@@ -64,7 +64,7 @@ use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId,
 use kabudachi_core::protocol::messages::Task;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::composite::{
-    MEMBER_BATCH_BYTES, SubmittedComposite, expansion_source, member_input, results,
+    MEMBER_BATCH_BYTES, SubmittedComposite, expansion_source, member_input, reduce_operands, results,
 };
 use kabudachi_core::scheduler::{SubmitRejection, mint};
 use kabudachi_core::time::{RealClock, WallTime};
@@ -81,8 +81,8 @@ use tokio::sync::watch;
 use crate::arguments::SubmitArguments;
 use crate::bridge::CLOSED_MESSAGE;
 use crate::composite::{
-    CompositeStatusTuple, PyBytesValue, PyManifest, PyMemberInput, PyResolved, member_batch, record_status,
-    refuse_values_past_limit, spill_step, step_from_tree,
+    CompositeStatusTuple, PyBytesValue, PyManifest, PyMemberInput, PyReduceOperands, PyResolved, member_batch,
+    record_status, refuse_values_past_limit, spill_step, step_from_tree,
 };
 use crate::errors::backpressure_error;
 use crate::health;
@@ -644,6 +644,30 @@ impl NetworkedRuntime {
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
             shared.hold_inputs(&run, source.counted());
             Ok(PyMemberInput(input))
+        })
+    }
+
+    /// Returns an awaitable that resolves to what the reduce step run
+    /// `task_run_id` works on (see `NativeRuntime.reduce_operands`). A record,
+    /// page or blob not found is asked for again for up to the run's
+    /// reconnect timeout.
+    ///
+    /// Raises `RuntimeError` if this worker does not hold the run or it is not
+    /// a reduce step's, or an operand is no longer held.
+    fn reduce_operands<'py>(&self, py: Python<'py>, task_run_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let (task, within) = self.member(task_run_id)?;
+        let shared = Arc::clone(&self.shared);
+        let run = TaskRunId::new(task_run_id);
+        self.host.bridge().spawn_into_py(py, async move {
+            let source = CountingSource::new(Arc::clone(&shared.net));
+            let operands = read_until(&shared, within, || {
+                source.begin();
+                reduce_operands(&source, &task)
+            })
+            .await
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            shared.hold_inputs(&run, source.counted());
+            Ok(PyReduceOperands(operands))
         })
     }
 

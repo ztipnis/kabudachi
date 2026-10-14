@@ -34,9 +34,10 @@ from networked_tasks import BULK_BYTES, awaits, bulk, echo, fleeting, gather, ho
 from proto_messages import Greeting
 
 
-# What `pipeline` of "a" gives: a flow's last result, a group's results, and
-# a returned flow's results, and what a failed group member's client was told.
-PIPELINE_OF_A = ["LOADED A", "loaded a", "A", "loaded a", "LOADED A", "ValueError: refused a"]
+# What `pipeline` of "a" gives: a flow's last result, a group's results, a
+# returned flow's results, a tree reduce of "abcde", a reduce stage after a
+# group, and what a failed group member's client was told.
+PIPELINE_OF_A = ["LOADED A", "loaded a", "A", "loaded a", "LOADED A", "abcde", "loaded aA", "ValueError: refused a"]
 
 
 def finished(shard, task_id):
@@ -306,19 +307,23 @@ def first_stage_started_on(cluster, markers):
     return next(worker for worker in cluster.workers if worker.pid == int(marker.read_text()))
 
 
-def committed_at_most_once(cluster, markers, definitions):
-    """No task a pipeline made of the `definitions`, found by the claim markers
-    the workers left, has more than one run that succeeded; returns how many
-    have one. A stage whose run is lost, or whose result a shard with no leader
-    could not store, is replayed, so a stage may run more than once; what must
-    hold is that no result is committed twice."""
-    claimed = {
+def tasks_made_of(markers, definitions):
+    """The ids of the tasks a pipeline made of the `definitions`, found by the
+    claim markers the workers left."""
+    return {
         marker.read_text()
         for definition in definitions
         for marker in markers.glob(f"claimed.{definition}.*")
     }
+
+
+def committed_at_most_once(cluster, markers, definitions):
+    """No task a pipeline made of the `definitions` has more than one run that
+    succeeded; returns how many have one. A stage whose run is lost, or whose
+    result a shard with no leader could not store, is replayed, so a stage may
+    run more than once; what must hold is that no result is committed twice."""
     committed = 0
-    for task_id in claimed:
+    for task_id in tasks_made_of(markers, definitions):
         record = finished(cluster, task_id)
         succeeded = states(record).count("SUCCEEDED")
         assert succeeded <= 1, record
@@ -326,10 +331,10 @@ def committed_at_most_once(cluster, markers, definitions):
     return committed
 
 
-def running_a_stage_besides(cluster, markers, kept):
-    """A worker not among `kept` that started a `shout` stage a moment ago, so
-    is still in it: a stage lasts a second."""
-    for marker in markers.glob("shout.*"):
+def running_a_stage_besides(cluster, markers, kept, stage="shout"):
+    """A worker not among `kept` that started a `stage` (`shout` or `join`) a
+    moment ago, so is still in it: a stage lasts a second."""
+    for marker in markers.glob(f"{stage}.*"):
         if time.time() - marker.stat().st_mtime > STAGE_SECONDS * 0.9:
             continue
         worker = next(worker for worker in cluster.workers if worker.pid == int(marker.read_text()))
@@ -339,9 +344,11 @@ def running_a_stage_besides(cluster, markers, kept):
 
 
 def test_a_stage_running_on_a_killed_worker_is_replayed_once_and_the_pipeline_ends_as_it_would_have(tmp_path):
-    # The leader submits a body that awaits a flow, a group and a returned
-    # step, each a composite it runs. A worker besides the body's, running a
-    # stage, is killed mid-stage: the stage's run is lost and replayed once.
+    # The leader submits a body that awaits a flow, a group, a returned step,
+    # a tree reduce and a reduce stage, each a composite it runs. A worker
+    # besides the body's, running a reduce step, is killed mid-step: the
+    # step's run is lost and replayed, and the reduce still gives the chain's
+    # value.
     cluster = Cluster.start(
         tmp_path, size=4, overrides={**LEADER_RUNS_NOTHING, **{n: BODY_HOST_RUNS_ONLY_IT for n in (1, 2, 3)}}
     )
@@ -351,16 +358,19 @@ def test_a_stage_running_on_a_killed_worker_is_replayed_once_and_the_pipeline_en
         piped = leader.submit("pipeline", text="a")
         body = eventually("the body to run", lambda: running_on(cluster, piped))
         victim = eventually(
-            "a stage to run on another worker",
-            lambda: running_a_stage_besides(cluster, tmp_path, {leader, body}),
+            "a reduce step to run on another worker",
+            lambda: running_a_stage_besides(cluster, tmp_path, {leader, body}, stage="join"),
         )
         victim.kill()
         assert outcome(leader, piped) == PIPELINE_OF_A
         assert states(cluster.record(piped)) == ["SUCCEEDED"], "the body never ran twice"
-        # Three stages, and at least the killed one's replay. No stage or
-        # planning task commits a result twice.
+        # Four stages. No stage, planning or reduce task commits a result twice,
+        # and each reduce step is committed once, the killed one's by its replay.
         assert len(list(tmp_path.glob("shout.*"))) >= 4
-        assert committed_at_most_once(cluster, tmp_path, ["shout", "plan", "load"]) >= 8
+        assert committed_at_most_once(cluster, tmp_path, ["shout", "plan", "load"]) >= 10
+        steps = tasks_made_of(tmp_path, ["join"])
+        assert steps and committed_at_most_once(cluster, tmp_path, ["join"]) == len(steps)
+        assert any("LOST" in states(finished(cluster, step)) for step in steps), "a join step was lost and replayed"
     finally:
         cluster.close()
 
@@ -383,7 +393,7 @@ def test_a_pipeline_whose_leader_is_killed_between_its_stages_ends_as_it_would_h
         # At least once each: a stage in flight when the leader died may be
         # replayed. None commits a result twice.
         assert len(list(tmp_path.glob("shout.*"))) >= 3
-        assert committed_at_most_once(cluster, tmp_path, ["shout", "plan", "load"]) >= 8
+        assert committed_at_most_once(cluster, tmp_path, ["shout", "plan", "load"]) >= 10
     finally:
         cluster.close()
 

@@ -17,7 +17,7 @@ use crate::time::Clock;
 
 use crate::scheduler::{Observer, Scheduler};
 
-use super::{CompositeKind, CompositeState, EXPANSION_DEFINITION, LOST_KIND, MemberOutcome, Stage};
+use super::{CompositeKind, CompositeState, EXPANSION_DEFINITION, LOST_KIND, MemberOutcome, ReduceRoot, Stage};
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Brings every composite rebuilt from records up to what its members'
@@ -83,13 +83,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             let Some(id) = task.composite_id() else {
                 continue;
             };
-            if task.task_definition_id() != expansion && self.composites.held.get(&id).is_some_and(|c| c.takes_batches()) {
+            if task.task_definition_id() != expansion
+                && self.composites.held.get(&id).is_some_and(|c| c.takes_batches() && c.step.reduce.is_none())
+            {
                 let held = counts.entry(id).or_default();
                 *held = (*held).max(task.composite_index + 1);
             }
         }
         for (id, composite) in &mut self.composites.held {
-            if !composite.takes_batches() {
+            // A reduce's members are its plan's steps, counted from its items.
+            if !composite.takes_batches() || composite.step.reduce.is_some() {
                 continue;
             }
             let named = counts.get(id).copied().unwrap_or(0);
@@ -144,7 +147,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let composite = &self.composites.held[id];
         let uncertain = &self.reconciliation;
         uncertain.is_uncertain_composite(id)
-            || (composite.step.expands() && uncertain.is_uncertain(&id.expansion_task()))
+            || (composite.expands() && uncertain.is_uncertain(&id.expansion_task()))
             || (0..composite.members).any(|index| {
                 let task = id.member_task(index);
                 uncertain.is_uncertain(&task)
@@ -165,7 +168,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// failure its policy fails on fails, one with every stage settled
     /// succeeds, and otherwise each stage it should have started is made
     /// unless it exists.
-    fn reevaluate(&mut self, id: &CompositeId) {
+    pub(super) fn reevaluate(&mut self, id: &CompositeId) {
         if self.composites.held[id].state != CompositeState::Running {
             return;
         }
@@ -173,7 +176,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         for index in 0..stages {
             self.settle_from_record(id, index);
         }
-        if self.composites.held[id].step.expands() && !self.composites.held[id].sealed {
+        if self.composites.held[id].expands() && !self.composites.held[id].sealed {
             self.resume_expansion(id);
             if self.composites.held[id].state != CompositeState::Running {
                 return;
@@ -185,6 +188,24 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let composite = &self.composites.held[id];
         if let Some(failure) = composite.first_failure_it_fails_on() {
             self.finish_composite(id, CompositeState::Failed, Some(failure));
+            return;
+        }
+        if composite.step.kind == CompositeKind::Reduce {
+            let Some(plan) = composite.reduce_plan() else {
+                // Still taking items: it waits for its batches.
+                return;
+            };
+            match plan.root() {
+                ReduceRoot::Step(root) if composite.outcomes.contains_key(&root) => {
+                    self.finish_composite(id, CompositeState::Succeeded, None);
+                }
+                ReduceRoot::Step(_) => {
+                    for index in plan.startable(|step| composite.outcomes.contains_key(&step)) {
+                        self.ensure_stage(id, index);
+                    }
+                }
+                ReduceRoot::Empty | ReduceRoot::Initial | ReduceRoot::Item(_) => self.start_reduce(id),
+            }
             return;
         }
         let open: Vec<u64> = (0..stages).filter(|index| !composite.outcomes.contains_key(index)).collect();
@@ -246,7 +267,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Members whose records are merely unknown were waited for before this.
     fn settle_members_nothing_names(&mut self, id: &CompositeId) {
         let composite = &self.composites.held[id];
-        if !composite.takes_batches() || !composite.sealed {
+        // A reduce's step with no Task is one not started yet, not a lost one.
+        if !composite.takes_batches() || !composite.sealed || composite.step.reduce.is_some() {
             return;
         }
         let nameless: Vec<u64> = composite
@@ -267,7 +289,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// submitter or its expansion run sends the members again if they are
     /// missing.
     fn ensure_stage(&mut self, id: &CompositeId, index: u64) {
-        if !self.composites.held[id].step.takes_batches() {
+        if self.composites.held[id].step.kind == CompositeKind::Reduce {
+            self.submit_reduce_step(id, index);
+        } else if !self.composites.held[id].takes_batches() {
             self.start_stage(id, index);
         }
     }

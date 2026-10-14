@@ -17,7 +17,13 @@
 //!   for one stored with `store_composite_payload`, or `None` when the task
 //!   takes its input from before it, and each field is `(name, kind, value)`
 //!   with `kind` one of `"int"`, `"uint"`, `"double"`, `"bool"`, `"string"` or
-//!   `"bytes"`.
+//!   `"bytes"`;
+//! - a reduce is `("reduce", on_error, stages, options)`, with `"streamed"`
+//!   after them for one whose items are sent in batches and `stages` empty, or
+//!   holding the one reducer task for one that folds the list it is given.
+//!   `options` is a dict of `reducer` (the reducer as a task with no value),
+//!   `tree`, `chunk_size` and `initial` (`bytes`, `("manifest", manifest)` or
+//!   `None`).
 
 use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::generated::{
@@ -28,7 +34,7 @@ use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId};
 use kabudachi_core::scheduler::MAX_SUBMISSION_BYTES;
 use kabudachi_core::scheduler::composite::{
     BoundStep, CompositeState, ExpansionRequest, FieldValue, ItemInput, MemberBatch, MemberInput,
-    OnError, Resolved, Spilled, Stage, Step, StreamedMember,
+    OnError, ReduceOperand, Resolved, Spilled, Stage, Step, StreamedMember,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -55,10 +61,18 @@ pub struct PyExpansion(ExpansionRequest);
 
 #[pymethods]
 impl PyExpansion {
-    /// The task the map runs on every item.
+    /// The task the map runs on every item, or the reducer each item is
+    /// encoded for.
     #[getter]
     fn definition_id(&self) -> &str {
         self.0.task.definition.as_str()
+    }
+
+    /// Whether the items stream into a reduce, as that reducer's items,
+    /// rather than into a map of the task.
+    #[getter]
+    fn reduces(&self) -> bool {
+        self.0.reduces
     }
 
     #[getter]
@@ -123,6 +137,10 @@ pub(crate) fn step_from_tree(tree: &Bound<'_, PyAny>) -> PyResult<Step> {
 }
 
 fn composite_description(tree: &Bound<'_, PyAny>) -> PyResult<StepDescription> {
+    let kind: String = tree.get_item(0)?.extract()?;
+    if kind == "reduce" {
+        return reduce_description(tree);
+    }
     let streamed = match tree.len()? {
         3 => false,
         4 if tree.get_item(3)?.extract::<&str>().is_ok_and(|marker| marker == STREAMED_MARKER) => true,
@@ -132,21 +150,82 @@ fn composite_description(tree: &Bound<'_, PyAny>) -> PyResult<StepDescription> {
             )));
         }
     };
-    let (kind, on_error, stages): (String, String, Vec<Bound<'_, PyAny>>) =
-        (tree.get_item(0)?.extract()?, tree.get_item(1)?.extract()?, tree.get_item(2)?.extract()?);
     let kind = match kind.as_str() {
         "flow" => generated::CompositeKind::Flow,
         "group" => generated::CompositeKind::Group,
         "map" => generated::CompositeKind::Map,
         other => return Err(PyValueError::new_err(format!("{other:?} is not a composite kind"))),
     };
-    let on_error = match on_error.as_str() {
-        "fail_fast" => generated::OnError::FailFast,
-        "collect_all" => generated::OnError::CollectAll,
-        other => return Err(PyValueError::new_err(format!("{other:?} is not an error policy"))),
-    };
+    let on_error = error_policy(tree)?;
+    let stages: Vec<Bound<'_, PyAny>> = tree.get_item(2)?.extract()?;
     let stages = stages.iter().map(stage_description).collect::<PyResult<Vec<_>>>()?;
-    Ok(StepDescription { kind: kind as i32, on_error: on_error as i32, stages, streamed })
+    Ok(StepDescription {
+        kind: kind as i32,
+        on_error: on_error as i32,
+        stages,
+        streamed,
+        reduce: None,
+    })
+}
+
+/// The error policy a composite's tree names as its second element.
+fn error_policy(tree: &Bound<'_, PyAny>) -> PyResult<generated::OnError> {
+    let on_error: String = tree.get_item(1)?.extract()?;
+    match on_error.as_str() {
+        "fail_fast" => Ok(generated::OnError::FailFast),
+        "collect_all" => Ok(generated::OnError::CollectAll),
+        other => Err(PyValueError::new_err(format!("{other:?} is not an error policy"))),
+    }
+}
+
+/// A reduce's tree: `("reduce", on_error, stages, options)`, with
+/// `"streamed"` after them for one whose items are sent in batches.
+fn reduce_description(tree: &Bound<'_, PyAny>) -> PyResult<StepDescription> {
+    let streamed = match tree.len()? {
+        4 => false,
+        5 if tree.get_item(4)?.extract::<&str>().is_ok_and(|marker| marker == STREAMED_MARKER) => true,
+        _ => {
+            return Err(PyTypeError::new_err(format!(
+                "a reduce is (\"reduce\", on_error, stages, options), with \"{STREAMED_MARKER}\" after them for one whose items are sent in batches"
+            )));
+        }
+    };
+    let stages: Vec<Bound<'_, PyAny>> = tree.get_item(2)?.extract()?;
+    let stages = stages.iter().map(stage_description).collect::<PyResult<Vec<_>>>()?;
+    Ok(StepDescription {
+        kind: generated::CompositeKind::Reduce as i32,
+        on_error: error_policy(tree)? as i32,
+        stages,
+        streamed,
+        reduce: Some(reduce_options(&tree.get_item(3)?)?),
+    })
+}
+
+/// A reduce's options: a dict of `reducer` (a task tree with no value), `tree`
+/// (whether chunks fold side by side), `chunk_size` and `initial` (`bytes`,
+/// `("manifest", manifest)` or `None`).
+fn reduce_options(options: &Bound<'_, PyAny>) -> PyResult<generated::ReduceOptions> {
+    let options = options
+        .cast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err("a reduce's options are a dict of reducer, tree, chunk_size and initial"))?;
+    let field = |name: &str| {
+        options
+            .get_item(name)?
+            .ok_or_else(|| PyTypeError::new_err(format!("a reduce's options lack {name:?}")))
+    };
+    let initial = match input_description(&field("initial")?)? {
+        None => None,
+        Some(bound_task_step::Input::Value(bytes)) => Some(generated::reduce_options::Initial::InitialValue(bytes)),
+        Some(bound_task_step::Input::ValueManifest(manifest)) => {
+            Some(generated::reduce_options::Initial::InitialManifest(manifest))
+        }
+    };
+    Ok(generated::ReduceOptions {
+        reducer: Some(task_description(&field("reducer")?)?),
+        tree: field("tree")?.extract()?,
+        chunk_size: field("chunk_size")?.extract()?,
+        initial,
+    })
 }
 
 fn stage_description(stage: &Bound<'_, PyAny>) -> PyResult<StageDescription> {
@@ -325,6 +404,32 @@ fn resolved_object(py: Python<'_>, resolved: Resolved) -> PyResult<Bound<'_, PyA
                 .collect::<PyResult<Vec<_>>>()?;
             ("list", PyList::new(py, items)?).into_bound_py_any(py)
         }
+    }
+}
+
+/// A reduce step's operands as Python reads them, in the order the step takes
+/// them: `("item", bytes)` for an item of the reduce's own, `("result",
+/// bytes)` for its initial value or an earlier step's result, and
+/// `("resolved", <a Resolved>)` for an item that is an entry of the previous
+/// stage's results.
+pub(crate) struct PyReduceOperands(pub(crate) Vec<ReduceOperand>);
+
+impl<'py> IntoPyObject<'py> for PyReduceOperands {
+    type Target = PyList;
+    type Output = Bound<'py, PyList>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let operands = self
+            .0
+            .into_iter()
+            .map(|operand| match operand {
+                ReduceOperand::Item(bytes) => ("item", PyBytes::new(py, &bytes)).into_bound_py_any(py),
+                ReduceOperand::Result(bytes) => ("result", PyBytes::new(py, &bytes)).into_bound_py_any(py),
+                ReduceOperand::Resolved(resolved) => ("resolved", resolved_object(py, resolved)?).into_bound_py_any(py),
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        PyList::new(py, operands)
     }
 }
 

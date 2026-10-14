@@ -639,7 +639,7 @@ impl Cluster {
             let writer = outcome.writer;
             let (Some(node), Some(scheduler), Some(records)) = (
                 self.nodes.get(&writer),
-                self.schedulers.get(&writer),
+                self.schedulers.get_mut(&writer),
                 self.leader_records.get_mut(&writer),
             ) else {
                 continue;

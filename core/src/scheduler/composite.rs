@@ -22,11 +22,17 @@ mod drive;
 mod held;
 mod records;
 mod recover;
+mod reduce;
 mod resolve;
 
 pub(in crate::scheduler) use held::Composites;
+pub use reduce::{
+    ITEM_PAGES, Operand, PlannedStep, REDUCE_EMPTY_KIND, REDUCE_ITEMS_LOST_KIND, REDUCER_CONTINUED_KIND, ReduceItem,
+    ReduceNode, ReducePlan, ReduceRoot, ReduceShape,
+};
 pub use resolve::{
-    CompositeSource, MemberInput, Resolved, Unresolved, expansion_source, member_input, resolve_manifest, results,
+    CompositeSource, MemberInput, ReduceOperand, Resolved, Unresolved, expansion_source, member_input,
+    reduce_operands, resolve_manifest, results,
 };
 
 /// The most members one batch of a streamed composite carries.
@@ -321,6 +327,8 @@ pub struct Step {
     /// The members are not in `stages`: they arrive in batches, and the
     /// template, if any, takes each item as its input.
     pub streamed: bool,
+    /// How a reduce folds; set on a reduce, and only on one.
+    pub reduce: Option<ReduceShape>,
 }
 
 /// One member of a streamed composite, as its submitter sends it.
@@ -564,6 +572,11 @@ pub enum MalformedStep {
     EmptyMember,
     #[error("a member batch names no composite")]
     NoComposite,
+    #[error(
+        "a reduce needs fail_fast, its reducer, either streamed items or the one reducer stage taking its list, \
+         and a tree chunk of at least one item; only a reduce takes reduce options"
+    )]
+    ReduceShape,
     #[error("the bytes are not an encoded step description")]
     Undecodable,
 }
@@ -601,7 +614,8 @@ impl Step {
 
     fn spill_into(self, values: &mut Vec<SpilledValue>) -> Step {
         let stages = self.stages.into_iter().map(|stage| stage.spill(values)).collect();
-        Step { stages, ..self }
+        let reduce = self.reduce.map(|shape| shape.spill(values));
+        Step { stages, reduce, ..self }
     }
 
     /// The BLAKE3 digest of the step's encoding: what a returning run's
@@ -630,10 +644,27 @@ impl Step {
             && matches!(self.stages.as_slice(), [Stage::Task(template)] if matches!(template.input, BoundInput::Previous))
     }
 
-    /// Whether the step's members arrive in batches: it is streamed, or it is
-    /// a map whose expansion run sends the items it splits a list into.
-    pub(in crate::scheduler) fn takes_batches(&self) -> bool {
-        self.streamed || self.expands()
+    /// Whether the step, given `input`, must have an expansion run stream in
+    /// the list it takes: a map over a list, or a reduce whose one stage takes
+    /// a list that a task stage returned as one value. A reduce given another
+    /// composite's results folds them from its pages instead.
+    pub(in crate::scheduler) fn expands_given(&self, input: &Option<(Manifest, InputShape)>) -> bool {
+        match self.kind {
+            CompositeKind::Map => self.expands(),
+            CompositeKind::Reduce => {
+                !self.streamed
+                    && matches!(self.stages.as_slice(), [only] if only.takes_input())
+                    && matches!(input, Some((_, InputShape::Value(_))))
+            }
+            CompositeKind::Flow | CompositeKind::Group => false,
+        }
+    }
+
+    /// Whether the step, given `input`, has members that arrive in batches:
+    /// it is streamed, or an expansion run sends the items it splits a list
+    /// into.
+    pub(in crate::scheduler) fn takes_batches_given(&self, input: &Option<(Manifest, InputShape)>) -> bool {
+        self.streamed || self.expands_given(input)
     }
 
     /// Whether the step expands a list and its template has fields set: each
@@ -650,26 +681,32 @@ impl Step {
 }
 
 /// What an expansion run is asked: the task to run on every item of the list
-/// it splits, and how the map over the items treats a failure.
+/// it splits, or, for a reduce, the reducer whose item each one is, and how
+/// the map over the items treats a failure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpansionRequest {
     pub task: BoundStep,
     pub on_error: OnError,
+    /// Whether `task` is the reducer of the reduce the items stream into,
+    /// rather than the template of the map they become members of.
+    pub reduces: bool,
 }
 
 impl ExpansionRequest {
     /// The request an expansion run carries as its input.
     pub fn decode(bytes: &[u8]) -> Result<ExpansionRequest, MalformedStep> {
         let request = generated::Expansion::decode(bytes).map_err(|_| MalformedStep::Undecodable)?;
-        let Some(generated::expansion::Then::Map(template)) = request.then else {
-            return Err(MalformedStep::UnsupportedKind);
+        let (template, reduces) = match request.then {
+            Some(generated::expansion::Then::Map(template)) => (template, false),
+            Some(generated::expansion::Then::Reduce(reducer)) => (reducer, true),
+            None => return Err(MalformedStep::UnsupportedKind),
         };
         let on_error = match generated::OnError::try_from(request.on_error) {
             Ok(generated::OnError::FailFast) => OnError::FailFast,
             Ok(generated::OnError::CollectAll) => OnError::CollectAll,
             _ => return Err(MalformedStep::UnknownKind),
         };
-        Ok(ExpansionRequest { task: BoundStep::try_from(&template)?, on_error })
+        Ok(ExpansionRequest { task: BoundStep::try_from(&template)?, on_error, reduces })
     }
 }
 
@@ -732,9 +769,7 @@ impl TryFrom<&generated::StepDescription> for Step {
             Ok(generated::CompositeKind::Flow) => CompositeKind::Flow,
             Ok(generated::CompositeKind::Group) => CompositeKind::Group,
             Ok(generated::CompositeKind::Map) => CompositeKind::Map,
-            // The reduce driver is not built yet: refusing it here keeps a
-            // reduce from being stored and never driven.
-            Ok(generated::CompositeKind::Reduce) => return Err(MalformedStep::UnsupportedKind),
+            Ok(generated::CompositeKind::Reduce) => CompositeKind::Reduce,
             _ => return Err(MalformedStep::UnknownKind),
         };
         let on_error = match generated::OnError::try_from(wire.on_error) {
@@ -743,7 +778,8 @@ impl TryFrom<&generated::StepDescription> for Step {
             _ => return Err(MalformedStep::UnknownKind),
         };
         // A map over an empty list is a map of no members, which finishes as
-        // it starts; a flow or group of nothing is a mistake.
+        // it starts; a flow or group of nothing is a mistake. A reduce with
+        // no stages is judged with the rest of its shape.
         if wire.streamed {
             if kind == CompositeKind::Flow {
                 return Err(MalformedStep::StreamedFlow);
@@ -751,11 +787,17 @@ impl TryFrom<&generated::StepDescription> for Step {
             if wire.stages.len() > 1 {
                 return Err(MalformedStep::StreamedWithStages);
             }
-        } else if wire.stages.is_empty() && kind != CompositeKind::Map {
+        } else if wire.stages.is_empty() && !matches!(kind, CompositeKind::Map | CompositeKind::Reduce) {
             return Err(MalformedStep::NoStages);
         }
         let stages = wire.stages.iter().map(Stage::try_from).collect::<Result<Vec<_>, _>>()?;
-        let step = Step { kind, on_error, stages, streamed: wire.streamed };
+        let reduce = wire.reduce.as_ref().map(ReduceShape::try_from).transpose()?;
+        let step = Step { kind, on_error, stages, streamed: wire.streamed, reduce };
+        if kind == CompositeKind::Reduce {
+            check_reduce(&step)?;
+        } else if step.reduce.is_some() {
+            return Err(MalformedStep::ReduceShape);
+        }
         if step.streamed {
             let fed = match kind {
                 CompositeKind::Map => matches!(
@@ -771,6 +813,25 @@ impl TryFrom<&generated::StepDescription> for Step {
         }
         Ok(step)
     }
+}
+
+/// A reduce is driven only if it fails on its first failed step, its
+/// reducer takes its input and binds no fields, a tree has chunks of at
+/// least one item, and it either streams its items in (no stages) or has the
+/// one stage of that very reducer, taking the list it is given.
+fn check_reduce(step: &Step) -> Result<(), MalformedStep> {
+    let Some(shape) = &step.reduce else {
+        return Err(MalformedStep::ReduceShape);
+    };
+    let reducer = &shape.reducer;
+    let takes_its_list = matches!(step.stages.as_slice(), [Stage::Task(bound)] if bound == reducer);
+    let items = if step.streamed { step.stages.is_empty() } else { takes_its_list };
+    let well_formed = items
+        && step.on_error == OnError::FailFast
+        && matches!(reducer.input, BoundInput::Previous)
+        && reducer.fields.is_empty()
+        && (!shape.tree || shape.chunk_size >= 1);
+    if well_formed { Ok(()) } else { Err(MalformedStep::ReduceShape) }
 }
 
 impl TryFrom<&generated::StageDescription> for Stage {
@@ -863,6 +924,7 @@ impl From<&Step> for generated::StepDescription {
             on_error: generated::OnError::from(step.on_error) as i32,
             stages: step.stages.iter().map(generated::StageDescription::from).collect(),
             streamed: step.streamed,
+            reduce: step.reduce.as_ref().map(generated::ReduceOptions::from),
         }
     }
 }

@@ -18,10 +18,11 @@ from hypothesis import strategies as st
 from kabudachi import _native
 from kabudachi._native import KabudachiError
 from kabudachi.body import fold_payloads
-from kabudachi.composites import _batches
+from kabudachi.composites import INLINE_VALUE_BYTES, _batches
 from kabudachi.errors import (
     BackpressureError,
     PayloadTooLargeError,
+    ReduceEmptyError,
     RunStoppedError,
     RuntimeNotStartedError,
     SerializationError,
@@ -803,12 +804,21 @@ def test_groups_whose_members_fail_alike_are_each_given_their_own_member_error()
     assert (error_early.who, error_late.who) == ("early", "late")
 
 
-def test_a_map_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_takes():
-    def numbers_of(request: Greeting) -> list[Receipt]:
-        return [Receipt(ok=True)]
+@pytest.mark.parametrize(("stage", "consumer"), [("map", "upper"), ("reduce", "chain_concat")])
+def test_a_map_or_reduce_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_takes(stage, consumer):
+    def numbers_of(text: str) -> list[int]:
+        return [1]
 
-    with pytest.raises(TaskDefinitionError, match="shout"):
-        flow(declare(numbers_of), declare(shout).map)
+    def not_a_list(text: str) -> str:
+        return text
+
+    world = reducing_world(numbers_of, not_a_list, upper, chain_concat)
+    step = getattr(world.tasks[consumer], stage)
+
+    with pytest.raises(TaskDefinitionError, match=consumer):
+        flow(world.tasks["numbers_of"], step)
+    with pytest.raises(TaskDefinitionError, match=consumer):
+        flow(world.tasks["not_a_list"], step)
 
 
 # --- backpressure -------------------------------------------------------
@@ -979,6 +989,23 @@ def test_members_are_batched_by_count_and_by_bytes_with_an_oversized_member_alon
     batches = [[len(member) for member in batch] for batch in _batches(members, max_items, max_bytes)]
 
     assert batches == expected
+
+
+def test_a_reduce_whose_items_pass_the_hard_limit_fails_with_backpressure_error_and_runs_no_step():
+    def fold(item: Greeting, previous: Greeting) -> Greeting:
+        return Greeting(text=previous.text + item.text)
+
+    world = World(fold, memory_soft_limit=100, memory_hard_limit=100, member_batch_items=1)
+
+    async def body():
+        handle = world.tasks["fold"].reduce([Greeting(text="x" * 40)] * 4, initial=Greeting())
+        with pytest.raises(BackpressureError):
+            await handle
+
+    with activated(world):
+        run(with_events(world, body))
+
+    assert world.runtime.claimed == [], "the reduce was never sealed, so no step ran"
 
 
 def test_a_streamed_group_pauses_when_slow_down_is_raised_while_it_is_still_sending_but_a_plain_call_does_not():
@@ -1589,3 +1616,254 @@ def test_under_fail_fast_the_stage_runs_once_only_if_every_member_succeeds(failu
         assert isinstance(outcome, ValueError)
         failing = {f"member {i} failed" for i, count in enumerate(failures) if count > RETRIES}
         assert str(outcome) in failing
+
+
+# --- reduce ---------------------------------------------------------------
+
+
+def chain_concat(item: str, previous: str) -> str:
+    return previous + item
+
+
+def tree_concat(item: str, previous: str) -> str:
+    return previous + item
+
+
+def count_letters(item: str, previous: dict) -> dict:
+    return {**previous, item: previous.get(item, 0) + 1}
+
+
+def add_counts(left: dict, right: dict) -> dict:
+    return {key: left.get(key, 0) + right.get(key, 0) for key in left | right}
+
+
+def explode_on_bad(item: str, previous: str) -> str:
+    if item == "bad":
+        raise ValueError("bad item")
+    return previous + item
+
+
+async def async_chain_concat(item: str, previous: str) -> str:
+    await asyncio.sleep(0)
+    return previous + item
+
+
+async def async_tree_concat(item: str, previous: str) -> str:
+    await asyncio.sleep(0)
+    return previous + item
+
+
+def concatenated(left: str, right: str) -> str:
+    return left + right
+
+
+def reducing_world(*functions, **options):
+    """A world whose tasks use pickle, with `functions` declared as tasks
+    and `options` (name to Task options) declared alongside."""
+    world = World(serializer="pickle")
+    world.serializers.register(Pickle())
+    for function in functions:
+        world.tasks[function.__name__] = Task(
+            function,
+            registry=world.registry,
+            serializers=world.serializers,
+            name=f"tests.{function.__name__}",
+            serializer="pickle",
+            **options.get(function.__name__, {}),
+        )
+    return world
+
+
+def reduce_claims(world, name):
+    return [claim for claim in world.runtime.claimed if claim.definition_id == f"tests.{name}"]
+
+
+def test_an_associative_reduce_gives_the_chains_result_whether_it_runs_as_a_chain_or_a_tree():
+    world = reducing_world(chain_concat, tree_concat, tree_concat={"associative": True})
+    letters = list("abcdefg")
+
+    async def body():
+        chained = await world.tasks["chain_concat"].reduce(letters)
+        treed = await world.tasks["tree_concat"].reduce(letters, chunk_size=2)
+        return chained, treed
+
+    with activated(world):
+        assert run(with_events(world, body)) == ("abcdefg", "abcdefg")
+    assert len(reduce_claims(world, "chain_concat")) == 6, "a seedless chain runs one step per item after the first"
+    levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "tree_concat"))
+    assert levels == [0, 0, 0, 0, 1, 1, 2], "four chunks of two, then three combines"
+
+
+def test_an_empty_or_one_item_reduce_runs_no_step_and_a_seedless_empty_one_has_no_result():
+    world = reducing_world(chain_concat)
+    concat = world.tasks["chain_concat"]
+
+    async def body():
+        return await concat.reduce([], initial="seed"), await concat.reduce(["only"])
+
+    with activated(world):
+        assert run(with_events(world, body)) == ("seed", "only")
+        with pytest.raises(ReduceEmptyError):
+            concat.reduce([])
+    assert reduce_claims(world, "chain_concat") == []
+
+
+def test_a_reduce_the_leader_finds_empty_fails_with_reduce_empty_error():
+    world = reducing_world(split_words, chain_concat)
+
+    async def body():
+        # The empty list is refused before it is sent when given; a stage's
+        # return is found empty only once it is streamed.
+        with pytest.raises(ReduceEmptyError):
+            await flow(world.tasks["split_words"], world.tasks["chain_concat"].reduce).start(world.session, "")
+
+    with activated(world):
+        run(with_events(world, body))
+
+
+def test_a_step_that_fails_after_its_retries_fails_the_reduce_and_no_later_step_runs():
+    world = reducing_world(explode_on_bad, explode_on_bad={"retries": 1})
+
+    async def body():
+        return await world.tasks["explode_on_bad"].reduce(["a", "bad", "c"], initial="")
+
+    with activated(world):
+        with pytest.raises(ValueError, match="bad item"):
+            run(with_events(world, body))
+    claims = [claim.reduce_node[1] for claim in reduce_claims(world, "explode_on_bad")]
+    assert claims == [0, 1, 1], "the failing step was tried twice and the step after it never ran"
+
+
+def test_a_step_lost_after_storing_its_result_and_before_complete_is_replayed_and_the_reduce_ends_as_the_chain_does():
+    calls = []
+
+    def numbered_concat(item: str, previous: str) -> str:
+        # Not idempotent: each call leaves its own number in the result, so the
+        # replay's result differs from the lost first run's.
+        calls.append(item)
+        return f"{previous}{item}{len(calls)}"
+
+    world = reducing_world(numbered_concat)
+    lost = []
+
+    def lose_the_first_completion_of_step_one(task_run_id):
+        # The session has stored the step's result blob (`store_result`) and is
+        # about to report COMPLETE: the run is lost instead, as when its worker dies.
+        claim = next(claim for claim in world.runtime.claimed if claim.task_run_id == task_run_id)
+        losing = claim.reduce_node == (0, 1) and not lost
+        if losing:
+            lost.append(task_run_id)
+            world.runtime.native.report_lost(task_run_id)
+        world.runtime.refuse_completion = losing
+
+    world.runtime.on_complete = lose_the_first_completion_of_step_one
+
+    async def body():
+        return await world.tasks["numbered_concat"].reduce(list("abc"), initial="")
+
+    with activated(world):
+        assert run(with_events(world, body)) == "a1b3c4", "step 2 folded the replay's result (b3), not the lost run's (b2)"
+    steps = [claim.reduce_node[1] for claim in reduce_claims(world, "numbered_concat")]
+    assert lost and steps == [0, 1, 1, 2], "step 1 ran again on the same operands"
+
+
+def test_async_reducers_fold_a_chain_and_a_tree_whose_merge_is_synchronous():
+    world = reducing_world(
+        async_chain_concat,
+        async_tree_concat,
+        async_tree_concat={"tree": True, "merge": concatenated},
+    )
+
+    async def body():
+        chained = await world.tasks["async_chain_concat"].reduce(list("abcde"), initial="")
+        treed = await world.tasks["async_tree_concat"].reduce(list("abcde"), initial="", chunk_size=2)
+        return chained, treed
+
+    with activated(world):
+        assert run(with_events(world, body)) == ("abcde", "abcde")
+    levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "async_tree_concat"))
+    assert levels == [0, 0, 0, 1, 2], "three chunks of two, two and one, then two combines"
+
+
+def test_a_reduce_seeded_with_an_initial_value_longer_than_an_inline_value_reads_it_back_in_a_chain_and_in_every_chunk_of_a_tree():
+    world = reducing_world(
+        chain_concat, count_letters, count_letters={"tree": True, "merge": add_counts}
+    )
+    long_text = "s" * (INLINE_VALUE_BYTES * 3)
+    long_key = "k" * (INLINE_VALUE_BYTES * 3)
+
+    async def body():
+        chained = await world.tasks["chain_concat"].reduce(list("abc"), initial=long_text)
+        treed = await world.tasks["count_letters"].reduce(
+            list("abab"), initial={long_key: 0}, chunk_size=2
+        )
+        return chained, treed
+
+    with activated(world):
+        assert run(with_events(world, body)) == (long_text + "abc", {long_key: 0, "a": 2, "b": 2})
+    levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "count_letters"))
+    assert levels == [0, 0, 1], "two chunks each from the initial value, then merged"
+
+
+def split_words(text: str) -> list[str]:
+    return text.split()
+
+
+def upper(word: str) -> str:
+    return word.upper()
+
+
+def join_words(item: str, previous: str) -> str:
+    return f"{previous} {item}".strip()
+
+
+def numbered(count: int) -> list[str]:
+    """`count` items starting with their own index: every seventh is just that
+    index, short enough to sit inline on an item page, and the rest about 1 KB,
+    stored as blobs."""
+    return [f"{index:06d}" + ("" if index % 7 == 0 else "x" * 994) for index in range(count)]
+
+
+def take_tag(item: str, previous: str) -> str:
+    return previous + item[:6]
+
+
+def test_a_reduce_stage_folds_a_maps_results_from_its_pages_and_a_returned_list_streamed_by_its_expansion():
+    world = reducing_world(split_words, upper, join_words, join_words={"associative": True})
+    join = world.tasks["join_words"]
+
+    async def body():
+        mapped = await flow(world.tasks["split_words"], world.tasks["upper"].map, join.reduce.options(chunk_size=2)).start(
+            world.session, "a b c d e"
+        )
+        expanded = await flow(world.tasks["split_words"], join.reduce.options(initial="")).start(world.session, "x y")
+        return mapped[-1], expanded[-1]
+
+    with activated(world):
+        assert run(with_events(world, body)) == ("A B C D E", "x y")
+    expansions = [claim for claim in world.runtime.claimed if claim.expansion]
+    assert len(expansions) == 2, "the map's list and the second flow's list were streamed; the map's results were not"
+
+
+def test_a_list_larger_than_one_record_reduces_in_order_across_item_pages_whether_it_is_given_or_returned():
+    count = _native.MAX_RECORD_BYTES // 800 + 64  # more item bytes than one record holds
+    world = reducing_world(numbered, take_tag, take_tag={"tree": True, "merge": concatenated})
+    tag = world.tasks["take_tag"].reduce.options(initial="", chunk_size=100)
+
+    async def body():
+        given = await world.tasks["take_tag"].reduce(numbered(count), initial="", chunk_size=100)
+        returned = await flow(world.tasks["numbered"], tag).start(world.session, count)
+        return given, returned[-1]
+
+    expected = "".join(f"{index:06d}" for index in range(count))
+    with activated(world):
+        assert run(with_events(world, body)) == (expected, expected)
+    reduces = {composite for composite, _, _ in world.runtime.members_sent}
+    assert len(reduces) == 2 and len(world.runtime.members_sent) >= 4, "each list went in more than one batch"
+
+
+def test_a_reduce_cannot_be_the_first_stage_of_a_flow_and_says_how_to_give_it_items():
+    world = reducing_world(chain_concat)
+
+    with pytest.raises(TypeError, match=r"chain_concat.*first stage.*reduce\(items\)"):
+        flow(world.tasks["chain_concat"].reduce)

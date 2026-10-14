@@ -190,6 +190,11 @@ impl Manifest {
         generated::Manifest::from(self.clone()).encode_to_vec()
     }
 
+    /// How many bytes `encode` gives, without building them.
+    pub fn encoded_len(&self) -> usize {
+        generated::Manifest::from(self.clone()).encoded_len()
+    }
+
     /// The manifest `bytes` encode.
     pub fn decode(bytes: &[u8]) -> Result<Manifest, InvalidManifest> {
         let wire = generated::Manifest::decode(bytes).map_err(|_| InvalidManifest::Undecodable)?;

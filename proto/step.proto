@@ -31,7 +31,7 @@ enum OnError {
 
 // A composite as its submitter described it. It is encoded the same way
 // every time it is built the same way, so the BLAKE3 digest of its encoding
-// names it. Field 5 is left for reduce options.
+// names it.
 message StepDescription {
   CompositeKind kind = 1;
   OnError on_error = 2;
@@ -41,6 +41,8 @@ message StepDescription {
   // SubmitMembers batches. A streamed map's `stages` holds its one template,
   // which takes each item as its input; a streamed group's is empty.
   bool streamed = 6;
+  // Set on a reduce, and only on one.
+  ReduceOptions reduce = 5;
 }
 
 message StageDescription {
@@ -97,4 +99,20 @@ message BoundField {
 message ReduceNode {
   uint32 level = 1;
   uint64 position = 2;
+}
+
+// How a reduce folds its items.
+message ReduceOptions {
+  // The task every step runs. Its input is unset and it binds no fields.
+  BoundTaskStep reducer = 1;
+  // Fold chunks side by side and combine their results pairwise, in order,
+  // instead of folding one item per step.
+  bool tree = 2;
+  // How many items one tree chunk folds. Unused by a chain.
+  uint32 chunk_size = 3;
+  // The result before any item is folded. Unset: the first item is.
+  oneof initial {
+    bytes initial_value = 4;
+    Manifest initial_manifest = 5;
+  }
 }

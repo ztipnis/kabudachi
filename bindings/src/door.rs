@@ -30,15 +30,15 @@ use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::composite::{
-    CompositeSource, CompositeState, CompositeStatus, MemberBatch, MembersAccepted, Step as CompositeStep,
-    Unresolved,
+    CompositeSource, CompositeState, CompositeStatus, ITEM_PAGES, MemberBatch, MembersAccepted,
+    Step as CompositeStep, Unresolved,
 };
 use kabudachi_core::scheduler::{
     Backlog, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted,
     Completion, Event, Failure, LostRun, ReportRejection, Scheduler, Submission, SubmitRejection,
     Submitted,
 };
-use kabudachi_core::task_record::{LocalRecords, office_to_reconcile};
+use kabudachi_core::task_record::{LocalRecords, RecordKey, ShardRecord, office_to_reconcile};
 use kabudachi_core::time::{Clock, Instant};
 use tokio::sync::{Notify, watch};
 
@@ -784,7 +784,21 @@ impl<C: Clock + Send + 'static> CompositeSource for DoorSource<'_, C> {
     }
 
     async fn page(&self, id: &CompositeId, page: u32) -> Option<CompositePage> {
-        self.0.read(|scheduler| scheduler.composite_page(id, page)).ok().flatten()
+        self.0
+            .read(|scheduler| {
+                if page < ITEM_PAGES {
+                    return scheduler.composite_page(id, page);
+                }
+                // The scheduler serves a composite's results pages only, and
+                // lets a full item page go once it is published: this node's
+                // own store has every item page.
+                match scheduler.observer().records().get_record(&RecordKey::Page(id.clone(), page)) {
+                    Some(ShardRecord::Page(held)) => Some(held.clone()),
+                    _ => None,
+                }
+            })
+            .ok()
+            .flatten()
     }
 
     async fn blob(&self, _owner: &BlobOwner, key: &BlobKey) -> Option<Vec<u8>> {

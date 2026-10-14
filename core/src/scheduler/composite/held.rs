@@ -7,11 +7,12 @@ use std::ops::Deref;
 use crate::manifest::{Failure, Manifest};
 use crate::protocol::ids::{CompositeId, TaskId, WorkerId};
 use crate::scheduler::SubmitRejection;
+use crate::task_record::RecordVersion;
 use crate::time::{Duration, Instant, WallTime};
 
 use super::{
     BoundStep, CANCELLED_KIND, CompositeKind, CompositeParent, CompositeState, InputShape,
-    MemberCounts, MemberOutcome, OnError, PAGE_ENTRIES, Stage, Step, StreamedMember,
+    ITEM_PAGES, MemberCounts, MemberOutcome, OnError, PAGE_ENTRIES, ReduceItem, ReducePlan, Stage, Step, StreamedMember,
 };
 
 /// One composite this scheduler drives, or keeps until its retention ends.
@@ -45,6 +46,21 @@ pub(in crate::scheduler) struct Composite {
     pub(super) members: u64,
     /// No batch adds a member: always true unless members arrive in batches.
     pub(super) sealed: bool,
+    /// A reduce's items taken from its batches so far.
+    pub(super) items_taken: u64,
+    /// How many items the stored record of a reduce fed in batches counted
+    /// when this leader installed it, which its item pages may no longer
+    /// hold: the reduce is never sealed with fewer.
+    pub(super) items_floor: u64,
+    /// The items of a reduce's last item page while that page is partly
+    /// filled: all the leader keeps of the items it took.
+    pub(super) partial_items: Vec<ReduceItem>,
+    /// Item pages that are full, kept until their write is stored: a refused
+    /// write is published again from here, and so is a write that must move.
+    pub(super) filled_item_pages: BTreeMap<u32, Vec<ReduceItem>>,
+    /// The newest version published of each full item page held, which a
+    /// stored write of that version or a newer one lets go.
+    pub(super) published_item_pages: BTreeMap<u32, RecordVersion>,
 }
 
 /// The outcomes of the members that settled, by index, with the tallies a
@@ -133,9 +149,29 @@ impl Outcomes {
 }
 
 impl Composite {
+    /// Whether an expansion run must stream in the list this composite is
+    /// given: a map, or a reduce whose one stage takes a list that a task stage
+    /// returned as one value. A reduce given another composite's results folds
+    /// them from its pages instead.
+    pub(super) fn expands(&self) -> bool {
+        self.step.expands_given(&self.input)
+    }
+
     /// Whether its members arrive in batches.
     pub(super) fn takes_batches(&self) -> bool {
-        self.step.takes_batches()
+        self.step.takes_batches_given(&self.input)
+    }
+
+    /// How far its batches have filled it: a reduce's items, else its members.
+    pub(super) fn batch_held(&self) -> u64 {
+        if self.step.kind == CompositeKind::Reduce { self.items_taken } else { self.members }
+    }
+
+    /// The plan of a reduce whose item count is final; `None` for any other
+    /// composite, and for a reduce still taking items.
+    pub(super) fn reduce_plan(&self) -> Option<ReducePlan> {
+        let shape = self.step.reduce.as_ref()?;
+        self.sealed.then(|| ReducePlan::new(self.items_taken, shape))
     }
 
     /// The stage a streamed member is to run as: a map's item is the input of
@@ -162,9 +198,10 @@ impl Composite {
     }
 
     /// Whether the first stage or member to fail for good ends the
-    /// composite: a flow's always does, a group's or map's by its policy.
+    /// composite: a flow's or a reduce's always does, a group's or map's by
+    /// its policy.
     pub(super) fn fails_on_first_failure(&self) -> bool {
-        self.step.kind == CompositeKind::Flow || self.step.on_error == OnError::FailFast
+        matches!(self.step.kind, CompositeKind::Flow | CompositeKind::Reduce) || self.step.on_error == OnError::FailFast
     }
 
     /// The failure that ended the composite, or the cancellation that did.
@@ -259,6 +296,9 @@ impl Composites {
         for page in 0..pages {
             self.page_changed(id, page);
         }
+        for page in self.held[id].held_item_pages() {
+            self.unpublished_pages.insert((id.clone(), page));
+        }
     }
 
     /// Page `page` of the held composite `id` changed: it is written at the
@@ -281,6 +321,15 @@ impl Composites {
         let Some(composite) = self.held.get(id) else {
             return;
         };
+        // A reduce's item pages are rewritten as finished too, whether the
+        // leader still holds them or let them go once stored: a holder
+        // retires them only from a finished revision. They sit apart from the
+        // results pages looped over below, at ITEM_PAGES onward.
+        for page in 0..composite.item_page_count() {
+            let key = (id.clone(), ITEM_PAGES + page);
+            self.unwritten_pages.remove(&key);
+            self.unpublished_pages.insert(key);
+        }
         let pages = composite.pages();
         for page in 0..pages {
             let key = (id.clone(), page);
@@ -294,7 +343,7 @@ impl Composites {
         self.finished.insert((now, id.clone()));
     }
 
-    pub(super) fn is_finished(&self, id: &CompositeId) -> bool {
+    pub(in crate::scheduler) fn is_finished(&self, id: &CompositeId) -> bool {
         self.finished_at.contains_key(id)
     }
 
@@ -343,8 +392,9 @@ impl Composites {
         let members = self.held.remove(id).map_or_else(Vec::new, |composite| {
             // A composite fed in batches keeps no stage once it has started
             // it: a child's index names no Task, which retention never holds.
-            let fed = composite.step.takes_batches();
-            let expansion = composite.step.expands().then(|| id.expansion_task());
+            // A reduce's members are all its steps' Tasks.
+            let fed = composite.takes_batches() || composite.step.kind == CompositeKind::Reduce;
+            let expansion = composite.expands().then(|| id.expansion_task());
             (0..composite.members)
                 .filter(|index| fed || matches!(composite.step.stages[*index as usize], Stage::Task(_)))
                 .map(|index| id.member_task(index))

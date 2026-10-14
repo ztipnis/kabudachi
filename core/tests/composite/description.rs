@@ -8,7 +8,7 @@ use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId};
 use kabudachi_core::scheduler::composite::{
     BoundField, BoundInput, BoundStep, CompositeKind, EXPANSION_DEFINITION, FieldValue, INLINE_VALUE_BYTES, ItemInput,
-    MalformedStep, MemberBatch, OnError, Spilled, SpilledValue, Stage, Step, StreamedMember, TaskOptions,
+    MalformedStep, MemberBatch, OnError, ReduceShape, Spilled, SpilledValue, Stage, Step, StreamedMember, TaskOptions,
 };
 use prost::Message;
 
@@ -46,15 +46,18 @@ fn every_kind() -> Step {
                 on_error: OnError::CollectAll,
                 stages: vec![overlaid, task("wrap", BoundInput::Previous)],
                 streamed: false,
+                reduce: None,
             }),
             Stage::Composite(Step {
                 kind: CompositeKind::Map,
                 on_error: OnError::FailFast,
                 stages: vec![task("each", BoundInput::Previous)],
                 streamed: false,
+                reduce: None,
             }),
         ],
         streamed: false,
+        reduce: None,
     }
 }
 
@@ -84,6 +87,7 @@ fn a_step_that_cannot_be_driven_is_refused() {
         on_error: generated::OnError::FailFast as i32,
         stages,
         streamed: false,
+        reduce: None,
     };
     assert_eq!(refused(flow(Vec::new())), MalformedStep::NoStages);
     assert_eq!(
@@ -101,9 +105,6 @@ fn a_step_that_cannot_be_driven_is_refused() {
     };
     overlaid.fields.reverse();
     assert_eq!(refused(unsorted), MalformedStep::FieldsUnsorted);
-    let mut reduce = flow(StepDescription::from(&every_kind()).stages);
-    reduce.kind = generated::CompositeKind::Reduce as i32;
-    assert_eq!(refused(reduce), MalformedStep::UnsupportedKind);
     let mut two_templates = StepDescription::from(&every_kind());
     let generated::stage_description::Step::Composite(map) = two_templates.stages[2].step.as_mut().unwrap()
     else {
@@ -156,6 +157,7 @@ fn streamed_map() -> Step {
         on_error: OnError::CollectAll,
         stages: vec![task("each", BoundInput::Previous)],
         streamed: true,
+        reduce: None,
     }
 }
 
@@ -195,7 +197,13 @@ fn a_streamed_step_and_its_member_batches_read_back_exactly_and_a_streamed_flow_
 #[test]
 fn a_task_stage_with_no_queue_or_the_reserved_expansion_definition_is_refused() {
     let refused = |step: &Step| Step::try_from(&StepDescription::from(step)).unwrap_err();
-    let flow_of = |stage| Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages: vec![stage], streamed: false };
+    let flow_of = |stage| Step {
+        kind: CompositeKind::Flow,
+        on_error: OnError::FailFast,
+        stages: vec![stage],
+        streamed: false,
+        reduce: None,
+    };
     let mut no_queue = bound("work", BoundInput::Value(b"x".to_vec()));
     no_queue.options.queue = String::new();
     assert_eq!(refused(&flow_of(Stage::Task(no_queue))), MalformedStep::NoQueue);
@@ -227,7 +235,28 @@ fn bound_group(values: Vec<Vec<u8>>) -> Step {
         on_error: OnError::FailFast,
         stages: values.into_iter().map(|value| task("each", BoundInput::Value(value))).collect(),
         streamed: false,
+        reduce: None,
     }
+}
+
+/// A seeded tree whose items stream in, and the same reduce over the one
+/// reducer stage that takes the list it is given.
+fn reduces() -> (Step, Step) {
+    let reducer = bound("fold", BoundInput::Previous);
+    let streamed = Step {
+        kind: CompositeKind::Reduce,
+        on_error: OnError::FailFast,
+        stages: Vec::new(),
+        streamed: true,
+        reduce: Some(ReduceShape {
+            reducer: reducer.clone(),
+            tree: true,
+            chunk_size: 2,
+            initial: Some(BoundInput::Value(Vec::new())),
+        }),
+    };
+    let template = Step { stages: vec![Stage::Task(reducer)], streamed: false, ..streamed.clone() };
+    (streamed, template)
 }
 
 #[test]
@@ -262,8 +291,20 @@ fn a_large_step_spills_its_long_values_to_blobs_the_same_way_every_time_and_a_sm
         on_error: OnError::FailFast,
         stages: vec![task("first", BoundInput::Value(b"x".to_vec())), Stage::Composite(large)],
         streamed: false,
+        reduce: None,
     };
     assert_eq!(nested.spill().values, spilled.values);
+
+    // A large seeded reduce spills its initial value too, the same way every time.
+    let (mut seeded, _) = reduces();
+    seeded.reduce.as_mut().expect("a reduce has a shape").initial = Some(BoundInput::Value(long.clone()));
+    let spilled_reduce = seeded.clone().spill();
+    assert_eq!(spilled_reduce, seeded.spill(), "deterministic");
+    assert_eq!(spilled_reduce.values, [SpilledValue { bytes: long.clone() }]);
+    assert_eq!(
+        spilled_reduce.step.reduce.expect("still a reduce").initial,
+        Some(BoundInput::Chunked(Manifest::chunk(&long).manifest))
+    );
 }
 
 #[test]
@@ -291,5 +332,62 @@ fn a_streamed_member_spills_only_once_its_inline_bytes_pass_the_senders_bound() 
         values,
         [SpilledValue { bytes: vec![3; INLINE_VALUE_BYTES + 1] }, SpilledValue { bytes: value }],
         "a composite member's nested values spill in stage order"
+    );
+}
+
+#[test]
+fn a_reduce_description_reads_back_exactly_and_one_that_cannot_be_planned_is_refused() {
+    let (streamed, template) = reduces();
+    for step in [&streamed, &template] {
+        let bytes = StepDescription::from(step).encode_to_vec();
+        let read = Step::try_from(&StepDescription::decode(&bytes[..]).unwrap()).unwrap();
+        assert_eq!(&read, step);
+    }
+    assert_eq!(
+        streamed.reduce.as_ref().unwrap().initial,
+        Some(BoundInput::Value(Vec::new())),
+        "an initial that encodes to no bytes is still given: the reduce is seeded"
+    );
+    assert!(template.takes_input() && !streamed.takes_input());
+
+    let refused = |step: Step| Step::try_from(&StepDescription::from(&step)).unwrap_err();
+    let shape = streamed.reduce.clone().unwrap();
+    let mut collect_all = streamed.clone();
+    collect_all.on_error = OnError::CollectAll;
+    let mut no_shape = streamed.clone();
+    no_shape.reduce = None;
+    let mut zero_chunks = streamed.clone();
+    zero_chunks.reduce.as_mut().unwrap().chunk_size = 0;
+    let mut streamed_with_a_stage = template.clone();
+    streamed_with_a_stage.streamed = true;
+    let mut unstreamed_without_one = streamed.clone();
+    unstreamed_without_one.streamed = false;
+    let mut bound_item = template.clone();
+    bound_item.stages = vec![task("fold", BoundInput::Value(b"a".to_vec()))];
+    let mut other_reducer = template.clone();
+    other_reducer.stages[0] =
+        Stage::Task(BoundStep { definition: TaskDefinitionId::new("other"), ..shape.reducer.clone() });
+    let mut fields_bound = template.clone();
+    let field = BoundField { name: "count".into(), value: FieldValue::Int(0) };
+    fields_bound.reduce.as_mut().unwrap().reducer.fields = vec![field];
+    fields_bound.stages = vec![Stage::Task(fields_bound.reduce.as_ref().unwrap().reducer.clone())];
+    for step in [
+        collect_all,
+        no_shape,
+        zero_chunks,
+        streamed_with_a_stage,
+        unstreamed_without_one,
+        bound_item,
+        other_reducer,
+        fields_bound,
+    ] {
+        assert_eq!(refused(step), MalformedStep::ReduceShape);
+    }
+    let mut shaped_flow = StepDescription::from(&template);
+    shaped_flow.kind = generated::CompositeKind::Flow as i32;
+    assert_eq!(
+        Step::try_from(&shaped_flow).unwrap_err(),
+        MalformedStep::ReduceShape,
+        "only a reduce takes reduce options"
     );
 }

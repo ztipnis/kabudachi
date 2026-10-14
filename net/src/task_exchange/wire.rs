@@ -97,6 +97,7 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
                 baggage: task.baggage.clone(),
             },
             member_of: None,
+            reduce_node: None,
         },
         clock,
     ))

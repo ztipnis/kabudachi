@@ -20,6 +20,14 @@ pub trait Observer {
     /// Takes one page of a composite's member outcomes as a call left it,
     /// versioned like a task's and published under the same rules.
     fn page_revision(&mut self, revision: CompositePage);
+
+    /// Whether every revision is stored by the time it is handed over, so the
+    /// scheduler may let go of what it published (a full item page) at once.
+    /// An observer that writes elsewhere returns `false`, and its driver tells
+    /// the scheduler of each stored write (`Scheduler::record_stored`).
+    fn stores_at_once(&self) -> bool {
+        false
+    }
 }
 
 /// The observer production uses: it ignores every revision.
@@ -32,4 +40,8 @@ impl Observer for NoObserver {
     fn composite_revision(&mut self, _: CompositeRecord) {}
 
     fn page_revision(&mut self, _: CompositePage) {}
+
+    fn stores_at_once(&self) -> bool {
+        true
+    }
 }

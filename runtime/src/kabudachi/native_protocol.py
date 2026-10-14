@@ -39,6 +39,9 @@ class Claim(Protocol):
     expansion: bool
     """Whether this is an expansion run: its input is a list a map is to be
     split over, and it reports the map that results."""
+    reduce_node: tuple[int, int] | None
+    """For a step of a reduce, its `(level, position)` in it: a step above
+    level 0 combines two results. `None` for any other task."""
 
 
 class Event(Protocol):
@@ -394,3 +397,12 @@ class Runtime(Protocol):
         what it takes from before it as `composite_results` has it,
         `("input", bytes)` for its own whole input stored as blobs, or `None`
         when the claim's `serialized_input` is the whole input."""
+
+    async def reduce_operands(self, task_run_id: str) -> list[tuple[str, Any]]:
+        """What the reduce step run `task_run_id` works on, in the order it
+        takes it: `("item", bytes)` for an item the reduce was sent,
+        `("result", bytes)` for its initial value or an earlier step's result,
+        and `("resolved", result)` for an item that is an entry of the
+        previous stage's results, `result` as `composite_results` has it.
+        Raises `RuntimeError` when the run is no reduce step's or an operand is
+        no longer held."""

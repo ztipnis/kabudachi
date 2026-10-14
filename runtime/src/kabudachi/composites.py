@@ -12,7 +12,7 @@ import functools
 import logging
 import threading
 import weakref
-from collections.abc import Awaitable, Iterable, Iterator
+from collections.abc import Awaitable, Iterable, Iterator, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +46,10 @@ MEMBER_BATCH_ITEMS: int = _native.MEMBER_BATCH_ITEMS
 MEMBER_BATCH_BYTES: int = _native.MEMBER_BATCH_BYTES
 """Most bytes of member input one batch holds; a member larger than this has
 its bound values stored as blobs before it is sent."""
+
+INLINE_VALUE_BYTES: int = _native.INLINE_VALUE_BYTES
+"""The longest item a reduce is sent inline: it sits in an item page, so a
+longer one is stored as blobs the reduce owns."""
 
 # What a member costs in a batch beyond the values bound in it: its
 # definition, version, options and framing.
@@ -129,6 +133,13 @@ class GroupHandle(CompositeHandle):
     member order."""
 
 
+class ReduceHandle(GroupHandle):
+    """A submitted reduce: it resolves to the folded value. A reduce streams
+    its items as a group streams its members, so it is a `GroupHandle`
+    (`Composites._stream` reads its `cancel_requested`); its composite's
+    results resolve to one value, which the reducer's serializer decodes."""
+
+
 async def composite_is_running(runtime: Runtime, composite_id: str) -> bool:
     """Whether the leader still has the composite running, or has lost track of it."""
     found = await runtime.composite_status(composite_id)
@@ -182,8 +193,11 @@ class Composites:
         under way), `PayloadTooLargeError` for a value bound in a flow that is
         past the hard limit alone, and `RunStoppedError` once the run is
         stopping."""
-        from kabudachi.flow import Group, MappedList
+        from kabudachi.flow import Group, MappedList, ReduceStep
 
+        if isinstance(step, ReduceStep) and isinstance(previous, list):
+            # A reduce a body in a task process called: its items stream on.
+            return self.stream_reduce(step, previous)
         if not self._hosted.has_loop():
             raise RuntimeNotStartedError(
                 "flows and groups can only be started while kabudachi.run() is serving"
@@ -195,6 +209,21 @@ class Composites:
         if isinstance(step, MappedList):
             return self._stream(*self._mapped(step))
         return self._submit_whole(step, previous)
+
+    def stream_reduce(self, step: Any, items: Sequence[Any]) -> ReduceHandle:
+        """Submits a reduce's head and sends `items` in batches, each encoded
+        as the reducer's item, lazily, waiting out SlowDown before each batch.
+        Raises `RunStoppedError` once the run is stopping."""
+        if not self._hosted.has_loop():
+            raise RuntimeNotStartedError("reduces can only be started while kabudachi.run() is serving")
+        if self._session.stopping:
+            raise RunStoppedError("the run is stopping, so no more reduces are accepted")
+        definition = step.definition
+        serializer = self._session.serializers.get(definition.serializer)
+        encoded = (serializer.encode(item, definition.input_type) for item in items)
+        return self._stream(
+            step.describe_streamed(self._session), encoded, handle=ReduceHandle, inline_bytes=INLINE_VALUE_BYTES
+        )
 
     def _submit_whole(self, step: Any, previous: Any) -> Any:
         tree = step.describe(self._session, previous)

@@ -11,6 +11,7 @@ use crate::protocol::ids::{IdGenerator, TaskId};
 use crate::task_record::{RecordKey, RecordVersion};
 use crate::time::{Clock, Duration, WallTime};
 
+use super::composite::ITEM_PAGES;
 use super::{Observer, Scheduler};
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
@@ -65,14 +66,29 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let pages = std::mem::take(&mut self.composites.unpublished_pages);
         let records = std::mem::take(&mut self.composites.unpublished);
         let mut published = 0;
+        let mut released = false;
         for (id, page) in pages {
-            if !self.composites.held.contains_key(&id) {
+            let Some(composite) = self.composites.held.get(&id) else {
+                continue;
+            };
+            let item_page = page >= ITEM_PAGES;
+            // An item page the leader no longer has was stored already, and
+            // is written again only to say its reduce is over.
+            if item_page && !composite.holds_item_page(page) && !self.composites.is_finished(&id) {
                 continue;
             }
             let version = self.leadership.next_version(recovery_epoch, term);
             let record = self.page_record_of(&id, page, version, published_at);
             self.observer.page_revision(record);
             published += 1;
+            if item_page {
+                self.item_page_published(&id, page, version);
+                released |= self.observer.stores_at_once() && self.release_item_page(&id, page);
+            }
+        }
+        // The bytes given back may end SlowDown, which no later call need.
+        if released {
+            self.update_pressure();
         }
         for id in records {
             if !self.composites.held.contains_key(&id) {

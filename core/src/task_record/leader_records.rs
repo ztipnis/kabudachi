@@ -191,14 +191,16 @@ impl<E> LeaderRecords<E> {
     }
 
     /// Settles `outcomes`, the write outcomes that arrived: notes each for
-    /// repair, lets `republished` take those of a republish, releases the
-    /// revisions held behind a stored one, and returns the answers settled,
-    /// in order. Ends with [`Self::end_unless_leading`].
+    /// repair, tells the scheduler which were stored (it lets go of an item
+    /// page only once its write is), lets `republished` take those of a
+    /// republish, releases the revisions held behind a stored one, and
+    /// returns the answers settled, in order. Ends with
+    /// [`Self::end_unless_leading`].
     #[must_use]
     pub fn settle<C: Clock, I: IdGenerator, O: Observer>(
         &mut self,
         node: &WorkerNode<C>,
-        scheduler: &Scheduler<C, I, O>,
+        scheduler: &mut Scheduler<C, I, O>,
         mut outcomes: Vec<WriteOutcome>,
         mut republished: impl FnMut(&WriteOutcome) -> bool,
         now: Instant,
@@ -206,6 +208,9 @@ impl<E> LeaderRecords<E> {
     ) -> Vec<Settled<E>> {
         for outcome in &outcomes {
             self.repair.settled(outcome, now);
+            if outcome.stored {
+                scheduler.record_stored(&outcome.write.key, outcome.write.version);
+            }
         }
         // The republish's own writes first; every other outcome is the gate's.
         outcomes.retain(|outcome| !republished(outcome));

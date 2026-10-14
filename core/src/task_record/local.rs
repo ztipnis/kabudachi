@@ -122,4 +122,8 @@ impl<C: Clock> Observer for LocalRecords<C> {
     fn page_revision(&mut self, revision: CompositePage) {
         self.keep(revision.into());
     }
+
+    fn stores_at_once(&self) -> bool {
+        true
+    }
 }

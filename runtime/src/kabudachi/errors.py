@@ -22,6 +22,22 @@ class DuplicateTaskError(TaskDefinitionError):
     """Two tasks were given the same name."""
 
 
+class ReduceEmptyError(KabudachiError, TypeError):
+    """A reduce of no items was given no initial value, so it has no result.
+    A `TypeError`, as `functools.reduce` raises for the same case."""
+
+
+class ReducerContinuedError(KabudachiError, RuntimeError):
+    """A reduce step returned a continuation instead of a value, so there was
+    no value for the step after it to fold. A reducer is a function of its
+    operands and returns its result."""
+
+
+class ReduceItemsLostError(KabudachiError, RuntimeError):
+    """A reduce's stored items fell short of the count its record names, so it
+    has no result: folding the fewer would give a wrong answer."""
+
+
 class UnknownSerializerError(KabudachiError, LookupError):
     """No serializer is registered under the requested name."""
 

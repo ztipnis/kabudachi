@@ -20,6 +20,7 @@ use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun, TaskRunIdentity};
 use crate::protocol::task::TaskRunState;
 use crate::scheduler::TraceContext;
+use crate::scheduler::composite::ReduceNode;
 use crate::time::{Duration, WallTime};
 
 /// The attempt number of a Task's first run.
@@ -51,6 +52,8 @@ pub struct NewTask {
     pub trace: TraceContext,
     /// The composite the task is a stage or member of, and its index there.
     pub member_of: Option<(CompositeId, u64)>,
+    /// Where the task sits in the reduce it is a step of.
+    pub reduce_node: Option<ReduceNode>,
 }
 
 impl NewTask {
@@ -81,6 +84,7 @@ impl NewTask {
             input_manifest: None,
             trace: TraceContext::default(),
             member_of: None,
+            reduce_node: None,
         }
     }
 }
@@ -110,6 +114,7 @@ pub fn new_task(new: NewTask) -> Task {
         baggage: new.trace.baggage,
         composite_id: new.member_of.as_ref().map(|(composite, _)| composite.clone().into()),
         composite_index: new.member_of.map_or(0, |(_, index)| index),
+        reduce_node: new.reduce_node.map(generated::ReduceNode::from),
     }
 }
 

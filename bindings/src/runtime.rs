@@ -11,7 +11,9 @@ use kabudachi_core::protocol::ids::{
     CompositeId, IncarnationId, ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::composite::{MEMBER_BATCH_BYTES, expansion_source, member_input, results};
+use kabudachi_core::scheduler::composite::{
+    MEMBER_BATCH_BYTES, ReduceOperand, expansion_source, member_input, reduce_operands, results,
+};
 use kabudachi_core::scheduler::{Completion, ReportRejection, Scheduler, SubmitRejection};
 use kabudachi_core::task_record::LocalRecords;
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
@@ -24,8 +26,8 @@ use tokio::task::JoinHandle;
 use crate::arguments::{SubmitArguments, memory_limits};
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::composite::{
-    PyBytesValue, PyManifest, PyMemberInput, PyResolved, member_batch, refuse_values_past_limit, spill_step,
-    state_name, step_from_tree,
+    PyBytesValue, PyManifest, PyMemberInput, PyReduceOperands, PyResolved, member_batch, refuse_values_past_limit,
+    spill_step, state_name, step_from_tree,
 };
 use crate::door::{Closed, DoorSource, Refusal, SchedulerDoor};
 use crate::election::{Publisher, run_election};
@@ -666,6 +668,29 @@ impl NativeRuntime {
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
             door.hold_member_input(&run, input.payload_bytes())?;
             Ok(PyMemberInput(input))
+        })
+    }
+
+    /// Returns an awaitable that resolves to what the reduce step run
+    /// `task_run_id` works on, in the order it takes it: a list of `("item",
+    /// bytes)`, `("result", bytes)` or `("resolved", <a result as
+    /// `composite_results` has it>)`.
+    ///
+    /// Raises `RuntimeError` if the run is unknown or not a reduce step's, or
+    /// an operand is no longer held.
+    fn reduce_operands<'py>(&self, py: Python<'py>, task_run_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let task = self
+            .door
+            .task_of_run(&TaskRunId::new(task_run_id))?
+            .ok_or_else(|| PyRuntimeError::new_err("no such run"))?;
+        let door = Arc::clone(&self.door);
+        let run = TaskRunId::new(task_run_id);
+        self.bridge.spawn_into_py(py, async move {
+            let operands = reduce_operands(&DoorSource(&door), &task)
+                .await
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            door.hold_member_input(&run, operands.iter().map(ReduceOperand::payload_bytes).sum())?;
+            Ok(PyReduceOperands(operands))
         })
     }
 

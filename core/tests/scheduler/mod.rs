@@ -13,6 +13,7 @@ mod scheduler_outcome;
 mod scheduler_queues;
 mod scheduler_reconcile;
 mod scheduler_records;
+mod scheduler_reduce;
 mod scheduler_retention;
 mod scheduler_streamed;
 mod scheduler_timing;

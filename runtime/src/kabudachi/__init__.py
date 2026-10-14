@@ -11,6 +11,7 @@ from kabudachi.config import QueueOptions, configure
 from kabudachi.errors import (
     DurabilityUnavailableError,
     PayloadTooLargeError,
+    ReduceEmptyError,
     ResultTooLargeError,
     ResultUnavailableError,
     TaskFailure,
@@ -24,7 +25,7 @@ from kabudachi.run_info import RunInfo, current_context
 from kabudachi.runner import run
 from kabudachi.serializers import register_serializer
 from kabudachi.status import CompositeStatus, Durability, TaskStatus
-from kabudachi.tasks import coalescing_task, ephemeral_task, task
+from kabudachi.tasks import coalescing_task, ephemeral_task, reducer, task
 
 __version__ = "0.1.0"
 
@@ -49,6 +50,8 @@ __all__ = [
     "PayloadTooLargeError",
     "process_init",
     "QueueOptions",
+    "ReduceEmptyError",
+    "reducer",
     "register_serializer",
     "ResultTooLargeError",
     "ResultUnavailableError",

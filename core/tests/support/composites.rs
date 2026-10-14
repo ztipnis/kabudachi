@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{
-    self, CompositeEntry, CompositePage, CompositeRecord, RecordVersion,
+    self, CompositeEntry, CompositePage, CompositeRecord, RecordVersion, composite_entry,
 };
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId, WorkerId};
 use kabudachi_core::scheduler::composite::{
-    BoundInput, BoundStep, CompositeFinished, CompositeKind, ItemInput, MemberBatch, OnError, PAGE_ENTRIES, Stage,
-    Step, StreamedMember, TaskOptions,
+    BoundInput, BoundStep, CompositeFinished, CompositeKind, ITEM_PAGES, ItemInput, MemberBatch, OnError, PAGE_ENTRIES,
+    ReduceShape, Stage, Step, StreamedMember, TaskOptions,
 };
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{Claim, Completion, Event, MemoryLimits};
@@ -37,6 +37,7 @@ pub fn one_stage_flow() -> Step {
             fields: Vec::new(),
         })],
         streamed: false,
+        reduce: None,
     }
 }
 
@@ -76,27 +77,27 @@ pub fn task_stage(name: &str, value: Option<&[u8]>) -> Stage {
 }
 
 pub fn flow_of(stages: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages, streamed: false }
+    Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages, streamed: false, reduce: None }
 }
 
 /// A group of `members` run side by side under `on_error`.
 pub fn group_of(on_error: OnError, members: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Group, on_error, stages: members, streamed: false }
+    Step { kind: CompositeKind::Group, on_error, stages: members, streamed: false, reduce: None }
 }
 
 /// A map whose members are bound to their items, failing fast.
 pub fn map_of(members: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: members, streamed: false }
+    Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: members, streamed: false, reduce: None }
 }
 
 /// A map whose items arrive in batches, each run by `each`.
 pub fn streamed_map(on_error: OnError) -> Step {
-    Step { kind: CompositeKind::Map, on_error, stages: vec![task_stage("each", None)], streamed: true }
+    Step { kind: CompositeKind::Map, on_error, stages: vec![task_stage("each", None)], streamed: true, reduce: None }
 }
 
 /// A group whose members arrive in batches.
 pub fn streamed_group(on_error: OnError) -> Step {
-    Step { kind: CompositeKind::Group, on_error, stages: Vec::new(), streamed: true }
+    Step { kind: CompositeKind::Group, on_error, stages: Vec::new(), streamed: true, reduce: None }
 }
 
 /// The item a streamed map's member `index` is given.
@@ -127,6 +128,87 @@ pub fn item_batch(map: &CompositeId, start: u64, count: u64, last: bool) -> Memb
             .collect(),
         last,
     }
+}
+
+/// The reducer every test reduce runs, taking its input.
+pub fn reducer() -> BoundStep {
+    BoundStep {
+        definition: TaskDefinitionId::new("fold"),
+        version: 0,
+        options: TaskOptions::on_queue("default"),
+        input: BoundInput::Previous,
+        fields: Vec::new(),
+    }
+}
+
+/// A reduce whose items stream in: a tree of `chunk`-item chunks when given,
+/// else a chain; seeded with `initial` when given.
+pub fn streamed_reduce(chunk: Option<u32>, initial: Option<&[u8]>) -> Step {
+    Step {
+        kind: CompositeKind::Reduce,
+        on_error: OnError::FailFast,
+        stages: Vec::new(),
+        streamed: true,
+        reduce: Some(ReduceShape {
+            reducer: reducer(),
+            tree: chunk.is_some(),
+            chunk_size: chunk.unwrap_or(0),
+            initial: initial.map(|value| BoundInput::Value(value.to_vec())),
+        }),
+    }
+}
+
+/// A reduce that is a stage of a flow: it takes the list the stage before it
+/// gives, through its one reducer stage, and is shaped as `streamed_reduce` is.
+pub fn reduce_template(chunk: Option<u32>, initial: Option<&[u8]>) -> Stage {
+    let mut step = streamed_reduce(chunk, initial);
+    step.streamed = false;
+    step.stages = vec![Stage::Task(reducer())];
+    Stage::Composite(step)
+}
+
+/// A batch of reduce items `start..`, one per value.
+pub fn items_batch(reduce: &CompositeId, start: u64, values: &[&[u8]], last: bool) -> MemberBatch {
+    MemberBatch {
+        composite_id: reduce.clone(),
+        start_index: start,
+        members: values
+            .iter()
+            .map(|value| StreamedMember::Item(ItemInput::Value(value.to_vec())))
+            .collect(),
+        last,
+    }
+}
+
+/// Submits `step` and streams it `values` as its one and last batch, which
+/// seals it and starts its steps.
+pub fn reduce_fed(fixture: &mut Fixture, step: Step, values: &[&[u8]]) -> CompositeId {
+    let reduce = submitted(fixture, step);
+    fixture.scheduler.submit_members(items_batch(&reduce, 0, values, true)).unwrap();
+    reduce
+}
+
+/// The result digest member `index` of `composite` settled with, as last
+/// published, if it settled with a value.
+pub fn value_of(fixture: &Fixture, composite: &CompositeId, index: u64) -> Option<Digest> {
+    match entry(fixture, composite, index)?.outcome {
+        Some(composite_entry::Outcome::Value(digest)) => Some(Digest::try_from(&digest).unwrap()),
+        _ => None,
+    }
+}
+
+/// The inline item entries of `reduce`'s item page `page`, as last published.
+pub fn items_on_page(fixture: &Fixture, reduce: &CompositeId, page: u32) -> Vec<(u64, Vec<u8>)> {
+    let Some(page) = fixture.spy.newest_page(reduce, ITEM_PAGES + page) else {
+        return Vec::new();
+    };
+    page.entries
+        .into_iter()
+        .map(|entry| match entry.outcome {
+            Some(composite_entry::Outcome::Item(bytes)) => (entry.index, bytes),
+            other => panic!("an inline item page holds items, not {other:?}"),
+        })
+        .collect()
 }
 
 /// Settings of a task stage, which the builders above leave at their defaults.
