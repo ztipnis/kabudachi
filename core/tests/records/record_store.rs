@@ -371,8 +371,15 @@ fn a_finished_record_that_chose_its_retention_is_kept_that_long_and_its_stub_too
     let mut shard_default = record("default", version(0, 0, 1, 2), "q");
     shard_default.finished = true;
     store.put(shard_default, NOW).unwrap();
+    // A task that keeps no result still keeps its record for the retention floor.
+    let mut floored = record("floored", version(0, 0, 1, 3), "q");
+    floored.finished = true;
+    floored.task.as_mut().unwrap().result_ttl_ms = Some(0);
+    store.put(floored, NOW).unwrap();
 
     assert_eq!(store.sweep(Instant::at(100)), 1, "the shard's default applies to the record that chose none");
+    assert_eq!(store.sweep(Instant::at(59_999)), 0, "a zero retention is raised to the floor");
+    assert_eq!(store.sweep(Instant::at(60_000)), 1);
     assert_eq!(store.next_due(), Some(Instant::at(120_000)));
     assert_eq!(store.sweep(Instant::at(120_000)), 2);
     assert_eq!(store.len(), 0);

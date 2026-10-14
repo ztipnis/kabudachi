@@ -321,7 +321,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     /// The worker that ran `run_id` says how mirroring its certified result
     /// went (`Stored` or `Failed`). Only that worker's word is taken, and only
-    /// for a run that succeeded; the same word again changes nothing.
+    /// for a run that succeeded; the same word again changes nothing, and a
+    /// `Failed` word after `Stored` is ignored.
     pub fn note_persistence(
         &mut self,
         worker: &WorkerId,
@@ -345,7 +346,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let run = self.owned_run(worker, run_id, TaskRunState::Succeeded)?;
         let wire = generated::PersistenceState::from(state) as i32;
-        if run.persistence == wire {
+        let stored = generated::PersistenceState::Stored as i32;
+        if run.persistence == wire || (run.persistence == stored && state == PersistenceState::Failed) {
             return Ok(());
         }
         run.persistence = wire;

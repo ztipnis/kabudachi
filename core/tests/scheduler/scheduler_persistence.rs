@@ -80,6 +80,9 @@ fn a_certified_run_is_pending_until_its_worker_says_how_its_mirror_went() {
     fixture.scheduler.note_persistence(&worker(), &run, PersistenceState::Stored).unwrap();
     fixture.scheduler.note_persistence(&worker(), &run, PersistenceState::Stored).unwrap();
     assert_eq!(persistence_of(&fixture, &run), generated::PersistenceState::Stored);
+    // Once stored, a late `Failed` word changes nothing.
+    fixture.scheduler.note_persistence(&worker(), &run, PersistenceState::Failed).unwrap();
+    assert_eq!(persistence_of(&fixture, &run), generated::PersistenceState::Stored);
     assert_eq!(
         published_persistence(&fixture, &run),
         generated::PersistenceState::Stored,
