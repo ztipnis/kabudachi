@@ -2,7 +2,7 @@
 //! hold for Python, a run taken back, an abort deadline, or one withdrawn.
 
 use std::sync::Arc;
-use std::time::Instant as StdInstant;
+use std::time::{Duration, Instant as StdInstant};
 
 use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::manifest::PAYLOAD_UNAVAILABLE_KIND;
@@ -128,15 +128,31 @@ impl Drop for MirrorRunning {
     }
 }
 
+/// How many times the record is read when it is missing or does not yet show
+/// the run's outcome, and the wait before the second read. The wait doubles
+/// each time, so the reads span about two seconds in all.
+const RECORD_READS: u32 = 4;
+const RECORD_READ_BACKOFF: Duration = Duration::from_millis(250);
+
 /// Whether the task's record shows `kept`'s run certified under its digest:
 /// a leader certified it though this worker's report was refused, as a resent
-/// report of a certified run is.
+/// report of a certified run is. A record that cannot be read, or that still
+/// shows the run unfinished, may only be behind the leader's answer, so it is
+/// read again a few times; a record that shows any other outcome is final.
 async fn certified_in_record(net: &Net, kept: &Mirror) -> bool {
-    let record = net.get_record(kept.task.clone()).await;
-    matches!(
-        task_standing(record.as_ref()),
-        TaskStanding::Succeeded { run, digest, .. } if run == kept.run && digest == kept.digest
-    )
+    let mut backoff = RECORD_READ_BACKOFF;
+    for read in 1..=RECORD_READS {
+        let record = net.get_record(kept.task.clone()).await;
+        match task_standing(record.as_ref()) {
+            TaskStanding::Succeeded { run, digest, .. } => return run == kept.run && digest == kept.digest,
+            TaskStanding::Unknown | TaskStanding::Unfinished if read < RECORD_READS => {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Why a run whose input travels as blobs cannot be handed to Python.

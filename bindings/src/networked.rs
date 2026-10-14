@@ -920,9 +920,11 @@ impl NetworkedRuntime {
 
     /// Returns an awaitable that resolves once the leader has taken the
     /// last report on every run this worker claimed and every result it is
-    /// mirroring is stored and reported (`True`), or the reconnect timeout
-    /// has passed or the worker left its shard (`False`). A mirror still
-    /// running then leaves its run's persistence `"pending"`.
+    /// mirroring has finished mirroring and had its persisted report queued
+    /// to the driver (`True`), or the reconnect timeout has passed or the
+    /// worker left its shard (`False`). The leader may not have answered
+    /// that last report yet. A mirror still running then leaves its run's
+    /// persistence `"pending"`.
     fn wait_until_reported<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let net = Arc::clone(&self.shared.net);
         let shared = Arc::clone(&self.shared);
