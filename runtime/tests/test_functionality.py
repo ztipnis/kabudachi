@@ -331,6 +331,18 @@ def test_the_phase6_library_works_for_an_independent_caller_across_workers_and_l
         assert configuration._caller.session.runtime.worker_id() != runtime.worker_id()
         assert await kabudachi.resume(pages.task_id) == paged
         assert await echo(Greeting(text="new caller")) == Greeting(text="new caller")
+        owner = weakref.ref(configuration._caller)
+        thread = configuration._caller.thread
+        configuration.configure(seeds=[worker.address for worker in cluster.live()])
+        assert owner() is None
+        assert not thread.is_alive()
+        assert await echo(Greeting(text="updated seeds")) == Greeting(text="updated seeds")
+        # A stopped event stream must not leave a dead session cached.
+        stopped_runtime = configuration._caller.session.runtime
+        stopped_runtime.shutdown()
+        await wait_for("the caller event stream to stop", configuration._caller.events.done)
+        assert await echo(Greeting(text="reconnected")) == Greeting(text="reconnected")
+        assert configuration._caller.session.runtime.worker_id() != stopped_runtime.worker_id()
         collect_caller(configuration)
 
         program = """

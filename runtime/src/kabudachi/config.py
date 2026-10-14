@@ -739,16 +739,24 @@ class Configuration:
 
         A networked worker reads all of its networked settings when `run()`
         starts, so a change made after that applies from the next `run()`.
+        Changing a caller's connection settings closes its current connection;
+        the next task call connects with the new settings.
 
         A failed task's error message is stored in the task's replicated
         record, so it can contain task data.
         """
-        configured ={**self._configured, **settings}
-        validated = self._validate(configured)
-        if "queue_options" in settings:
-            # A copy: a mapping the caller changes later changes nothing here.
-            configured["queue_options"] = dict(validated.queue_options)
-        self._configured, self._settings = configured, validated
+        with self._caller_lock:
+            configured = {**self._configured, **settings}
+            validated = self._validate(configured)
+            if "queue_options" in settings:
+                # A copy: a mapping the caller changes later changes nothing here.
+                configured["queue_options"] = dict(validated.queue_options)
+            if self._caller is not None and any(
+                getattr(self.settings(), name) != getattr(validated, name)
+                for name in ("seeds", "authority", "shard", "listen", "external_address", "result_backend")
+            ):
+                self._caller = None
+            self._configured, self._settings = configured, validated
 
     def resolve(self, name: str, task_value: Any = UNSET) -> Any:
         """The effective value of a setting: the task's own value if it chose

@@ -22,6 +22,8 @@ def current_session() -> Session:
         return session
     configuration = process_configuration()
     with configuration._caller_lock:
+        if configuration._caller is not None and configuration._caller.events.done():
+            configuration._caller = None
         if configuration._caller is None:
             settings = configuration.settings()
             if not settings.seeds and settings.authority is None:
@@ -53,8 +55,8 @@ async def _connect(configuration: Configuration, settings: Settings) -> tuple[Se
         events = asyncio.create_task(session.watch_events())
 
         def stopped(ended: asyncio.Task[Any]) -> None:
-            if not ended.cancelled() and ended.exception() is not None:
-                session.close_caller(ended.exception())
+            error = None if ended.cancelled() else ended.exception()
+            session.close_caller(error or RunStoppedError("the caller connection stopped"))
 
         events.add_done_callback(stopped)
         return session, events
@@ -64,9 +66,15 @@ async def _connect(configuration: Configuration, settings: Settings) -> tuple[Se
 
 
 def _serve_loop(ready: concurrent.futures.Future[asyncio.AbstractEventLoop]) -> None:
-    with asyncio.Runner() as runner:
-        ready.set_result(runner.get_loop())
-        runner.get_loop().run_forever()
+    try:
+        with asyncio.Runner() as runner:
+            ready.set_result(runner.get_loop())
+            runner.get_loop().run_forever()
+    except BaseException as error:
+        if not ready.done():
+            ready.set_exception(error)
+        else:
+            raise
 
 
 def _release(loop: asyncio.AbstractEventLoop, thread: threading.Thread, session: Session) -> None:
@@ -92,7 +100,7 @@ class _Caller:
         self.thread.start()
         self.loop = ready.result()
         try:
-            self.session, _ = asyncio.run_coroutine_threadsafe(
+            self.session, self.events = asyncio.run_coroutine_threadsafe(
                 _connect(weakref.proxy(configuration), _settings(configuration)), self.loop,
             ).result()
         except BaseException:
