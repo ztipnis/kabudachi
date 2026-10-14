@@ -8,10 +8,10 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelAnswer, CancelOutcome, CompositeAccepted, OutcomeAnswer, RunCertified, RunFailed, RunLost, SubmitComposite,
-    SubmitTask, TaskReject, TaskRejectReason, TaskResponse, task_response,
+    CancelAnswer, CancelOutcome, CompositeAccepted, MembersAccepted, OutcomeAnswer, RunCertified, RunFailed, RunLost,
+    SubmitComposite, SubmitTask, TaskReject, TaskRejectReason, TaskResponse, task_response,
 };
-use kabudachi_core::scheduler::composite::{Step, SubmittedComposite};
+use kabudachi_core::scheduler::composite::{self as scheduler_composite, Step, SubmittedComposite};
 use kabudachi_core::scheduler::{
     CancelRejection, Cancellation, Certification, Failure, LostRun, Outcome, OutcomeRejection, ReportRejection,
     Submission, Submitted, SubmitRejection, TraceContext,
@@ -128,10 +128,24 @@ pub(crate) fn submitted_composite(submit: &SubmitComposite) -> Result<SubmittedC
     })
 }
 
-/// The answer that a composite is recorded.
-pub(crate) fn composite_accepted(id: CompositeId) -> CompositeAccepted {
+/// The answer that a composite is recorded. `slow_down` is set when the
+/// leader asks submitters to wait.
+pub(crate) fn composite_accepted(id: CompositeId, slow_down: bool) -> CompositeAccepted {
     CompositeAccepted {
         composite_id: Some(id.into()),
+        slow_down,
+    }
+}
+
+/// The answer that a batch of `composite`'s members is taken.
+pub(crate) fn members_accepted(
+    composite: CompositeId,
+    accepted: scheduler_composite::MembersAccepted,
+) -> MembersAccepted {
+    MembersAccepted {
+        composite_id: Some(composite.into()),
+        members: accepted.members,
+        slow_down: accepted.slow_down,
     }
 }
 
@@ -151,7 +165,13 @@ pub(crate) fn submit_reject(rejection: SubmitRejection) -> TaskRejectReason {
         SubmitRejection::KeyNotReady => TaskRejectReason::TaskRejectNotReady,
         SubmitRejection::KeyBackpressure { .. } => TaskRejectReason::TaskRejectBackpressure,
         SubmitRejection::PayloadTooLarge { .. } => TaskRejectReason::TaskRejectPayloadTooLarge,
-        SubmitRejection::StepTakesInput => TaskRejectReason::TaskRejectMalformed,
+        SubmitRejection::StepTakesInput
+        | SubmitRejection::UnknownComposite
+        | SubmitRejection::NotStreamed
+        | SubmitRejection::MemberGap { .. }
+        | SubmitRejection::MemberKind => TaskRejectReason::TaskRejectMalformed,
+        SubmitRejection::NotReady => TaskRejectReason::TaskRejectNotReady,
+        SubmitRejection::CompositeFinished => TaskRejectReason::TaskRejectCompositeFinished,
     }
 }
 

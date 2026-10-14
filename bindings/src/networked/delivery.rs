@@ -15,6 +15,7 @@ use kabudachi_net::task_exchange::NotStored;
 use tokio::runtime::Handle;
 
 use super::seam::Shared;
+use super::slow_down::heard_slow_down;
 use crate::outcomes::PyEventKind;
 use crate::work::PyEvent;
 
@@ -135,7 +136,8 @@ pub(super) async fn deliver(
         return;
     };
     match response.result {
-        Some(task_response::Result::Submitted(_)) => {
+        Some(task_response::Result::Submitted(accepted)) => {
+            heard_slow_down(&shared, accepted.slow_down);
             {
                 let mut seam = shared.seam();
                 seam.delivering.remove(&task);

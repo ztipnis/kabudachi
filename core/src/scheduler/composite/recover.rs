@@ -6,12 +6,18 @@
 //! reach their holders in any order, so no field of one record is trusted to
 //! agree with another.
 
-use crate::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId};
+use std::collections::BTreeMap;
+
+use crate::manifest::Failure;
+use crate::protocol::ids::{CompositeId, IdGenerator, TaskDefinitionId, TaskId, TaskRunId};
+use crate::protocol::messages::prelude::*;
+use crate::protocol::records::TaskRunRecord as _;
+use crate::protocol::task::TaskRunState;
 use crate::time::Clock;
 
 use crate::scheduler::{Observer, Scheduler};
 
-use super::{CompositeKind, CompositeState, MemberOutcome, Stage};
+use super::{CompositeKind, CompositeState, EXPANSION_DEFINITION, LOST_KIND, MemberOutcome, Stage};
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Brings every composite rebuilt from records up to what its members'
@@ -21,6 +27,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     pub(in crate::scheduler) fn recover_composites(&mut self) {
         self.resolve_retainers();
         self.derive_continuations();
+        self.count_streamed_members();
+        self.note_claimed_members();
         let ids: Vec<CompositeId> = self.composites.held.keys().cloned().collect();
         for id in ids {
             if !self.holds_composite_back(&id) {
@@ -41,6 +49,57 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .collect();
         for task in ended {
             self.finish_continuation(&task);
+        }
+    }
+
+    /// Notes every member Task a worker holds, for the composite that counts
+    /// the running ones.
+    fn note_claimed_members(&mut self) {
+        let held: Vec<TaskId> = self
+            .tasks
+            .keys()
+            .filter(|task| {
+                self.current_run.get(*task).is_some_and(|run| {
+                    matches!(self.runs[run].current_state(), TaskRunState::Claimed | TaskRunState::Running)
+                })
+            })
+            .cloned()
+            .collect();
+        for task in held {
+            self.note_member_claimed(&task);
+        }
+    }
+
+    /// Raises the member count of every streamed composite to one past the
+    /// highest index any of its member Tasks or settled outcomes names. Its
+    /// record may lag what its old leader stored, so the larger count stands;
+    /// whether it is sealed only its record says, so a successor never seals
+    /// a composite on its own. An expansion run carries the map's id but is
+    /// not one of its members.
+    fn count_streamed_members(&mut self) {
+        let expansion = TaskDefinitionId::new(EXPANSION_DEFINITION);
+        let mut counts: BTreeMap<CompositeId, u64> = BTreeMap::new();
+        for task in self.tasks.values() {
+            let Some(id) = task.composite_id() else {
+                continue;
+            };
+            if task.task_definition_id() != expansion && self.composites.held.get(&id).is_some_and(|c| c.takes_batches()) {
+                let held = counts.entry(id).or_default();
+                *held = (*held).max(task.composite_index + 1);
+            }
+        }
+        for (id, composite) in &mut self.composites.held {
+            if !composite.takes_batches() {
+                continue;
+            }
+            let named = counts.get(id).copied().unwrap_or(0);
+            let settled = composite.outcomes.last_key_value().map_or(0, |(index, _)| index + 1);
+            let counted = composite.members.max(named).max(settled);
+            if counted > composite.members {
+                composite.members = counted;
+                composite.outcomes.grow_to(counted);
+                self.composites.unpublished.insert(id.clone());
+            }
         }
     }
 
@@ -85,7 +144,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let composite = &self.composites.held[id];
         let uncertain = &self.reconciliation;
         uncertain.is_uncertain_composite(id)
-            || (0..composite.step.stages.len() as u64).any(|index| {
+            || (composite.step.expands() && uncertain.is_uncertain(&id.expansion_task()))
+            || (0..composite.members).any(|index| {
                 let task = id.member_task(index);
                 uncertain.is_uncertain(&task)
                     || uncertain.is_uncertain_composite(&id.child(index))
@@ -109,10 +169,19 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if self.composites.held[id].state != CompositeState::Running {
             return;
         }
-        let stages = self.composites.held[id].step.stages.len() as u64;
+        let stages = self.composites.held[id].members;
         for index in 0..stages {
             self.settle_from_record(id, index);
         }
+        if self.composites.held[id].step.expands() && !self.composites.held[id].sealed {
+            self.resume_expansion(id);
+            if self.composites.held[id].state != CompositeState::Running {
+                return;
+            }
+        }
+        // After the expansion is resumed: it may be what seals the composite,
+        // and only a sealed composite has members nothing will send again.
+        self.settle_members_nothing_names(id);
         let composite = &self.composites.held[id];
         if let Some(failure) = composite.first_failure_it_fails_on() {
             self.finish_composite(id, CompositeState::Failed, Some(failure));
@@ -120,7 +189,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let open: Vec<u64> = (0..stages).filter(|index| !composite.outcomes.contains_key(index)).collect();
         match (composite.step.kind, open.first()) {
-            (_, None) => self.finish_composite(id, CompositeState::Succeeded, None),
+            (_, None) if composite.sealed => self.finish_composite(id, CompositeState::Succeeded, None),
             (CompositeKind::Flow, Some(&first)) => {
                 self.composites.held.get_mut(id).expect("held above").next_stage = first;
                 self.ensure_stage(id, first);
@@ -142,40 +211,78 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if composite.outcomes.contains_key(&index) {
             return;
         }
-        let outcome = match &composite.step.stages[index as usize] {
-            Stage::Task(_) => {
-                let task = id.member_task(index);
-                if !self.retention.holds(&task) {
-                    return;
+        // A streamed composite keeps no stage once it has started it: a member
+        // is a child composite only if there is one.
+        let is_task = match composite.step.stages.get(index as usize) {
+            Some(Stage::Task(_)) => true,
+            Some(Stage::Composite(_)) => false,
+            None => !self.composites.held.contains_key(&id.child(index)),
+        };
+        let outcome = if is_task {
+            let task = id.member_task(index);
+            if !self.retention.holds(&task) {
+                return;
+            }
+            self.member_outcome_of(&task)
+        } else {
+            let child = id.child(index);
+            self.composites.held.get(&child).and_then(|child_composite| match child_composite.state {
+                CompositeState::Running => None,
+                CompositeState::Succeeded => Some(MemberOutcome::Child(child.clone())),
+                CompositeState::Failed | CompositeState::Cancelled => {
+                    Some(MemberOutcome::Failed(child_composite.failure_or_cancelled()))
                 }
-                self.member_outcome_of(&task)
-            }
-            Stage::Composite(_) => {
-                let child = id.child(index);
-                self.composites.held.get(&child).and_then(|child_composite| match child_composite.state {
-                    CompositeState::Running => None,
-                    CompositeState::Succeeded => Some(MemberOutcome::Child(child.clone())),
-                    CompositeState::Failed | CompositeState::Cancelled => {
-                        Some(MemberOutcome::Failed(child_composite.failure_or_cancelled()))
-                    }
-                })
-            }
+            })
         };
         if let Some(outcome) = outcome {
             self.record_member(id, index, outcome);
         }
     }
 
-    /// Starts stage or member `index` of `id` unless its Task or child
-    /// composite exists. An expanding map's one member is the run that
-    /// splits its list.
-    fn ensure_stage(&mut self, id: &CompositeId, index: u64) {
-        if self.composites.held[id].step.expands() {
-            if !self.tasks.contains_key(&id.member_task(0)) {
-                self.submit_expansion(id);
-            }
+    /// Settles as lost every member of a sealed composite fed in batches that
+    /// has no outcome and no Task or child composite: the batch that made it
+    /// reached the holders in part, and with the composite sealed nothing
+    /// sends it again, so the composite would otherwise wait for it forever.
+    /// Members whose records are merely unknown were waited for before this.
+    fn settle_members_nothing_names(&mut self, id: &CompositeId) {
+        let composite = &self.composites.held[id];
+        if !composite.takes_batches() || !composite.sealed {
             return;
         }
-        self.start_stage(id, index);
+        let nameless: Vec<u64> = composite
+            .outcomes
+            .open()
+            .filter(|index| {
+                !self.tasks.contains_key(&id.member_task(*index)) && !self.composites.held.contains_key(&id.child(*index))
+            })
+            .collect();
+        for index in nameless {
+            let failure = Failure::new(LOST_KIND, "the record of the member was not found");
+            self.record_member(id, index, MemberOutcome::Failed(failure));
+        }
+    }
+
+    /// Starts stage or member `index` of `id` unless its Task or child
+    /// composite exists. A composite fed in batches starts nothing: its
+    /// submitter or its expansion run sends the members again if they are
+    /// missing.
+    fn ensure_stage(&mut self, id: &CompositeId, index: u64) {
+        if !self.composites.held[id].step.takes_batches() {
+            self.start_stage(id, index);
+        }
+    }
+
+    /// Takes up the expansion run of the expanding map `id` from its Task's
+    /// record: a run that ended seals the map, one that failed for good fails
+    /// it, and a map with no run yet gets one.
+    fn resume_expansion(&mut self, id: &CompositeId) {
+        let task = id.expansion_task();
+        if !self.tasks.contains_key(&task) {
+            self.submit_expansion(id);
+        } else if self.retention.holds(&task) {
+            if let Some(outcome) = self.member_outcome_of(&task) {
+                self.expansion_finished(id, outcome);
+            }
+        }
     }
 }

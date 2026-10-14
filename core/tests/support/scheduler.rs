@@ -42,18 +42,17 @@ impl Fixture {
     }
 
     pub fn not_leading() -> Self {
-        Self::not_leading_with(SequentialIds::new())
+        Self::not_leading_with(SequentialIds::new(), Spy::default())
     }
 
     /// A scheduler of a shard's next leader: it has not won yet, and its ids
     /// never repeat those `previous` handed out, as no two leaders' ids do.
     pub fn successor_of(previous: &Fixture) -> Self {
-        Self::not_leading_with(previous.ids.clone())
+        Self::not_leading_with(previous.ids.clone(), Spy::default())
     }
 
-    fn not_leading_with(ids: SequentialIds) -> Self {
+    fn not_leading_with(ids: SequentialIds, spy: Spy) -> Self {
         let clock = FakeClock::new();
-        let spy = Spy::default();
         let scheduler = Scheduler::with_observer(clock.clone(), ids.clone(), spy.clone());
         Self {
             ids,
@@ -61,6 +60,16 @@ impl Fixture {
             scheduler,
             spy,
         }
+    }
+
+    /// A leading scheduler with `limits`, publishing to `spy`.
+    pub fn leading_with(limits: MemoryLimits, spy: Spy) -> Self {
+        let mut fixture = Self::not_leading_with(SequentialIds::new(), spy);
+        fixture
+            .scheduler
+            .set_leadership_grant(Some(unbounded_grant()));
+        fixture.scheduler.set_memory_limits(Some(limits));
+        fixture
     }
 
     pub fn leading_with_limits(limits: MemoryLimits) -> Self {

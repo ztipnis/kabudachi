@@ -11,7 +11,7 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::composite::{
-    BoundInput, CompositeFinished, CompositeKind, CompositeState, EXPANSION_DEFINITION, MemberCounts, OnError,
+    CompositeFinished, CompositeKind, CompositeState, EXPANSION_DEFINITION, MemberCounts, OnError,
     PAGE_ENTRIES, Stage, Step,
 };
 use kabudachi_core::scheduler::{
@@ -322,20 +322,19 @@ fn a_map_of_more_members_than_a_page_holds_spreads_its_outcomes_over_pages_each_
     let mut fixture = Fixture::leading();
     let members = (0..=PAGE_ENTRIES).map(|item| task_stage("each", Some(&item.to_be_bytes()))).collect();
     let map = submitted(&mut fixture, map_of(members));
-    let mark = fixture.spy.mark();
     run_member(&mut fixture, &map, PAGE_ENTRIES, &PAGE_ENTRIES.to_be_bytes());
+    for index in 0..PAGE_ENTRIES - 1 {
+        run_member(&mut fixture, &map, index, &index.to_be_bytes());
+    }
+    assert!(fixture.spy.newest_page(&map, 0).is_none(), "page 0 is not whole yet");
+    assert!(fixture.spy.newest_page(&map, 1).is_some(), "page 1 is, with its one member");
+    let mark = fixture.spy.mark();
+    run_member(&mut fixture, &map, PAGE_ENTRIES - 1, &(PAGE_ENTRIES - 1).to_be_bytes());
     let published = fixture.spy.published_since(mark);
     let position_of = |wanted: &dyn Fn(&ShardRecord) -> bool| published.iter().position(wanted).unwrap();
     let page_zero = position_of(&|record| matches!(record, ShardRecord::Page(page) if page.index == 0));
-    let page_one = position_of(&|record| matches!(record, ShardRecord::Page(page) if page.index == 1));
     let composite = position_of(&|record| matches!(record, ShardRecord::Composite(_)));
-    assert!(
-        page_zero < composite && page_one < composite,
-        "the record now names two pages, so the lower one is published too, before the record"
-    );
-    for index in 0..PAGE_ENTRIES {
-        run_member(&mut fixture, &map, index, &index.to_be_bytes());
-    }
+    assert!(page_zero < composite, "a page is published before the record that ends the composite");
     let finished_events = finished(&mut fixture);
     assert_eq!(finished_events[0].pages, 2);
     assert_eq!(fixture.spy.newest_page(&map, 0).unwrap().entries.len() as u64, PAGE_ENTRIES);
@@ -570,6 +569,50 @@ fn a_step_too_large_for_the_task_record_fails_its_run_for_good() {
 }
 
 #[test]
+fn a_returned_step_too_large_only_after_spilling_fails_its_run_and_a_spilled_large_one_runs() {
+    let mut fixture = Fixture::leading();
+    let mut returning = |step: Step| {
+        let task = fixture
+            .scheduler
+            .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
+            .unwrap();
+        let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+        fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+        let step = step.spill().step;
+        let certified =
+            fixture.scheduler.complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step));
+        (claim, certified)
+    };
+    let (_, fits) = returning(group_of(OnError::FailFast, vec![task_stage("a", Some(&vec![0; 600 * 1024])); 3]));
+    assert!(fits.is_ok(), "three 600 KiB values leave the step");
+    // One more one-byte-bound stage adds this much; the group's own fields
+    // are left out, so the count below passes a record on stages alone.
+    let one = |count| group_of(OnError::FailFast, vec![task_stage("a", Some(b"x")); count]);
+    let stage_len = one(2).encoded_len() - one(1).encoded_len();
+    let stages = (MAX_RECORD_BYTES / stage_len + 1) as usize;
+    let (claim, refused) = returning(one(stages));
+    assert_eq!(refused, Err(ReportRejection::ContinuationTooLarge));
+    assert_eq!(fixture.scheduler.task_run(&claim.task_run_id).unwrap().current_state(), TaskRunState::Failed);
+}
+
+#[test]
+fn a_composite_is_refused_at_submit_for_its_structure_alone_and_one_with_large_values_is_taken() {
+    let mut fixture = Fixture::leading();
+    let one = |count| flow_of(vec![task_stage("a", Some(b"x")); count]);
+    let stage_len = one(2).encoded_len() - one(1).encoded_len();
+    let stages = (MAX_RECORD_BYTES / stage_len + 1) as usize;
+    let minted = fixture.scheduler.mint_composite(one(stages).spill().step, Some(worker()));
+    assert!(
+        matches!(fixture.scheduler.submit_composite(minted), Err(SubmitRejection::RecordTooLarge { .. })),
+        "too many stages pass a record whatever their values"
+    );
+
+    let large = flow_of(vec![task_stage("a", Some(&vec![0; 600 * 1024])); 3]).spill().step;
+    let minted = fixture.scheduler.mint_composite(large, Some(worker()));
+    assert!(fixture.scheduler.submit_composite(minted).is_ok(), "three 600 KiB values leave the step");
+}
+
+#[test]
 fn the_largest_step_a_record_can_carry_is_taken_and_one_byte_more_fails_its_run() {
     // Whether a step of this many payload bytes was taken, and the size of the record then published
     // with the empty version the limit is measured at.
@@ -677,31 +720,26 @@ fn stages_that_never_started_count_pending_after_their_flow_is_cancelled() {
     assert_eq!(status.counts, MemberCounts { pending: 2, running: 0, succeeded: 0, failed: 0, cancelled: 1 });
 }
 
-/// The map member a worker builds for one item it stored.
-fn item_member(item: &[u8]) -> Stage {
-    let Stage::Task(mut member) = task_stage("each", None) else { unreachable!("a task stage") };
-    member.input = BoundInput::Chunked(Manifest::new(vec![ManifestEntry::Blob(BlobKey::of(item))], 0));
-    Stage::Task(member)
-}
-
-fn map_over_previous() -> Stage {
+fn map_over_previous(on_error: OnError) -> Stage {
     Stage::Composite(Step {
         kind: CompositeKind::Map,
-        on_error: OnError::FailFast,
+        on_error,
         stages: vec![task_stage("each", None)],
+        streamed: false,
     })
 }
 
 #[test]
-fn a_map_after_a_stage_is_split_by_an_expansion_run_and_the_next_stage_takes_the_items_results() {
+fn a_map_after_a_stage_is_fed_by_its_expansion_run_and_the_next_stage_takes_the_items_results() {
     let mut fixture = Fixture::leading();
     let flow = submitted(
         &mut fixture,
-        flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(), task_stage("report", None)]),
+        flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(OnError::FailFast), task_stage("report", None)]),
     );
     run_member(&mut fixture, &flow, 0, b"[1, 2]");
     let map = flow.child(1);
-    let expansion = start_member(&mut fixture, &map, 0);
+    let expansion = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+    fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
     assert_eq!(expansion.task.task_definition_id().as_str(), EXPANSION_DEFINITION);
     let asked = Expansion::decode(&expansion.task.serialized_input[..]).unwrap();
     assert_eq!(
@@ -709,44 +747,39 @@ fn a_map_after_a_stage_is_split_by_an_expansion_run_and_the_next_stage_takes_the
         Manifest::new(vec![ManifestEntry::Blob(BlobKey::of(b"[1, 2]"))], 0)
     );
     assert_eq!(asked.producer, Some(TaskDefinitionId::new("load").into()));
-    let items = Step {
-        kind: CompositeKind::Map,
-        on_error: OnError::FailFast,
-        stages: vec![item_member(b"1"), item_member(b"2")],
-    };
+    fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+    run_member(&mut fixture, &map, 0, b"a");
     fixture
         .scheduler
-        .complete(&worker(), &expansion.task_run_id, items.digest(), Completion::Continues(items))
+        .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
         .unwrap();
-    let members = CompositeId::continuation_of(&expansion.task_run_id);
-    for index in 0..2 {
-        run_member(&mut fixture, &members, index, &[index as u8]);
-    }
+    assert!(finished(&mut fixture).is_empty(), "a sealed map still waits for its last member");
+    run_member(&mut fixture, &map, 1, b"b");
     let report = run_member(&mut fixture, &flow, 2, b"reported");
     assert_eq!(
         report.input_manifest().unwrap(),
-        Some(Manifest::new(vec![ManifestEntry::Page { composite: members, page: 0 }], 0)),
-        "the stage after the map takes the items' results, not the expansion's"
+        Some(Manifest::new(vec![ManifestEntry::Page { composite: map.clone(), page: 0 }], 0)),
+        "the stage after the map takes the items' results directly"
     );
     assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
-}
 
-#[test]
-fn a_list_that_splits_into_no_items_gives_the_next_stage_an_empty_list() {
-    let mut fixture = Fixture::leading();
-    let flow = submitted(
+    let empty = submitted(
         &mut fixture,
-        flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(), task_stage("report", None)]),
+        flow_of(vec![task_stage("load", Some(b"y")), map_over_previous(OnError::FailFast), task_stage("report", None)]),
     );
-    run_member(&mut fixture, &flow, 0, b"[]");
-    let expansion = start_member(&mut fixture, &flow.child(1), 0);
-    let items = Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: Vec::new() };
+    run_member(&mut fixture, &empty, 0, b"[]");
+    let split = fixture.scheduler.request_claim(&worker(), &empty.child(1).expansion_task()).unwrap();
+    fixture.scheduler.report_started(&worker(), &split.task_run_id).unwrap();
     fixture
         .scheduler
-        .complete(&worker(), &expansion.task_run_id, items.digest(), Completion::Continues(items))
+        .complete(&worker(), &split.task_run_id, Digest::blake3(b""), Completion::Final)
         .unwrap();
-    let report = run_member(&mut fixture, &flow, 2, b"reported");
-    assert_eq!(report.input_manifest().unwrap(), Some(Manifest::new(Vec::new(), 0)));
+    let last = run_member(&mut fixture, &empty, 2, b"none");
+    assert_eq!(
+        last.input_manifest().unwrap(),
+        Some(Manifest::new(Vec::new(), 0)),
+        "an empty list maps to an empty list"
+    );
     assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
 }
 
@@ -754,18 +787,60 @@ fn a_list_that_splits_into_no_items_gives_the_next_stage_an_empty_list() {
 fn an_expansion_that_fails_fails_its_map_and_the_flow_whatever_the_maps_error_policy() {
     for on_error in [OnError::FailFast, OnError::CollectAll] {
         let mut fixture = Fixture::leading();
-        let map = Stage::Composite(Step {
-            kind: CompositeKind::Map,
-            on_error,
-            stages: vec![task_stage("each", None)],
-        });
-        let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map]));
-        run_member(&mut fixture, &flow, 0, b"not a list");
-        fail_member(&mut fixture, &flow.child(1), 0, "SerializationError");
+        let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(on_error)]));
+        run_member(&mut fixture, &flow, 0, b"[1, 2, 3]");
+        let map = flow.child(1);
+        let expansion = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+        fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+        fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+        fixture.scheduler.fail(&worker(), &expansion.task_run_id, "SerializationError").unwrap();
         let finished = finished(&mut fixture);
-        assert_eq!(finished[0].state, CompositeState::Failed);
-        assert_eq!(finished[0].failure.as_ref().unwrap().kind, "SerializationError");
+        assert_eq!(finished[0].state, CompositeState::Failed, "{on_error:?}");
+        assert_eq!(finished[0].failure.as_ref().unwrap().kind, "SerializationError", "{on_error:?}");
     }
+}
+
+#[test]
+fn an_expansion_lost_with_its_worker_restreams_without_doubling() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(OnError::FailFast)]));
+    run_member(&mut fixture, &flow, 0, b"[1, 2, 3]");
+    let map = flow.child(1);
+    let first = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+    fixture.scheduler.report_started(&worker(), &first.task_run_id).unwrap();
+    fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+    let lost = fixture.lose_silent(&worker());
+    assert!(lost[0].replayed.is_some(), "the expansion is replayed");
+    let replay = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+    fixture.scheduler.report_started(&worker(), &replay.task_run_id).unwrap();
+    assert_eq!(fixture.scheduler.submit_members(item_batch(&map, 0, 3, false)).unwrap().members, 3);
+    assert_eq!(fixture.scheduler.pending_len(), 3, "the replay's batch made only the third member");
+    fixture
+        .scheduler
+        .complete(&worker(), &replay.task_run_id, Digest::blake3(b""), Completion::Final)
+        .unwrap();
+    for index in 0..3 {
+        run_member(&mut fixture, &map, index, b"done");
+    }
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
+}
+
+#[test]
+fn a_map_that_fails_fast_while_its_expansion_still_streams_cancels_the_expansion() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(OnError::FailFast)]));
+    run_member(&mut fixture, &flow, 0, b"[1, 2, 3]");
+    let map = flow.child(1);
+    let expansion = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+    fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+    fail_member(&mut fixture, &map, 0, "ValueError");
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Failed);
+    assert_eq!(
+        fixture.state(&map.expansion_task()),
+        TaskRunState::Cancelled,
+        "a worker still splitting the list is told to stop"
+    );
 }
 
 #[test]

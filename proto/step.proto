@@ -37,6 +37,10 @@ message StepDescription {
   OnError on_error = 2;
   // A flow's stages, or a group's or map's members, in order.
   repeated StageDescription stages = 3;
+  // Set on a group or map whose members are not in `stages` but arrive in
+  // SubmitMembers batches. A streamed map's `stages` holds its one template,
+  // which takes each item as its input; a streamed group's is empty.
+  bool streamed = 6;
 }
 
 message StageDescription {

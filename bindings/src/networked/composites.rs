@@ -10,18 +10,25 @@ use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::CompositeId;
 use kabudachi_core::protocol::messages::{TaskRejectReason, task_response};
-use kabudachi_core::scheduler::composite::{CompositeFinished, SubmittedComposite, Unresolved};
+use kabudachi_core::scheduler::composite::{CompositeFinished, MemberBatch, SubmittedComposite, Unresolved};
 use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::payload_memory::Taken;
 use kabudachi_net::result_transport::ResultEvent;
 use kabudachi_net::task_exchange::NotStored;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::prelude::*;
 use tokio::runtime::Handle;
 use tokio::time::Instant;
 
 use super::delivery::blob_submission_deadline;
-use super::seam::Shared;
+use super::seam::{GONE_MESSAGE, Shared};
+use super::slow_down::heard_slow_down;
+use crate::errors::backpressure_error;
 use crate::outcomes::PyEventKind;
 use crate::work::PyEvent;
+
+/// What a `BackpressureError` says when the shard's stores are full for now.
+const STORES_FULL_MESSAGE: &str = "the shard's stores cannot take the members' payloads now";
 
 /// Asks leaders, in the background on `handle`, to run `submitted`, and
 /// returns its composite id. `values` are the bound inputs too large to
@@ -51,6 +58,7 @@ impl Shared {
             let mut seam = self.seam();
             seam.delivering_composites.remove(id);
             seam.awaiting_composites.remove(id);
+            seam.refused_composites.insert(id.clone());
             seam.events.push_back(PyEvent::refused(id.as_str(), reason));
         }
         self.wake();
@@ -115,7 +123,8 @@ async fn deliver_composite(shared: Arc<Shared>, submitted: SubmittedComposite, v
         return shared.abandon_composite(&id);
     };
     match response.result {
-        Some(task_response::Result::Composite(_)) => {
+        Some(task_response::Result::Composite(accepted)) => {
+            heard_slow_down(&shared, accepted.slow_down);
             {
                 let mut seam = shared.seam();
                 seam.delivering_composites.remove(&id);
@@ -130,6 +139,79 @@ async fn deliver_composite(shared: Arc<Shared>, submitted: SubmittedComposite, v
         },
         _ => shared.refuse_composite(&id, "an answer that is not about a submission"),
     }
+}
+
+/// Takes `batch` to the shard's leader once the composite's own submission
+/// from here, if any, has been answered, after storing the `values` it names
+/// by manifest as blobs the composite owns (counted in flight until then).
+/// Resolves to `"accepted"`, or `"finished"` when the composite is over (or
+/// its own submission was refused) and takes no more members. The leader is
+/// asked again after a refusal for now, with the same batch, so a batch whose
+/// answer was lost creates nothing twice.
+///
+/// Fails with `BackpressureError` when the shard's stores are full for now or
+/// the leader refuses the batch as backpressure, `ValueError` when the leader
+/// finds it malformed, and `RuntimeError` once the worker has left its shard.
+pub(super) async fn send_members(
+    shared: &Arc<Shared>,
+    batch: MemberBatch,
+    values: Vec<(Vec<u8>, Taken)>,
+) -> PyResult<&'static str> {
+    let id = batch.composite_id.clone();
+    while shared.seam().delivering_composites.contains(&id) {
+        if shared.net.has_left_shard() {
+            return Err(PyRuntimeError::new_err(GONE_MESSAGE));
+        }
+        tokio::time::sleep(shared.retry.ask_again_after).await;
+    }
+    if shared.seam().refused_composites.contains(&id) {
+        return Ok("finished");
+    }
+    let at = Instant::now() + blob_submission_deadline();
+    let owner = BlobOwner::Composite(id);
+    for (value, _in_flight) in &values {
+        let stored = tokio::time::timeout_at(
+            at,
+            shared
+                .net
+                .store_payload_at_leader(BlobRole::Input, &owner, value, shared.retry),
+        )
+        .await
+        .unwrap_or(Err(NotStored::Refused));
+        match stored {
+            Ok(_) => {}
+            Err(NotStored::LeftShard) => return Err(PyRuntimeError::new_err(GONE_MESSAGE)),
+            Err(NotStored::Refused) => return Err(backpressure(STORES_FULL_MESSAGE)),
+        }
+    }
+    let Some(response) = shared.net.submit_members(&batch, shared.retry).await else {
+        return Err(PyRuntimeError::new_err(GONE_MESSAGE));
+    };
+    match response.result {
+        Some(task_response::Result::Members(accepted)) => {
+            heard_slow_down(shared, accepted.slow_down);
+            Ok("accepted")
+        }
+        Some(task_response::Result::Reject(reject)) => match TaskRejectReason::try_from(reject.reason) {
+            Ok(TaskRejectReason::TaskRejectCompositeFinished) => Ok("finished"),
+            Ok(
+                TaskRejectReason::TaskRejectBackpressure
+                | TaskRejectReason::TaskRejectTooLarge
+                | TaskRejectReason::TaskRejectPayloadTooLarge,
+            ) => Err(backpressure("the shard's leader cannot take the members now")),
+            Ok(reason) => Err(PyValueError::new_err(format!(
+                "the shard's leader refused the members: {}",
+                reason.as_str_name()
+            ))),
+            Err(_) => Err(PyValueError::new_err("the leader refused the members for a reason this worker cannot read")),
+        },
+        _ => Err(PyValueError::new_err("an answer that is not about the members")),
+    }
+}
+
+/// A `BackpressureError` raised from the worker's own runtime.
+fn backpressure(message: &str) -> PyErr {
+    Python::attach(|py| backpressure_error(py, message.to_owned()))
 }
 
 /// Asks leaders to cancel the composite `id` until one answers, once its own

@@ -29,6 +29,19 @@ pub use resolve::{
     CompositeSource, MemberInput, Resolved, Unresolved, expansion_source, member_input, resolve_manifest, results,
 };
 
+/// The most members one batch of a streamed composite carries.
+pub const MEMBER_BATCH_ITEMS: u64 = 1024;
+
+/// The most inline input one batch of a streamed composite carries.
+pub const MEMBER_BATCH_BYTES: u64 = 512 * 1024;
+
+/// A step encoded in at most this many bytes keeps its bound values inline.
+pub const STEP_INLINE_BYTES: u64 = 256 * 1024;
+
+/// Above `STEP_INLINE_BYTES`, a bound value longer than this is stored as
+/// blobs: a one-chunk manifest costs about as much.
+pub const INLINE_VALUE_BYTES: usize = 64;
+
 /// How many member outcomes one page of a composite holds.
 pub const PAGE_ENTRIES: u64 = 1024;
 
@@ -302,8 +315,146 @@ pub(crate) fn failure_of(task: &TaskId, state: TaskRunState, kind: &str, message
 pub struct Step {
     pub kind: CompositeKind,
     pub on_error: OnError,
-    /// A flow's stages, or a group's or map's members, in order.
+    /// A flow's stages, or a group's or map's members, in order. A streamed
+    /// group has none, and a streamed map holds its one template.
     pub stages: Vec<Stage>,
+    /// The members are not in `stages`: they arrive in batches, and the
+    /// template, if any, takes each item as its input.
+    pub streamed: bool,
+}
+
+/// One member of a streamed composite, as its submitter sends it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamedMember {
+    /// A map's item: its template's whole input.
+    Item(ItemInput),
+    /// A group's member.
+    Stage(Stage),
+}
+
+/// A map item's bytes, inline or as the blobs of a manifest: a
+/// [`BoundInput`] that is never open, since an item is the whole input.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ItemInput {
+    Value(Vec<u8>),
+    Chunked(Manifest),
+}
+
+impl From<ItemInput> for BoundInput {
+    fn from(input: ItemInput) -> Self {
+        match input {
+            ItemInput::Value(bytes) => BoundInput::Value(bytes),
+            ItemInput::Chunked(manifest) => BoundInput::Chunked(manifest),
+        }
+    }
+}
+
+impl StreamedMember {
+    /// The input the member's Task will carry inline, which is what a batch
+    /// of members is bounded by on the wire: the length of a `Value`, and
+    /// nothing for a chunked item or stage, whose bytes are blobs, or for a
+    /// composite stage.
+    pub fn input_bytes(&self) -> u64 {
+        match self {
+            StreamedMember::Item(ItemInput::Value(bytes))
+            | StreamedMember::Stage(Stage::Task(BoundStep { input: BoundInput::Value(bytes), .. })) => {
+                bytes.len() as u64
+            }
+            _ => 0,
+        }
+    }
+
+    /// What the member weighs against the memory budget once its Task is
+    /// submitted: its whole input, inline or as the blobs of a manifest.
+    pub fn budget_bytes(&self) -> u64 {
+        match self {
+            StreamedMember::Item(ItemInput::Value(bytes))
+            | StreamedMember::Stage(Stage::Task(BoundStep { input: BoundInput::Value(bytes), .. })) => {
+                bytes.len() as u64
+            }
+            StreamedMember::Item(ItemInput::Chunked(manifest))
+            | StreamedMember::Stage(Stage::Task(BoundStep { input: BoundInput::Chunked(manifest), .. })) => {
+                manifest.total_bytes()
+            }
+            StreamedMember::Stage(_) => 0,
+        }
+    }
+
+    /// The member with its bound values spilled when its inline bytes pass
+    /// `inline_bytes` (at most `MEMBER_BATCH_BYTES`, so any batch fits one
+    /// frame): an item's one value whole, a stage's values, each only when
+    /// longer than `INLINE_VALUE_BYTES`, since a manifest costs about that. Every value is owned by the streamed composite:
+    /// a composite member's nested values too, since only a top-level group,
+    /// a root, streams composite members.
+    pub fn spill(self, inline_bytes: u64) -> (StreamedMember, Vec<SpilledValue>) {
+        let inline_bytes = inline_bytes.min(MEMBER_BATCH_BYTES);
+        let mut values = Vec::new();
+        let member = match self {
+            StreamedMember::Item(ItemInput::Value(bytes))
+                if bytes.len() as u64 > inline_bytes && bytes.len() > INLINE_VALUE_BYTES =>
+            {
+                let manifest = Manifest::chunk(&bytes).manifest;
+                values.push(SpilledValue { bytes });
+                StreamedMember::Item(ItemInput::Chunked(manifest))
+            }
+            StreamedMember::Stage(stage) if stage.inline_bytes() > inline_bytes => {
+                StreamedMember::Stage(stage.spill(&mut values))
+            }
+            unchanged => unchanged,
+        };
+        (member, values)
+    }
+}
+
+/// The next members of a streamed composite, starting at `start_index`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemberBatch {
+    pub composite_id: CompositeId,
+    pub start_index: u64,
+    pub members: Vec<StreamedMember>,
+    /// No member follows these.
+    pub last: bool,
+}
+
+impl MemberBatch {
+    /// The length of the batch as it goes on the wire, which one message
+    /// must hold.
+    pub fn encoded_len(&self) -> u64 {
+        generated::SubmitMembers::from(self).encoded_len() as u64
+    }
+}
+
+/// What a leader answers a batch it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MembersAccepted {
+    /// How many members the composite holds now.
+    pub members: u64,
+    /// The leader's memory is past its soft limit.
+    pub slow_down: bool,
+}
+
+/// A step with its large bound values moved to blobs, and the values, in
+/// the order the step names them, for the submitter to store before it
+/// submits (each stored as `Manifest::chunk` cuts it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spilled {
+    pub step: Step,
+    pub values: Vec<SpilledValue>,
+}
+
+/// One value moved out of a step. It is owned by the root of the step's
+/// tree, whatever composite in it holds its stage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpilledValue {
+    pub bytes: Vec<u8>,
+}
+
+/// `bytes` as the manifest of its chunks, with the bytes kept for the caller
+/// to store.
+fn spill_value(bytes: Vec<u8>, values: &mut Vec<SpilledValue>) -> BoundInput {
+    let manifest = Manifest::chunk(&bytes).manifest;
+    values.push(SpilledValue { bytes });
+    BoundInput::Chunked(manifest)
 }
 
 /// One stage of a flow, or one member of a group or map.
@@ -403,6 +554,16 @@ pub enum MalformedStep {
     BadField,
     #[error("a bound input's manifest cannot be read")]
     BadManifest,
+    #[error("a flow cannot be streamed")]
+    StreamedFlow,
+    #[error("only a root composite can be streamed, not a stage or member of one")]
+    StreamedBelowRoot,
+    #[error("a streamed group has no stages and a streamed map has exactly one template that takes its input")]
+    StreamedWithStages,
+    #[error("a streamed member names neither an item nor a stage")]
+    EmptyMember,
+    #[error("a member batch names no composite")]
+    NoComposite,
     #[error("the bytes are not an encoded step description")]
     Undecodable,
 }
@@ -420,6 +581,29 @@ impl Step {
         generated::StepDescription::from(self).encode_to_vec()
     }
 
+    /// The length of the step's encoding.
+    pub fn encoded_len(&self) -> u64 {
+        generated::StepDescription::from(self).encoded_len() as u64
+    }
+
+    /// This step as it should be stored: unchanged when it encodes in at
+    /// most `STEP_INLINE_BYTES`, otherwise with every bound value longer
+    /// than `INLINE_VALUE_BYTES` replaced by its chunks' manifest, depth
+    /// first in stage order. The same step always spills the same.
+    pub fn spill(self) -> Spilled {
+        let mut values = Vec::new();
+        if self.encoded_len() <= STEP_INLINE_BYTES {
+            return Spilled { step: self, values };
+        }
+        let step = self.spill_into(&mut values);
+        Spilled { step, values }
+    }
+
+    fn spill_into(self, values: &mut Vec<SpilledValue>) -> Step {
+        let stages = self.stages.into_iter().map(|stage| stage.spill(values)).collect();
+        Step { stages, ..self }
+    }
+
     /// The BLAKE3 digest of the step's encoding: what a returning run's
     /// result digest is when the step is its continuation.
     pub fn digest(&self) -> Digest {
@@ -429,6 +613,9 @@ impl Step {
     /// Whether the step needs an input from whatever runs before it: its
     /// first stage does (a flow), or any member does (a group or map).
     pub fn takes_input(&self) -> bool {
+        if self.streamed {
+            return false;
+        }
         match self.kind {
             CompositeKind::Flow => self.stages.first().is_some_and(Stage::takes_input),
             _ => self.stages.iter().any(Stage::takes_input),
@@ -439,7 +626,20 @@ impl Step {
     /// expansion run must first split into items.
     pub fn expands(&self) -> bool {
         self.kind == CompositeKind::Map
+            && !self.streamed
             && matches!(self.stages.as_slice(), [Stage::Task(template)] if matches!(template.input, BoundInput::Previous))
+    }
+
+    /// Whether the step's members arrive in batches: it is streamed, or it is
+    /// a map whose expansion run sends the items it splits a list into.
+    pub(in crate::scheduler) fn takes_batches(&self) -> bool {
+        self.streamed || self.expands()
+    }
+
+    /// Whether the step expands a list and its template has fields set: each
+    /// item is the template's whole input, so none could be given them.
+    fn template_has_fields(&self) -> bool {
+        self.expands() && matches!(self.stages.as_slice(), [Stage::Task(template)] if !template.fields.is_empty())
     }
 
     /// A map's members are all bound to their items, or it has one member
@@ -474,6 +674,40 @@ impl ExpansionRequest {
 }
 
 impl Stage {
+    /// Whether this stage is a composite that waits for members to be sent,
+    /// at any depth.
+    pub fn is_or_holds_streamed(&self) -> bool {
+        match self {
+            Stage::Task(_) => false,
+            Stage::Composite(step) => step.streamed || step.stages.iter().any(Stage::is_or_holds_streamed),
+        }
+    }
+
+    /// The stage with every bound value longer than `INLINE_VALUE_BYTES`
+    /// moved to `values`, nested composites' included.
+    fn spill(self, values: &mut Vec<SpilledValue>) -> Stage {
+        match self {
+            Stage::Task(BoundStep { input: BoundInput::Value(bytes), definition, version, options, fields })
+                if bytes.len() > INLINE_VALUE_BYTES =>
+            {
+                let input = spill_value(bytes, values);
+                Stage::Task(BoundStep { definition, version, options, input, fields })
+            }
+            Stage::Task(step) => Stage::Task(step),
+            Stage::Composite(step) => Stage::Composite(step.spill_into(values)),
+        }
+    }
+
+    /// The bytes of the bound values the stage carries inline, nested
+    /// composites' included.
+    fn inline_bytes(&self) -> u64 {
+        match self {
+            Stage::Task(BoundStep { input: BoundInput::Value(bytes), .. }) => bytes.len() as u64,
+            Stage::Task(_) => 0,
+            Stage::Composite(step) => step.stages.iter().map(Stage::inline_bytes).sum(),
+        }
+    }
+
     /// Whether the stage needs an input from whatever runs before it.
     pub fn takes_input(&self) -> bool {
         match self {
@@ -510,12 +744,29 @@ impl TryFrom<&generated::StepDescription> for Step {
         };
         // A map over an empty list is a map of no members, which finishes as
         // it starts; a flow or group of nothing is a mistake.
-        if wire.stages.is_empty() && kind != CompositeKind::Map {
+        if wire.streamed {
+            if kind == CompositeKind::Flow {
+                return Err(MalformedStep::StreamedFlow);
+            }
+            if wire.stages.len() > 1 {
+                return Err(MalformedStep::StreamedWithStages);
+            }
+        } else if wire.stages.is_empty() && kind != CompositeKind::Map {
             return Err(MalformedStep::NoStages);
         }
         let stages = wire.stages.iter().map(Stage::try_from).collect::<Result<Vec<_>, _>>()?;
-        let step = Step { kind, on_error, stages };
-        if kind == CompositeKind::Map && !step.is_map_shaped() {
+        let step = Step { kind, on_error, stages, streamed: wire.streamed };
+        if step.streamed {
+            let fed = match kind {
+                CompositeKind::Map => matches!(
+                    step.stages.as_slice(),
+                    [Stage::Task(template)] if matches!(template.input, BoundInput::Previous) && template.fields.is_empty()
+                ),
+                _ => step.stages.is_empty(),
+            };
+            return if fed { Ok(step) } else { Err(MalformedStep::StreamedWithStages) };
+        }
+        if kind == CompositeKind::Map && (!step.is_map_shaped() || step.template_has_fields()) {
             return Err(MalformedStep::MapShape);
         }
         Ok(step)
@@ -529,9 +780,12 @@ impl TryFrom<&generated::StageDescription> for Stage {
         match wire.step.as_ref() {
             None => Err(MalformedStep::EmptyStage),
             Some(generated::stage_description::Step::Task(task)) => BoundStep::try_from(task).map(Stage::Task),
-            Some(generated::stage_description::Step::Composite(step)) => {
-                Step::try_from(step).map(Stage::Composite)
-            }
+            // Only a step submitted as a root is fed in batches: a stage is
+            // described whole.
+            Some(generated::stage_description::Step::Composite(step)) => match Step::try_from(step)? {
+                step if step.streamed => Err(MalformedStep::StreamedBelowRoot),
+                step => Ok(Stage::Composite(step)),
+            },
         }
     }
 }
@@ -608,6 +862,58 @@ impl From<&Step> for generated::StepDescription {
             kind: kind as i32,
             on_error: generated::OnError::from(step.on_error) as i32,
             stages: step.stages.iter().map(generated::StageDescription::from).collect(),
+            streamed: step.streamed,
+        }
+    }
+}
+
+impl TryFrom<&generated::StreamedMember> for StreamedMember {
+    type Error = MalformedStep;
+
+    fn try_from(wire: &generated::StreamedMember) -> Result<Self, MalformedStep> {
+        use generated::streamed_member::Member;
+        match wire.member.as_ref().ok_or(MalformedStep::EmptyMember)? {
+            Member::Value(bytes) => Ok(StreamedMember::Item(ItemInput::Value(bytes.clone()))),
+            Member::ValueManifest(manifest) => Ok(StreamedMember::Item(ItemInput::Chunked(
+                Manifest::try_from(manifest).map_err(|_| MalformedStep::BadManifest)?,
+            ))),
+            Member::Stage(stage) => Stage::try_from(stage).map(StreamedMember::Stage),
+        }
+    }
+}
+
+impl From<&StreamedMember> for generated::StreamedMember {
+    fn from(member: &StreamedMember) -> Self {
+        use generated::streamed_member::Member;
+        let member = match member {
+            StreamedMember::Item(ItemInput::Value(bytes)) => Member::Value(bytes.clone()),
+            StreamedMember::Item(ItemInput::Chunked(manifest)) => Member::ValueManifest(manifest.clone().into()),
+            StreamedMember::Stage(stage) => Member::Stage(stage.into()),
+        };
+        generated::StreamedMember { member: Some(member) }
+    }
+}
+
+impl TryFrom<&generated::SubmitMembers> for MemberBatch {
+    type Error = MalformedStep;
+
+    fn try_from(wire: &generated::SubmitMembers) -> Result<Self, MalformedStep> {
+        Ok(MemberBatch {
+            composite_id: CompositeId::from(wire.composite_id.clone().ok_or(MalformedStep::NoComposite)?),
+            start_index: wire.start_index,
+            members: wire.items.iter().map(StreamedMember::try_from).collect::<Result<Vec<_>, _>>()?,
+            last: wire.last,
+        })
+    }
+}
+
+impl From<&MemberBatch> for generated::SubmitMembers {
+    fn from(batch: &MemberBatch) -> Self {
+        generated::SubmitMembers {
+            composite_id: Some(batch.composite_id.clone().into()),
+            start_index: batch.start_index,
+            items: batch.members.iter().map(generated::StreamedMember::from).collect(),
+            last: batch.last,
         }
     }
 }

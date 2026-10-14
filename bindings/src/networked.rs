@@ -49,6 +49,7 @@ mod host;
 mod observed;
 mod results;
 mod seam;
+mod slow_down;
 mod start;
 
 use std::net::SocketAddr;
@@ -57,13 +58,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::blob::{BlobKey, BlobOwner, MAX_BLOB_BYTES};
-use kabudachi_core::manifest::{INLINE_PAYLOAD_BYTES, Manifest, fits_inline};
+use kabudachi_core::manifest::{Manifest, fits_inline};
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId, Uuid7Ids};
 use kabudachi_core::protocol::messages::Task;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::composite::{
-    SubmittedComposite, expansion_source, member_input, results,
+    MEMBER_BATCH_BYTES, SubmittedComposite, expansion_source, member_input, results,
 };
 use kabudachi_core::scheduler::{SubmitRejection, mint};
 use kabudachi_core::time::{RealClock, WallTime};
@@ -71,6 +72,7 @@ use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::composites::{CountingSource, NetSource};
 use kabudachi_net::executor::{Report, executor_channel};
 use kabudachi_net::handoff::HandedOff;
+use kabudachi_net::payload_memory::Taken;
 use kabudachi_net::worker::Worker;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -79,15 +81,15 @@ use tokio::sync::watch;
 use crate::arguments::SubmitArguments;
 use crate::bridge::CLOSED_MESSAGE;
 use crate::composite::{
-    CompositeStatusTuple, PyBytesValue, PyManifest, PyMemberInput, PyResolved, record_status,
-    refuse_values_past_limit, step_from_tree, take_large_values,
+    CompositeStatusTuple, PyBytesValue, PyManifest, PyMemberInput, PyResolved, member_batch, record_status,
+    refuse_values_past_limit, spill_step, step_from_tree,
 };
 use crate::errors::backpressure_error;
 use crate::health;
 use crate::work::PyTaskRecord;
 
 use self::composites::{
-    cancel_composite_at_leader, read_until, send_composite, stored_until,
+    cancel_composite_at_leader, read_until, send_composite, send_members, stored_until,
 };
 use self::delivery::{cancel_at_leader, send_submission};
 use self::host::Host;
@@ -501,24 +503,12 @@ impl NetworkedRuntime {
         if !self.host.bridge().is_open() {
             return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
         }
-        let mut step = step_from_tree(tree)?;
+        let step = step_from_tree(tree)?;
         if step.takes_input() {
             return Err(PyValueError::new_err(SubmitRejection::StepTakesInput.to_string()));
         }
-        let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
-        refuse_values_past_limit(py, self.shared.net.payload_memory().hard_limit(), &values)?;
-        let mut stored = Vec::with_capacity(values.len());
-        for value in values {
-            // Too many payloads in flight now: refused for now. Whatever was
-            // counted so far is dropped, and counts no more.
-            let Ok(Some(taken)) = self.shared.net.payload_memory().try_take(value.len() as u64) else {
-                return Err(backpressure_error(
-                    py,
-                    "too many large payloads in flight past the hard memory limit".into(),
-                ));
-            };
-            stored.push((value, taken));
-        }
+        let (step, values) = spill_step(step);
+        let stored = self.take_in_flight(py, values)?;
         let submitted = SubmittedComposite {
             composite_id: Uuid7Ids.next_composite_id(),
             submitted_at: WallTime::now(&self.clock),
@@ -526,6 +516,59 @@ impl NetworkedRuntime {
             client: Some(self.shared.net.local_worker_id()),
         };
         Ok(send_composite(&self.shared, self.host.handle(), submitted, stored))
+    }
+
+    /// Returns an awaitable that resolves to `"accepted"` when the shard's
+    /// leader holds `members`, the ones from `start_index` on of the streamed
+    /// composite `composite_id`, or `"finished"` when the composite is over
+    /// and takes no more: send no further batch. Members, `last` and
+    /// `inline_bytes` are as for `NativeRuntime.submit_members`. The composite
+    /// must have been submitted here, or be one this worker's run streams
+    /// into; one submitted here waits for its own submission to be answered
+    /// first (resolving `"finished"` if it was refused). A member whose
+    /// values are stored as blobs has them stored where the leader places the
+    /// composite's record first, and they count against this process's memory
+    /// limits until they are. The leader is asked again after a refusal for
+    /// now, so an answer lost with a leader creates nothing twice.
+    ///
+    /// Raises `ValueError` if the batch is malformed or cannot go in one
+    /// message even with its values stored as blobs or the leader finds it
+    /// malformed, `BackpressureError` if its values do not fit this process's
+    /// room for payloads in flight now, one alone is past the hard limit, the
+    /// shard cannot store them now, or the leader refuses the batch as
+    /// backpressure (nothing of it is taken), and `RuntimeError` once the
+    /// runtime has shut down or the worker has left its shard.
+    #[pyo3(signature = (composite_id, start_index, members, last, inline_bytes = MEMBER_BATCH_BYTES))]
+    fn submit_members<'py>(
+        &self,
+        py: Python<'py>,
+        composite_id: &str,
+        start_index: u64,
+        members: Vec<Bound<'py, PyAny>>,
+        last: bool,
+        inline_bytes: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !self.host.bridge().is_open() {
+            return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
+        }
+        let (batch, values) = member_batch(composite_id, start_index, &members, last, inline_bytes)?;
+        let stored = self.take_in_flight(py, values)?;
+        let shared = Arc::clone(&self.shared);
+        self.host
+            .bridge()
+            .spawn_into_py(py, async move { send_members(&shared, batch, stored).await })
+    }
+
+    /// Whether submitters are to wait: the shard's leader last said its memory
+    /// is past its soft limit and a poll has not yet heard it clear, or this
+    /// process's own payloads in flight are past their soft share and have
+    /// not fallen below 80% of it. Raises `RuntimeError` once the runtime has
+    /// shut down.
+    fn slow_down(&self) -> PyResult<bool> {
+        if !self.host.bridge().is_open() {
+            return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
+        }
+        Ok(self.shared.slow_down())
     }
 
     /// Asks the shard's leader to cancel a composite, in the background, and
@@ -794,15 +837,34 @@ impl NetworkedRuntime {
 }
 
 impl NetworkedRuntime {
+    /// Counts `values`, bound inputs to be stored as blobs, in flight until
+    /// each is stored. Raises `BackpressureError` if one alone is past the
+    /// hard memory limit or they do not all fit now; whatever was counted so
+    /// far is then dropped, and counts no more.
+    fn take_in_flight(&self, py: Python<'_>, values: Vec<Vec<u8>>) -> PyResult<Vec<(Vec<u8>, Taken)>> {
+        refuse_values_past_limit(py, self.shared.net.payload_memory().hard_limit(), &values)?;
+        let mut taken = Vec::with_capacity(values.len());
+        for value in values {
+            let Ok(Some(counted)) = self.shared.net.payload_memory().try_take(value.len() as u64) else {
+                return Err(backpressure_error(
+                    py,
+                    "too many large payloads in flight past the hard memory limit".into(),
+                ));
+            };
+            taken.push((value, counted));
+        }
+        Ok(taken)
+    }
+
     /// Hands the leader a run's success by the step `tree` describes. The
     /// values too large to inline are stored first, under the composite the
     /// step runs as, so the report finds them held.
     fn complete_with_step(&self, py: Python<'_>, run: TaskRunId, tree: &Bound<'_, PyAny>) -> PyResult<()> {
-        let mut step = step_from_tree(tree)?;
+        let step = step_from_tree(tree)?;
         if step.takes_input() {
             return Err(PyValueError::new_err("a returned step cannot take an input"));
         }
-        let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
+        let (step, values) = spill_step(step);
         refuse_values_past_limit(py, self.shared.net.payload_memory().hard_limit(), &values)?;
         let Some(held) = self.shared.end(&run) else {
             return Ok(());

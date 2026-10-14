@@ -6,13 +6,13 @@
 use std::collections::BTreeMap;
 
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated::composite_entry;
+use kabudachi_core::protocol::generated::{CompositeEntry, CompositePage, composite_entry};
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::{Rebuild, ReportedRun, ReportedState, WorkerRuns};
 use kabudachi_core::scheduler::composite::{
-    BoundInput, CompositeKind, CompositeState, OnError, Stage, Step,
+    CompositeKind, CompositeState, OnError, PAGE_ENTRIES, Stage, Step,
 };
 use kabudachi_core::scheduler::{CancelRejection, ClaimRejection, Completion, Submission};
 use kabudachi_core::task_record::RecordKey;
@@ -312,21 +312,21 @@ fn the_items_an_expansion_split_are_kept_as_long_as_the_flow_that_names_them() {
             kind: CompositeKind::Map,
             on_error: OnError::FailFast,
             stages: vec![task_stage("each", None)],
+            streamed: false,
         });
         let flow = submitted(
             &mut fixture,
             flow_of(vec![task_stage("load", Some(b"x")), map, task_stage("report", Some(b"r"))]),
         );
         run_member(&mut fixture, &flow, 0, b"[1]");
-        let expansion = start_member(&mut fixture, &flow.child(1), 0);
-        let Stage::Task(mut item) = task_stage("each", None) else { unreachable!("a task stage") };
-        item.input = BoundInput::Value(b"1".to_vec());
-        let items = Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: vec![Stage::Task(item)] };
+        let split = flow.child(1);
+        let expansion = fixture.scheduler.request_claim(&worker(), &split.expansion_task()).unwrap();
+        fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+        fixture.scheduler.submit_members(item_batch(&split, 0, 1, false)).unwrap();
         fixture
             .scheduler
-            .complete(&worker(), &expansion.task_run_id, items.digest(), Completion::Continues(items))
+            .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
             .unwrap();
-        let split = CompositeId::continuation_of(&expansion.task_run_id);
         run_member(&mut fixture, &split, 0, b"1!");
         assert_eq!(
             fixture.scheduler.composite_status(&flow.child(1)).unwrap().state,
@@ -356,7 +356,10 @@ fn the_items_an_expansion_split_are_kept_as_long_as_the_flow_that_names_them() {
             leading.scheduler.composite_record(&flow.child(1)).is_none(),
             "and the map it held (takeover: {takeover})"
         );
-        assert!(leading.scheduler.composite_record(&split).is_none(), "and the items (takeover: {takeover})");
+        assert!(
+            leading.scheduler.composite_page(&split, 0).is_none(),
+            "and the items' results (takeover: {takeover})"
+        );
     }
 }
 
@@ -390,8 +393,17 @@ fn a_composite_whose_page_is_learnt_after_the_rebuild_moves_on_once_it_is_learnt
     );
     run_member(&mut old, &group, 0, b"a");
     let mut rebuild = rebuild_losing(&old, 0, |_| false);
-    let pages = std::mem::take(&mut rebuild.pages);
-    assert!(!pages.is_empty(), "the member's outcome was published on a page");
+    assert!(rebuild.pages.is_empty(), "a page is not written before it is whole");
+    let page = CompositePage {
+        version: rebuild.composites[0].version.clone(),
+        entries: vec![CompositeEntry {
+            index: 0,
+            outcome: Some(composite_entry::Outcome::Value(Digest::blake3(b"a").into())),
+            producer: Some(TaskDefinitionId::new("a").into()),
+        }],
+        ..page(&group, 0, 0, 0)
+    };
+    let pages = vec![page];
     rebuild.uncertain_composites.insert(group.clone());
     let mut new = took_over(&old, rebuild);
     new.scheduler
@@ -456,4 +468,226 @@ fn a_continuation_certified_while_its_composite_record_is_unknown_is_taken_from_
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].parent_task, Some(task));
     assert_eq!(finished[0].state, CompositeState::Succeeded);
+}
+
+/// A map over the list the stage before it returns.
+fn expanding_map() -> Stage {
+    Stage::Composite(Step {
+        kind: CompositeKind::Map,
+        on_error: OnError::FailFast,
+        stages: vec![task_stage("each", None)],
+        streamed: false,
+    })
+}
+
+/// The expansion run of a map ended and every item's member ended, but the
+/// old leader's last call stored only the Tasks: the map's record never said
+/// it was sealed. The successor seals it from the expansion run's own record,
+/// or, when that record is not known yet, waits for it and then does.
+#[test]
+fn a_map_whose_seal_was_lost_with_its_leader_is_sealed_from_its_expansion_runs_record() {
+    for unknown_at_first in [false, true] {
+        let mut old = Fixture::leading();
+        let flow = submitted(
+            &mut old,
+            flow_of(vec![
+                task_stage("load", Some(b"x")),
+                expanding_map(),
+                task_stage("report", Some(b"r")),
+            ]),
+        );
+        run_member(&mut old, &flow, 0, b"[1, 2]");
+        let map = flow.child(1);
+        let expansion_task = map.expansion_task();
+        let expansion = old.scheduler.request_claim(&worker(), &expansion_task).unwrap();
+        old.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+        old.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+        for index in 0..2 {
+            run_member(&mut old, &map, index, b"done");
+        }
+        let mark = old.spy.mark();
+        old.scheduler
+            .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
+            .unwrap();
+        let mut rebuild = rebuild_losing(&old, mark, is_composite_or_page);
+        let mut unknown_record = None;
+        if unknown_at_first {
+            let known = rebuild
+                .records
+                .iter()
+                .position(|record| record.task.as_ref().unwrap().task_id() == expansion_task)
+                .unwrap();
+            unknown_record = Some(rebuild.records.remove(known));
+            rebuild.uncertain.insert(expansion_task.clone(), Default::default());
+        }
+        let mut new = took_over(&old, rebuild);
+        if let Some(record) = unknown_record {
+            assert_eq!(
+                new.scheduler.composite_status(&map).unwrap().state,
+                CompositeState::Running,
+                "the map waits while its expansion run's end is unknown"
+            );
+            new.scheduler
+                .adopt(Rebuild { records: vec![record], ..Rebuild::default() })
+                .unwrap();
+        }
+        assert_eq!(
+            new.scheduler.composite_status(&map).unwrap().state,
+            CompositeState::Succeeded,
+            "(expansion record unknown at first: {unknown_at_first})"
+        );
+        run_member(&mut new, &flow, 2, b"reported");
+        assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
+        assert!(new.spy.newest_composite(&map).unwrap().sealed);
+    }
+}
+
+/// A sealed map names a member whose Task record never reached a holder: the
+/// expansion run that would have sent it again is over, so nothing ever will.
+/// The map settles the member as lost rather than waiting for it forever.
+#[test]
+fn a_sealed_map_does_not_wait_for_a_member_whose_task_record_was_lost() {
+    let mut old = Fixture::leading();
+    let flow = submitted(&mut old, flow_of(vec![task_stage("load", Some(b"x")), expanding_map()]));
+    run_member(&mut old, &flow, 0, b"[1, 2, 3]");
+    let map = flow.child(1);
+    let expansion = old.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+    old.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    old.scheduler.submit_members(item_batch(&map, 0, 3, false)).unwrap();
+    run_member(&mut old, &map, 0, b"done");
+    run_member(&mut old, &map, 2, b"done");
+    old.scheduler
+        .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
+        .unwrap();
+    let missing = RecordKey::Task(map.member_task(1));
+    let mut new = took_over(&old, rebuild_losing(&old, 0, |key| *key == missing));
+    let finished = finished(&mut new);
+    assert_eq!(finished[0].state, CompositeState::Failed);
+    assert_eq!(finished[0].failure.as_ref().unwrap().kind, "TaskLostError");
+}
+
+/// Both losses at once: the map's seal went with the old leader and a member's
+/// Task record never reached a holder. The successor seals the map from its
+/// expansion run's record and then settles the nameless member as lost; the
+/// map neither stays running nor waits for that member forever.
+#[test]
+fn a_map_whose_seal_and_a_member_record_were_both_lost_ends_with_the_member_lost() {
+    let mut old = Fixture::leading();
+    let flow = submitted(&mut old, flow_of(vec![task_stage("load", Some(b"x")), expanding_map()]));
+    run_member(&mut old, &flow, 0, b"[1, 2, 3]");
+    let map = flow.child(1);
+    let expansion = old.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+    old.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    old.scheduler.submit_members(item_batch(&map, 0, 3, false)).unwrap();
+    run_member(&mut old, &map, 0, b"done");
+    run_member(&mut old, &map, 2, b"done");
+    let mark = old.spy.mark();
+    old.scheduler
+        .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
+        .unwrap();
+    let mut rebuild = rebuild_losing(&old, mark, is_composite_or_page);
+    let missing = map.member_task(1);
+    rebuild.records.retain(|record| record.task.as_ref().unwrap().task_id() != missing);
+    let mut new = took_over(&old, rebuild);
+    let finished = finished(&mut new);
+    assert_eq!(finished[0].state, CompositeState::Failed);
+    assert_eq!(finished[0].failure.as_ref().unwrap().kind, "TaskLostError");
+}
+
+/// The old leader stored a batch's member records but not the map's record.
+/// Its successor counts the members it finds: the submitter, whether it carries
+/// on with the next batch or asks for the lost one again, is taken once, and
+/// the map ends when its last batch comes.
+#[test]
+fn a_streamed_maps_batch_whose_record_was_lost_with_its_leader_is_counted_from_its_members() {
+    let mut old = Fixture::leading();
+    let map = submitted(&mut old, streamed_map(OnError::FailFast));
+    old.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+    let mark = old.spy.mark();
+    old.scheduler.submit_members(item_batch(&map, 2, 3, false)).unwrap();
+    let lose_the_record = |key: &RecordKey| matches!(key, RecordKey::Composite(_));
+
+    let mut carries_on = took_over(&old, rebuild_losing(&old, mark, lose_the_record));
+    assert_eq!(
+        carries_on.scheduler.submit_members(item_batch(&map, 5, 0, true)).unwrap().members,
+        5,
+        "the members found count, so the next batch is no gap"
+    );
+    let mut asks_again = took_over(&old, rebuild_losing(&old, mark, lose_the_record));
+    assert_eq!(
+        asks_again.scheduler.submit_members(item_batch(&map, 2, 3, false)).unwrap().members,
+        5,
+        "the batch asked again creates nothing"
+    );
+    asks_again.scheduler.submit_members(item_batch(&map, 5, 0, true)).unwrap();
+    for new in [&mut carries_on, &mut asks_again] {
+        for index in 0..5 {
+            let claim = run_member(new, &map, index, b"r");
+            assert_eq!(new.scheduler.runs_of(&map.member_task(index)).len(), 1);
+            assert_eq!(claim.task.serialized_input, item(index));
+        }
+        assert_eq!(finished(new)[0].state, CompositeState::Succeeded);
+        let record = new.spy.newest_composite(&map).unwrap();
+        assert_eq!((record.members, record.sealed), (5, true));
+    }
+}
+
+/// Every member the old leader took had settled when its record was lost, but
+/// its last batch had not come: the successor finds nothing left to run, and
+/// must not take that for the end of the map.
+#[test]
+fn a_streamed_map_whose_held_members_all_settled_stays_open_after_a_takeover_until_its_last_batch() {
+    let mut old = Fixture::leading();
+    let map = submitted(&mut old, streamed_map(OnError::FailFast));
+    old.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+    let mark = old.spy.mark();
+    old.scheduler.submit_members(item_batch(&map, 2, 3, false)).unwrap();
+    for index in 0..5 {
+        run_member(&mut old, &map, index, b"r");
+    }
+    let mut new = took_over(&old, rebuild_losing(&old, mark, is_composite_or_page));
+    assert!(finished(&mut new).is_empty(), "more members may still come");
+    assert_eq!(new.scheduler.composite_status(&map).unwrap().state, CompositeState::Running);
+    assert_eq!(new.scheduler.submit_members(item_batch(&map, 5, 0, true)).unwrap().members, 5);
+    assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
+}
+
+/// A map of more members than a page holds ended under the old leader, which
+/// stored its record and every page as finished. Its successor, given only
+/// those records, holds the map as it ended: the same counts and outcomes on
+/// every page, the failed member's entry included, and publishes each record
+/// again as finished and in full.
+#[test]
+fn a_successor_takes_over_a_finished_multi_page_map_whole() {
+    let mut old = Fixture::leading();
+    let map = submitted(&mut old, streamed_map(OnError::CollectAll));
+    let total = PAGE_ENTRIES + 2;
+    old.scheduler.submit_members(item_batch(&map, 0, total, true)).unwrap();
+    fail_member(&mut old, &map, 0, "ValueError");
+    for index in 1..total {
+        run_member(&mut old, &map, index, b"r");
+    }
+    assert_eq!(finished(&mut old)[0].state, CompositeState::Succeeded, "collect_all ends the map with a member failed");
+    let pages = (0..2u32)
+        .map(|index| old.spy.newest_page(&map, index).unwrap())
+        .collect::<Vec<_>>();
+    assert!(pages.iter().all(|page| page.finished && !page.entries.is_empty()));
+    let record = old.spy.newest_composite(&map).unwrap();
+    assert!(record.finished);
+
+    let rebuild = Rebuild { composites: vec![record], pages: pages.clone(), ..Rebuild::default() };
+    let new = took_over(&old, rebuild);
+
+    let (was, now) = (old.scheduler.composite_status(&map).unwrap(), new.scheduler.composite_status(&map).unwrap());
+    assert_eq!((now.state, now.counts), (was.state, was.counts));
+    for (index, original) in pages.iter().enumerate() {
+        let held = new.scheduler.composite_page(&map, index as u32).unwrap();
+        assert_eq!(held.entries, original.entries, "page {index} as the old leader ended it");
+        let published = new.spy.newest_page(&map, index as u32).unwrap();
+        assert!(published.finished, "page {index} is republished as finished");
+        assert_eq!(published.entries, original.entries, "and in full");
+    }
+    assert!(new.spy.newest_composite(&map).unwrap().finished);
+    let failed = entry(&new, &map, 0).unwrap();
+    assert!(matches!(failed.outcome, Some(composite_entry::Outcome::Failure(_))));
 }

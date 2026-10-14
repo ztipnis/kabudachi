@@ -17,6 +17,14 @@ create_exception!(
     "Base class of every exception kabudachi raises on purpose."
 );
 
+create_exception!(
+    kabudachi._native,
+    ContinuationTooLargeError,
+    KabudachiError,
+    "The step a run returned would take its task's record past the largest a record may be. \
+The leader has already failed the run for good, as a retry would return the same step."
+);
+
 const BACKPRESSURE_DOC: &str = "A task was not submitted because the scheduler holds as much \
 pending work as its hard memory limit allows. Nothing was queued; submit again once running \
 tasks have finished. Also raised, transiently, while a coalescing key's newest generation is \

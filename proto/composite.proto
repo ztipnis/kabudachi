@@ -89,6 +89,10 @@ message CompositeRecord {
   // every large value bound anywhere in the tree, and its record is held
   // unfinished until the whole tree is over. Its own id on the root.
   CompositeId root = 23;
+  // A streamed composite's members so far.
+  uint64 members = 21;
+  // A streamed composite's members are all in: no batch adds one.
+  bool sealed = 22;
 }
 
 // Up to 1024 member outcomes of one composite: page `index` holds members
@@ -128,6 +132,40 @@ message SubmitComposite {
 
 message CompositeAccepted {
   CompositeId composite_id = 1;
+  // The leader's memory is past its soft limit: a submitter sending more
+  // should wait for it to clear (QuerySlowDown).
+  bool slow_down = 2;
+}
+
+// One member of a streamed composite.
+message StreamedMember {
+  oneof member {
+    // A map's item: its template's whole input, encoded by the template's
+    // serializer.
+    bytes value = 1;
+    // A map's item stored as blobs the composite owns.
+    Manifest value_manifest = 2;
+    // A group's member.
+    StageDescription stage = 3;
+  }
+}
+
+// The next members of a streamed composite, starting at `start_index`. The
+// leader takes the batch whole or not at all; a batch asked again creates
+// nothing twice.
+message SubmitMembers {
+  CompositeId composite_id = 1;
+  uint64 start_index = 2;
+  repeated StreamedMember items = 3;
+  // No member follows these.
+  bool last = 4;
+}
+
+message MembersAccepted {
+  CompositeId composite_id = 1;
+  // How many members the composite holds now.
+  uint64 members = 2;
+  bool slow_down = 3;
 }
 
 // The leader tells a composite's client it is over.

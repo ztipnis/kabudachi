@@ -220,13 +220,15 @@ fn refused_as_no_member<C: Clock, I: IdGenerator>(
 /// no membership; `None` for every request the leader decides. Where
 /// records go is one: a worker that drained has been taken out of the
 /// roster by the time it asks, and the answer decides nothing and names
-/// only voters.
+/// only voters. Whether the leader asks submitters to wait is another: it
+/// decides nothing either, and any worker may poll it.
 fn ungated_answer<C: Clock, I: IdGenerator>(
     deciding: &Deciding<'_, C, I>,
     handle: &TaskRequestHandle,
 ) -> Option<TaskResponse> {
     match handle.request() {
         task_request::Request::Place(place) => Some(place_answer(deciding, &handle.from(), place)),
+        task_request::Request::QuerySlowDown(_) => Some(slow_down_answer(deciding)),
         _ => None,
     }
 }
@@ -241,6 +243,15 @@ fn place_answer<C: Clock, I: IdGenerator>(
     }
     let voters = deciding.node.placeable_voters();
     task_exchange::placements(place, asker, &voters, deciding.factor)
+}
+
+/// Whether this leader asks submitters to wait; a node that does not lead
+/// says so.
+fn slow_down_answer<C: Clock, I: IdGenerator>(deciding: &Deciding<'_, C, I>) -> TaskResponse {
+    if !deciding.scheduler.is_leader() {
+        return task_exchange::not_leader();
+    }
+    task_exchange::slow_down_state(deciding.scheduler.slow_down())
 }
 
 /// Answers every inbound `/kabudachi/reconcile/1` request queued on `net`
@@ -319,6 +330,8 @@ pub(super) fn record_named<C: Clock, I: IdGenerator>(
         task_request::Request::Submit(submit) => task(&submit.task_id),
         task_request::Request::Cancel(cancel) => task(&cancel.task_id).or_else(|| composite(&cancel.composite_id)),
         task_request::Request::SubmitComposite(submit) => composite(&submit.composite_id),
+        task_request::Request::SubmitMembers(submit) => composite(&submit.composite_id),
+        task_request::Request::QuerySlowDown(_) => None,
         task_request::Request::Started(report) => of_run(&report.task_run_id),
         task_request::Request::Completed(report) => of_run(&report.task_run_id),
         task_request::Request::Failed(report) => of_run(&report.task_run_id),

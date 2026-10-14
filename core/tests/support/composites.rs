@@ -6,11 +6,11 @@ use kabudachi_core::protocol::generated::{
 };
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId, WorkerId};
 use kabudachi_core::scheduler::composite::{
-    BoundInput, BoundStep, CompositeFinished, CompositeKind, OnError, PAGE_ENTRIES, Stage, Step,
-    TaskOptions,
+    BoundInput, BoundStep, CompositeFinished, CompositeKind, ItemInput, MemberBatch, OnError, PAGE_ENTRIES, Stage,
+    Step, StreamedMember, TaskOptions,
 };
 use kabudachi_core::reconcile::Rebuild;
-use kabudachi_core::scheduler::{Claim, Completion, Event};
+use kabudachi_core::scheduler::{Claim, Completion, Event, MemoryLimits};
 use kabudachi_core::task_record::{RecordKey, ShardRecord};
 
 use crate::support::scheduler::{Fixture, OFFICE, grant_of, reconciling_after};
@@ -36,6 +36,7 @@ pub fn one_stage_flow() -> Step {
             input: BoundInput::Value(b"x".to_vec()),
             fields: Vec::new(),
         })],
+        streamed: false,
     }
 }
 
@@ -75,17 +76,57 @@ pub fn task_stage(name: &str, value: Option<&[u8]>) -> Stage {
 }
 
 pub fn flow_of(stages: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages }
+    Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages, streamed: false }
 }
 
 /// A group of `members` run side by side under `on_error`.
 pub fn group_of(on_error: OnError, members: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Group, on_error, stages: members }
+    Step { kind: CompositeKind::Group, on_error, stages: members, streamed: false }
 }
 
 /// A map whose members are bound to their items, failing fast.
 pub fn map_of(members: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: members }
+    Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: members, streamed: false }
+}
+
+/// A map whose items arrive in batches, each run by `each`.
+pub fn streamed_map(on_error: OnError) -> Step {
+    Step { kind: CompositeKind::Map, on_error, stages: vec![task_stage("each", None)], streamed: true }
+}
+
+/// A group whose members arrive in batches.
+pub fn streamed_group(on_error: OnError) -> Step {
+    Step { kind: CompositeKind::Group, on_error, stages: Vec::new(), streamed: true }
+}
+
+/// The item a streamed map's member `index` is given.
+pub fn item(index: u64) -> Vec<u8> {
+    index.to_be_bytes().to_vec()
+}
+
+/// A leader with `step` submitted, whose limits leave `soft` and `hard`
+/// bytes beyond what `step` itself weighs. The weight is read from a first
+/// fixture that submits the same step without limits: ids are sequential,
+/// so both mint the same composite.
+pub fn leading_with_room_for(step: Step, soft: u64, hard: u64) -> (Fixture, CompositeId) {
+    let mut probe = Fixture::leading();
+    submitted(&mut probe, step.clone());
+    let base = probe.scheduler.memory_in_use();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: base + soft, hard: base + hard });
+    let id = submitted(&mut fixture, step);
+    (fixture, id)
+}
+
+/// Items `start..start + count` of `map`, the last batch when `last`.
+pub fn item_batch(map: &CompositeId, start: u64, count: u64, last: bool) -> MemberBatch {
+    MemberBatch {
+        composite_id: map.clone(),
+        start_index: start,
+        members: (0..count)
+            .map(|offset| StreamedMember::Item(ItemInput::Value(item(start.wrapping_add(offset)))))
+            .collect(),
+        last,
+    }
 }
 
 /// Settings of a task stage, which the builders above leave at their defaults.

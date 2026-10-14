@@ -127,6 +127,11 @@ impl CompositeId {
         CompositeId::new(derived_id("child", self.as_str(), index))
     }
 
+    /// The id of the expansion run's Task that feeds this map its items.
+    pub fn expansion_task(&self) -> TaskId {
+        TaskId::new(derived_id("expansion", self.as_str(), 0))
+    }
+
     /// The id of the composite that the step `run` returned becomes. The
     /// worker's report and a later leader's reconciliation both name it
     /// without asking anyone.

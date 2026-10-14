@@ -64,7 +64,10 @@ async fn spawn(server: &ValkeyServer, seeds: Vec<Multiaddr>) -> RunningWorker {
 }
 
 /// Waits until one of `workers` leads and every other follows it, all in one
-/// incarnation; returns it and the leader.
+/// incarnation and all holding a configuration that counts them as voters;
+/// returns it and the leader. A joiner is Active with a leader as soon as it
+/// is answered, before its first ack gives it a configuration; losing the
+/// leader and the authority in that window strands it, so wait past it.
 async fn led_shard(workers: &[RunningWorker]) -> (ShardId, WorkerId) {
     let mut found = None;
     poll_until("one leader followed by every worker, in one incarnation", || {
@@ -81,7 +84,8 @@ async fn led_shard(workers: &[RunningWorker]) -> (ShardId, WorkerId) {
         };
         let led = seen.len() == workers.len()
             && seen.iter().all(|(_, seen)| {
-                seen.shard_id == leader.shard_id
+                seen.voter
+                    && seen.shard_id == leader.shard_id
                     && (seen.state == WorkerState::Leader
                         || (seen.state == WorkerState::Active
                             && seen.leader.as_ref() == Some(leader_id)))

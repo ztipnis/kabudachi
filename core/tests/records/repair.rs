@@ -4,8 +4,8 @@
 //! placements that are still in the configuration.
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
-use kabudachi_core::protocol::generated::{Task, TaskRecord};
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::protocol::generated::{CompositeRecord, Task, TaskRecord};
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::task_record::{
     PlacedWrite, PriorPlacement, RecordKey, RecordVersion, Repair, ShardRecord, Write, WriteOutcome,
 };
@@ -94,6 +94,55 @@ fn with_no_room_under_the_writes_in_flight_nothing_is_due_and_the_driver_is_not_
     assert_eq!(repair.wake_at(), None, "an outcome will wake the driver, a past instant would spin it");
     repair.settled(&outcome(&records[0], true), Instant::at(501));
     assert_eq!(check(&mut repair, &["a"], &["a"], 502), [RecordKey::Task(TaskId::new("t064"))]);
+}
+
+#[test]
+fn a_due_composite_retry_is_not_starved_by_task_retries_that_keep_being_refused() {
+    let mut repair = Repair::new(RETRY_AFTER);
+    // 63 writes in flight leave room for one republish per round.
+    for n in 0..63 {
+        written(&mut repair, &record(&format!("f{n:03}"), 0, &["a"]));
+    }
+    let tasks = ["r0", "r1", "r2"];
+    for task in tasks {
+        let first = record(task, 0, &["a"]);
+        written(&mut repair, &first);
+        repair.settled(&outcome(&first, false), Instant::at(0));
+    }
+    let composite = CompositeRecord {
+        version: Some(RecordVersion { recovery_epoch: RecoveryEpoch::new(0, 0), leader_term: 1, revision: 0 }.into()),
+        composite_id: Some(CompositeId::new("c").into()),
+        placement: vec![worker("a").into()],
+        ..CompositeRecord::default()
+    };
+    let composite_write = ShardRecord::Composite(composite);
+    let mut placed = PlacedWrite::new(composite_write.clone(), 1);
+    repair.written(&mut placed, |_| true);
+    repair.settled(&WriteOutcome { write: Write::of(&composite_write), stored: false }, Instant::at(0));
+
+    // Every republished Task is refused again; the composite, due as early as
+    // they were, must still be published within a few rounds.
+    let mut revision = 0;
+    let mut republished = false;
+    for round in 1..=10 {
+        let now = 100 * round;
+        for key in check(&mut repair, &["a"], &["a"], now) {
+            match key {
+                RecordKey::Composite(_) => republished = true,
+                RecordKey::Task(task) => {
+                    revision += 1;
+                    let again = record(task.as_str(), revision, &["a"]);
+                    written(&mut repair, &again);
+                    repair.settled(&outcome(&again, false), Instant::at(now));
+                }
+                RecordKey::Page(..) => unreachable!("no page was written"),
+            }
+        }
+        if republished {
+            break;
+        }
+    }
+    assert!(republished, "the composite's refused write was never published again");
 }
 
 #[test]

@@ -46,6 +46,22 @@ HANDLES = {}
 # The client each run claimed here names, by task id.
 CLIENTS = {}
 
+# How many times SlowDown went from cleared to raised here, as sampled.
+RAISES = 0
+# The sampling task, held here so it is not garbage collected while it runs.
+SAMPLING: asyncio.Task | None = None
+SLOW_DOWN_SAMPLE_SECONDS = 0.02
+
+
+async def count_slow_down_raises(native) -> None:
+    global RAISES
+    raised = False
+    while True:
+        now = native.slow_down()
+        RAISES += now and not raised
+        raised = now
+        await asyncio.sleep(SLOW_DOWN_SAMPLE_SECONDS)
+
 
 class NotingClaims:
     """The worker's runtime, noting the client named by each claim made
@@ -132,6 +148,8 @@ async def answer(native, command: dict) -> dict:
         status = await asyncio.wait_for(HANDLES[command["status"]].status(), 20)
         assert isinstance(status, kabudachi.TaskStatus)
         return {"status": {"state": status.state, "attempt": status.attempt, "delivered": status.delivered}}
+    if "slow_down" in command:
+        return {"slow_down": native.slow_down(), "raises": RAISES}
     if "claimed" in command:
         return {"client": CLIENTS.get(command["claimed"])}
     if "reported" in command:
@@ -142,7 +160,9 @@ async def answer(native, command: dict) -> dict:
 
 
 async def main() -> None:
+    global SAMPLING
     native = session.current_session().runtime
+    SAMPLING = asyncio.create_task(count_slow_down_raises(native))
     say(ready={
         "worker": native.worker_id(),
         "address": native.address(),

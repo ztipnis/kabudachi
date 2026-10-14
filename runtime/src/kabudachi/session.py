@@ -39,7 +39,13 @@ from typing import Any
 from kabudachi import _native
 from kabudachi._native import MAX_FAILURE_MESSAGE_BYTES, EventKind, RunState
 from kabudachi.body import Given, RunningBody, decode_resolved
-from kabudachi.composites import Composites, composite_is_running, refuse_oversized_values
+from kabudachi.composites import (
+    MEMBER_BATCH_BYTES,
+    Composites,
+    _batches,
+    composite_is_running,
+    refuse_oversized_values,
+)
 from kabudachi.config import Configuration
 from kabudachi.errors import (
     BackpressureError,
@@ -83,6 +89,10 @@ from kabudachi.status import CompositeStatus, TaskStatus
 from kabudachi.task_table import Run, TaskTable, result_digest
 
 WAIT_POLL_SECONDS = 0.005
+
+# How often a stream waiting out SlowDown asks the runtime again, so a change
+# no event announced (a networked leader's, say) is still seen.
+SLOW_DOWN_POLL_SECONDS = 0.05
 
 _logger = logging.getLogger("kabudachi")
 
@@ -151,9 +161,8 @@ class Session:
             self._hosted.attach(asyncio.get_running_loop())
         except RuntimeError:
             pass
-        # Set while memory use is below the soft limit, when bulk submission may go on.
-        self._below_soft_limit = asyncio.Event()
-        self._below_soft_limit.set()
+        # Set when a SLOW_DOWN event arrives, to wake a stream waiting for room.
+        self._slow_down_changed = asyncio.Event()
         # Every flow, group and map started here.
         self._composites = Composites(self, self._hosted)
         # Runs of composites' members, and expansions, under way here.
@@ -346,9 +355,19 @@ class Session:
         return await self._tasks.status(task_id)
 
     def has_room(self) -> bool:
-        """Whether there is room to submit in bulk now: the scheduler has not
-        said memory use is past its soft limit."""
-        return self._below_soft_limit.is_set()
+        """Whether there is room to submit in bulk now: the runtime has not
+        said memory use is past its soft limit. Asked of the runtime, not
+        inferred from events, so a late event can never leave a stream paused."""
+        return not self._runtime.slow_down()
+
+    async def wait_for_room(self) -> None:
+        """Waits for a SLOW_DOWN event or `SLOW_DOWN_POLL_SECONDS`, whichever
+        comes first. The caller asks `has_room` again."""
+        self._slow_down_changed.clear()
+        try:
+            await asyncio.wait_for(self._slow_down_changed.wait(), SLOW_DOWN_POLL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
 
     async def watch_events(self) -> None:
         """Acts on what the runtime decides on its own: a task that expired
@@ -397,10 +416,7 @@ class Session:
         )
 
     def _on_slow_down(self, event: Any) -> None:
-        if event.active:
-            self._below_soft_limit.clear()
-        else:
-            self._below_soft_limit.set()
+        self._slow_down_changed.set()
 
     def _on_superseded(self, event: Any) -> None:
         self._tasks.failed(
@@ -968,14 +984,22 @@ class Session:
         if step.is_task:
             tree = ("flow", "fail_fast", [tree])
         refuse_oversized_values(self._runtime, tree)
-        self._runtime.complete(claim.task_run_id, continuation=tree)
+        try:
+            self._runtime.complete(claim.task_run_id, continuation=tree)
+        except _native.ContinuationTooLargeError as refusal:
+            # The leader has failed the run for good already, so nothing is
+            # reported; the handle fails as a follower's does, by the kind.
+            if run.holds_handle:
+                self._tasks.failed(claim.task_id, TaskBodyError(str(refusal), "ContinuationTooLarge"))
+            return
         if run.holds_handle:
             self._tasks.continuing(claim.task_id, _native.continuation_of(claim.task_run_id))
 
     async def _expand(self, claim: Any) -> None:
-        """Splits the list an expansion run names into one blob per item, each
-        encoded as the map's task takes it, and returns the map over them as
-        the run's continuation. The leader never decodes the list."""
+        """Splits the list an expansion run names into the map it feeds: each
+        item encoded as the map's task takes it and sent in batches, waiting
+        out SlowDown, then the run completes, which seals the map. The leader
+        never decodes the list."""
         try:
             request = _native.read_expansion(claim.serialized_input)
             items = self.decode_resolved(await self._runtime.resolve_expansion(claim.task_run_id))
@@ -983,26 +1007,21 @@ class Session:
             if template is None:
                 raise UnknownTaskError(f"this process has no task named {request.definition_id!r}")
             serializer = self._serializers.get(template.serializer)
-            # The items belong to the map this run returns, so they live as long
-            # as it does and move with its record.
-            owner = _native.continuation_of(claim.task_run_id)
-            members = []
-            for item in items:
-                manifest = await self._runtime.store_composite_payload(
-                    owner, serializer.encode(item, template.input_type)
-                )
-                members.append(
-                    (
-                        "task",
-                        request.definition_id,
-                        request.version,
-                        request.settings,
-                        ("manifest", manifest),
-                        [],
-                    )
-                )
             self._runtime.report_started(claim.task_run_id)
-            self._runtime.complete(claim.task_run_id, continuation=("map", request.on_error, members))
+            encoded = (serializer.encode(item, template.input_type) for item in items)
+            start = 0
+            for batch in _batches(encoded, self._composites.batch_items, MEMBER_BATCH_BYTES):
+                while not self.has_room():
+                    if self.stopping:
+                        raise RunStoppedError("the run stopped while this was being sent")
+                    await self.wait_for_room()
+                if await self._runtime.submit_members(claim.composite_id, start, batch, False) != "accepted":
+                    # The map ended without all its items (a member failed, or
+                    # it was cancelled), which cancels this run: nothing is left
+                    # to complete or report.
+                    return
+                start += len(batch)
+            self._runtime.complete(claim.task_run_id, result_digest(b""))
         except Exception as error:
             kind, message = _kind_of(error), _message_of(error)
             if not self._report_failure(claim, kind, message) and self._awaits_composites():

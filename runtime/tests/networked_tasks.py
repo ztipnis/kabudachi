@@ -100,6 +100,14 @@ def echo(request: Greeting) -> Greeting:
     return request
 
 
+@kabudachi.task(name="cluster.maps")
+async def maps(request: Greeting) -> Greeting:
+    """Maps `echo` over `request.times` numbered greetings from inside a
+    body, and returns their texts joined, in the order they came back."""
+    results = await echo.map([Greeting(text=str(index)) for index in range(request.times)])
+    return Greeting(text=",".join(result.text for result in results))
+
+
 @kabudachi.task(name="cluster.fails")
 async def fails(request: Greeting) -> Greeting:
     """Fails with `text` as its error's message."""
@@ -208,6 +216,7 @@ TASKS = {
     "awaits": awaits,
     "fleeting": fleeting,
     "echo": echo,
+    "maps": maps,
     "fails": fails,
     "inflate": inflate,
     "weigh": weigh,

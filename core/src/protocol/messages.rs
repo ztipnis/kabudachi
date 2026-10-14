@@ -48,6 +48,9 @@ pub use generated::{
     SubmitComposite, bound_field, bound_task_step, composite_entry, composite_record, expansion,
     input_shape, stage_description,
 };
+pub use generated::{
+    MembersAccepted, QuerySlowDown, SlowDownState, StreamedMember, SubmitMembers, streamed_member,
+};
 
 /// Whether every required ID field of a raw message is present. Nested
 /// messages are not checked; [`checked::decode`] covers them.

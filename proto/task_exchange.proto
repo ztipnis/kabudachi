@@ -113,6 +113,8 @@ message TaskRequest {
     ReportLost lost = 8;
     QueryOutcome query_outcome = 9;
     SubmitComposite submit_composite = 10;
+    SubmitMembers submit_members = 11;
+    QuerySlowDown query_slow_down = 13;
   }
 }
 
@@ -153,6 +155,16 @@ message TaskReject {
 
 message SubmitAccepted {
   TaskId task_id = 1;
+  // The leader's memory is past its soft limit: a submitter sending more
+  // should wait for it to clear (QuerySlowDown).
+  bool slow_down = 2;
+}
+
+// Whether the leader still asks submitters to wait. Decides nothing.
+message QuerySlowDown {}
+
+message SlowDownState {
+  bool slow_down = 1;
 }
 
 message StartAccepted {}
@@ -237,5 +249,7 @@ message TaskResponse {
     RunLost lost = 9;
     OutcomeAnswer outcome = 10;
     CompositeAccepted composite = 11;
+    MembersAccepted members = 12;
+    SlowDownState slow_down = 13;
   }
 }

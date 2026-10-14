@@ -8,6 +8,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use prost::Message as _;
 
@@ -21,7 +22,7 @@ use crate::protocol::ids::{CompositeId, TaskDefinitionId};
 use crate::protocol::messages::Task;
 use crate::protocol::messages::prelude::*;
 
-use super::{BoundInput, BoundStep, CompositeKind, Stage, Step};
+use super::{BoundInput, BoundStep, CompositeKind, Stage, Step, TaskOptions};
 
 /// Where a reader finds a composite's records and the blobs they name: the
 /// scheduler's own copy in a one-node runtime, the shard over the network.
@@ -114,6 +115,9 @@ pub async fn member_input<S: CompositeSource>(source: &S, task: &Task) -> Result
         .ok_or_else(|| Unresolved::MissingComposite(id.clone()))?;
     let step = step_of(&record)?;
     let index = task.composite_index;
+    if step.takes_batches() {
+        return streamed_member_input(source, &id, &step, task).await;
+    }
     let Some(Stage::Task(bound)) = usize::try_from(index).ok().and_then(|index| step.stages.get(index)).cloned()
     else {
         return Err(Unresolved::Malformed);
@@ -145,6 +149,48 @@ pub async fn member_input<S: CompositeSource>(source: &S, task: &Task) -> Result
     };
     let input = resolve_manifest(source, &manifest, producer.as_ref(), owner.as_ref()).await?;
     Ok(MemberInput { step: bound, input: Some(input), own_input: None })
+}
+
+/// A member of a composite whose members arrive in batches, read from its own
+/// Task, since the composite's record holds no stage for it: a map's member
+/// runs the record's template on the item the Task carries, a group's member
+/// is the task its Task is. An item too large for a message is named by the
+/// Task's input manifest, and its blobs belong to the composite itself.
+async fn streamed_member_input<S: CompositeSource>(
+    source: &S,
+    id: &CompositeId,
+    step: &Step,
+    task: &Task,
+) -> Result<MemberInput, Unresolved> {
+    let input = match task.input_manifest.as_ref() {
+        Some(manifest) => BoundInput::Chunked(Manifest::try_from(manifest).map_err(|_| Unresolved::Malformed)?),
+        None => BoundInput::Value(task.serialized_input.clone()),
+    };
+    let bound = match (step.kind, step.stages.as_slice()) {
+        (CompositeKind::Map, [Stage::Task(template)]) => BoundStep { input, ..template.clone() },
+        (CompositeKind::Group, []) => BoundStep {
+            definition: task.task_definition_id(),
+            version: task.source_version,
+            options: TaskOptions {
+                queue: task.queue.clone(),
+                retries: task.max_retries,
+                ephemeral: task.ephemeral,
+                non_retriable: task.non_retriable,
+                reconnect_timeout: (task.reconnect_timeout_ms > 0)
+                    .then(|| Duration::from_millis(task.reconnect_timeout_ms)),
+            },
+            input,
+            fields: Vec::new(),
+        },
+        _ => return Err(Unresolved::Malformed),
+    };
+    match &bound.input {
+        BoundInput::Chunked(chunks) => {
+            let own = source.payload(&BlobOwner::Composite(id.clone()), chunks).await?;
+            Ok(MemberInput { step: bound, input: None, own_input: Some(own) })
+        }
+        _ => Ok(MemberInput { step: bound, input: None, own_input: None }),
+    }
 }
 
 /// The list an expansion run `task` is to split: the source its `Expansion`
@@ -182,8 +228,7 @@ pub async fn resolve_manifest<S: CompositeSource>(
 }
 
 /// A finished composite's results, as its client reads them: its pages'
-/// entries in index order. An expanding map's results are those of the map its
-/// expansion returned.
+/// entries in index order.
 pub async fn results<S: CompositeSource>(source: &S, id: &CompositeId) -> Result<Resolved, Unresolved> {
     resolving_results(source, id).await
 }
@@ -226,9 +271,6 @@ fn resolving_results<'a, S: CompositeSource>(source: &'a S, id: &'a CompositeId)
             .composite(id)
             .await
             .ok_or_else(|| Unresolved::MissingComposite(id.clone()))?;
-        if let Some(members) = expanded_into(source, id, &record).await? {
-            return resolving_results(source, &members).await;
-        }
         let mut list = Vec::new();
         for page in 0..record.pages {
             let held = source.page(id, page).await.ok_or_else(|| Unresolved::MissingPage(id.clone(), page))?;
@@ -274,22 +316,6 @@ async fn read_result<S: CompositeSource>(source: &S, owner: &BlobOwner, key: &Bl
     }
     let manifest = Manifest::decode(&bytes).map_err(|_| Unresolved::Malformed)?;
     source.payload(owner, &manifest).await
-}
-
-/// The map an expanding map's expansion returned, once it has.
-async fn expanded_into<S: CompositeSource>(
-    source: &S,
-    id: &CompositeId,
-    record: &CompositeRecord,
-) -> Result<Option<CompositeId>, Unresolved> {
-    if !step_of(record)?.expands() || record.pages == 0 {
-        return Ok(None);
-    }
-    let page = source.page(id, 0).await.ok_or_else(|| Unresolved::MissingPage(id.clone(), 0))?;
-    Ok(page.entries.iter().find_map(|entry| match (entry.index, entry.outcome.as_ref()) {
-        (0, Some(composite_entry::Outcome::Child(members))) => Some(members.clone().into()),
-        _ => None,
-    }))
 }
 
 fn step_of(record: &CompositeRecord) -> Result<Step, Unresolved> {

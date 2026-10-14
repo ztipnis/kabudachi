@@ -27,6 +27,7 @@ class World:
         concurrency_override=False,
         memory_soft_limit=None,
         memory_hard_limit=None,
+        member_batch_items=None,
         **task_options,
     ):
         if (memory_soft_limit is None) != (memory_hard_limit is None):
@@ -60,6 +61,8 @@ class World:
         self.session = Session(
             self.runtime, self.registry, self.serializers, self.configuration
         )
+        if member_batch_items is not None:
+            self.session.composites.batch_items = member_batch_items
 
     def call(self, name, argument):
         return self.session.submit(self.tasks[name].definition, argument)

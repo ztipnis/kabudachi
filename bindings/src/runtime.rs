@@ -5,13 +5,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kabudachi_core::blob::{BlobKey, BlobOwner, MAX_BLOB_BYTES};
-use kabudachi_core::manifest::{INLINE_PAYLOAD_BYTES, Manifest};
+use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{
     CompositeId, IncarnationId, ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::composite::{expansion_source, member_input, results};
+use kabudachi_core::scheduler::composite::{MEMBER_BATCH_BYTES, expansion_source, member_input, results};
 use kabudachi_core::scheduler::{Completion, ReportRejection, Scheduler, SubmitRejection};
 use kabudachi_core::task_record::LocalRecords;
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
@@ -24,8 +24,8 @@ use tokio::task::JoinHandle;
 use crate::arguments::{SubmitArguments, memory_limits};
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::composite::{
-    PyBytesValue, PyManifest, PyMemberInput, PyResolved, refuse_values_past_limit, state_name, step_from_tree,
-    take_large_values,
+    PyBytesValue, PyManifest, PyMemberInput, PyResolved, member_batch, refuse_values_past_limit, spill_step,
+    state_name, step_from_tree,
 };
 use crate::door::{Closed, DoorSource, Refusal, SchedulerDoor};
 use crate::election::{Publisher, run_election};
@@ -321,7 +321,14 @@ impl NativeRuntime {
             .submit(submission)
             .map_err(|refusal| {
                 refused(refusal, |rejection| match rejection {
-                    SubmitRejection::NotLeader => {
+                    // The member-batch refusals answer a batch, not a task.
+                    SubmitRejection::NotLeader
+                    | SubmitRejection::NotReady
+                    | SubmitRejection::UnknownComposite
+                    | SubmitRejection::NotStreamed
+                    | SubmitRejection::MemberGap { .. }
+                    | SubmitRejection::MemberKind
+                    | SubmitRejection::CompositeFinished => {
                         PyRuntimeError::new_err(rejection.to_string())
                     }
                     SubmitRejection::StepTakesInput => {
@@ -398,14 +405,17 @@ impl NativeRuntime {
     /// `continuation`, the tree of the step the run returned (see
     /// `describe_step`): the step runs as a composite and the run is
     /// certified under the digest of its description, so the digest is not
-    /// given. Values of the step too large to inline are stored as blobs the
-    /// composite owns, nested stages' included. The task is not over (its
+    /// given. When the encoded step is large, its bound values longer than a
+    /// manifest are stored as blobs the composite owns, nested stages'
+    /// included, and the digest is that of the step as stored. The task is not over (its
     /// coalescing key stays held) until the composite is.
     ///
     /// Raises `ValueError` if neither or both are given, if `result_digest`
     /// is not a BLAKE3 digest's length, or if `continuation` is malformed or
     /// takes an input, `BackpressureError` if a value of the step alone is
-    /// past the hard memory limit, and `RuntimeError` if the run is unknown,
+    /// past the hard memory limit, `ContinuationTooLargeError` if the encoded
+    /// step is past the largest a task's record may be (the run is then
+    /// failed for good), and `RuntimeError` if the run is unknown,
     /// is not running, or is not this worker's; the result is then not
     /// certified.
     #[pyo3(signature = (task_run_id, result_digest = None, continuation = None))]
@@ -424,11 +434,11 @@ impl NativeRuntime {
                 self.door.complete(&run, digest, Completion::Final)
             }
             (None, Some(tree)) => {
-                let mut step = step_from_tree(tree)?;
+                let step = step_from_tree(tree)?;
                 if step.takes_input() {
                     return Err(PyValueError::new_err("a returned step cannot take an input"));
                 }
-                let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
+                let (step, values) = spill_step(step);
                 self.refuse_values_past_limit(py, &values)?;
                 self.door.complete_with_step(&run, step, values)
             }
@@ -445,9 +455,11 @@ impl NativeRuntime {
 
     /// Records the composite `tree` describes (see `describe_step`) and
     /// returns its ID. A flow starts its first stage, and a group or map all
-    /// its members, once this worker leads. Values of the tree too large to
-    /// inline are stored as blobs the composite owns, nested stages'
-    /// included. The worker is told when it is over (`COMPOSITE_FINISHED`).
+    /// its members, once this worker leads; a streamed group or map (see
+    /// `submit_members`) starts its members as they arrive. When the encoded
+    /// step is large, its bound values longer than a manifest are stored as
+    /// blobs the composite owns, nested stages' included. The worker is told
+    /// when it is over (`COMPOSITE_FINISHED`).
     ///
     /// Before this worker leads the composite is queued and its id returned
     /// at once, as a task's is; it is recorded, in order, when the worker
@@ -459,12 +471,18 @@ impl NativeRuntime {
     /// tree alone is past it, and `RuntimeError` if the runtime has shut
     /// down.
     fn submit_composite(&self, py: Python<'_>, tree: &Bound<'_, PyAny>) -> PyResult<String> {
-        let mut step = step_from_tree(tree)?;
-        let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
+        let (step, values) = spill_step(step_from_tree(tree)?);
         self.refuse_values_past_limit(py, &values)?;
         let composite_id = self.door.submit_composite(step, values).map_err(|refusal| {
             refused(refusal, |rejection| match rejection {
-                SubmitRejection::NotLeader => PyRuntimeError::new_err(rejection.to_string()),
+                // The member-batch refusals answer a batch, not a composite.
+                SubmitRejection::NotLeader
+                | SubmitRejection::NotReady
+                | SubmitRejection::UnknownComposite
+                | SubmitRejection::NotStreamed
+                | SubmitRejection::MemberGap { .. }
+                | SubmitRejection::MemberKind
+                | SubmitRejection::CompositeFinished => PyRuntimeError::new_err(rejection.to_string()),
                 SubmitRejection::StepTakesInput => PyValueError::new_err(rejection.to_string()),
                 SubmitRejection::TooLarge { .. }
                 | SubmitRejection::RecordTooLarge { .. }
@@ -477,6 +495,48 @@ impl NativeRuntime {
             })
         })?;
         Ok(composite_id.as_str().to_owned())
+    }
+
+    /// Returns an awaitable that resolves to `"accepted"` when the streamed
+    /// composite `composite_id` holds `members`, the ones from `start_index`
+    /// on, or `"finished"` when the composite is over and takes no more: send
+    /// no further batch. `members` are a streamed map's items, each its
+    /// template's whole input as `bytes`, or a streamed group's members, each
+    /// a stage tree as `describe_step` takes one. `last` says no member
+    /// follows. A batch asked again, or overlapping the members already held,
+    /// adds only the members the composite lacks. A member whose inline bytes
+    /// pass `inline_bytes` (at most `MEMBER_BATCH_BYTES`; a larger value
+    /// counts as that) has its bound values stored as blobs the composite
+    /// owns, so a batch always fits one message. The batch is taken under the
+    /// scheduler's lock before this returns; it is an awaitable as a
+    /// networked runtime's is, which asks its leader.
+    ///
+    /// Raises `BackpressureError` if the batch would take memory past the
+    /// hard limit or one of its values alone is past it (nothing of the batch
+    /// is taken), `ValueError` if the batch is malformed, starts past the
+    /// members held, adds to a composite whose last batch is in, does not
+    /// fit the composite, or cannot go in one message even with its values
+    /// stored as blobs, and `RuntimeError` if this worker is not the leader or
+    /// the runtime has shut down.
+    #[pyo3(signature = (composite_id, start_index, members, last, inline_bytes = MEMBER_BATCH_BYTES))]
+    fn submit_members<'py>(
+        &self,
+        py: Python<'py>,
+        composite_id: &str,
+        start_index: u64,
+        members: Vec<Bound<'py, PyAny>>,
+        last: bool,
+        inline_bytes: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let answer = self.send_members(py, composite_id, start_index, &members, last, inline_bytes);
+        self.bridge.spawn_into_py(py, async move { answer })
+    }
+
+    /// Whether memory in use is past the soft limit and has not fallen back
+    /// below 80% of it: new work is to wait. Raises `RuntimeError` once the
+    /// runtime has shut down.
+    fn slow_down(&self) -> PyResult<bool> {
+        Ok(self.door.slow_down()?)
     }
 
     /// Returns an awaitable that resolves to the digest of a result: `data`
@@ -803,6 +863,41 @@ impl Drop for NativeRuntime {
 }
 
 impl NativeRuntime {
+    /// Takes one batch of members into its streamed composite, and says
+    /// whether the composite is still taking more (see `submit_members`).
+    fn send_members(
+        &self,
+        py: Python<'_>,
+        composite_id: &str,
+        start_index: u64,
+        members: &[Bound<'_, PyAny>],
+        last: bool,
+        inline_bytes: u64,
+    ) -> PyResult<&'static str> {
+        let (batch, values) = member_batch(composite_id, start_index, members, last, inline_bytes)?;
+        self.refuse_values_past_limit(py, &values)?;
+        match self.door.submit_members(batch, values) {
+            Ok(_) => Ok("accepted"),
+            Err(Refusal::Rejected(SubmitRejection::CompositeFinished)) => Ok("finished"),
+            Err(refusal) => Err(refused(refusal, |rejection| match rejection {
+                SubmitRejection::Backpressure { .. }
+                | SubmitRejection::TooLarge { .. }
+                | SubmitRejection::KeyBackpressure { .. }
+                | SubmitRejection::PayloadTooLarge { .. } => errors::backpressure_error(py, rejection.to_string()),
+                SubmitRejection::NotLeader | SubmitRejection::NotReady | SubmitRejection::KeyNotReady => {
+                    PyRuntimeError::new_err(rejection.to_string())
+                }
+                SubmitRejection::UnknownComposite
+                | SubmitRejection::NotStreamed
+                | SubmitRejection::MemberGap { .. }
+                | SubmitRejection::MemberKind
+                | SubmitRejection::RecordTooLarge { .. }
+                | SubmitRejection::StepTakesInput
+                | SubmitRejection::CompositeFinished => PyValueError::new_err(rejection.to_string()),
+            })),
+        }
+    }
+
     /// Refuses any of `values` alone past the hard memory limit, before
     /// anything is stored.
     fn refuse_values_past_limit(&self, py: Python<'_>, values: &[Vec<u8>]) -> PyResult<()> {
@@ -811,7 +906,12 @@ impl NativeRuntime {
 }
 
 fn rejected(rejection: ReportRejection) -> PyErr {
-    PyRuntimeError::new_err(rejection.to_string())
+    match rejection {
+        ReportRejection::ContinuationTooLarge => {
+            errors::ContinuationTooLargeError::new_err(rejection.to_string())
+        }
+        _ => PyRuntimeError::new_err(rejection.to_string()),
+    }
 }
 
 /// What a refused door operation raises: the closed error, or whatever

@@ -18,12 +18,14 @@ from hypothesis import strategies as st
 from kabudachi import _native
 from kabudachi._native import KabudachiError
 from kabudachi.body import fold_payloads
+from kabudachi.composites import _batches
 from kabudachi.errors import (
     BackpressureError,
     PayloadTooLargeError,
     RunStoppedError,
     RuntimeNotStartedError,
     SerializationError,
+    TaskBodyError,
     TaskCancelledError,
     TaskDefinitionError,
     TaskFailure,
@@ -676,6 +678,37 @@ def test_a_map_after_a_stage_that_returns_a_list_is_expanded_by_a_worker_and_kee
     assert any(claim.expansion for claim in world.runtime.claimed), "an expansion run split the list"
 
 
+def test_a_map_that_fails_while_its_items_are_still_being_sent_stops_the_expansion_without_reporting_it():
+    def load(request: Greeting) -> list[Greeting]:
+        return [Greeting(text=text) for text in ("bad", "a", "b")]
+
+    def picky(request: Greeting) -> Greeting:
+        if request.text == "bad":
+            raise ValueError("bad input")
+        return request
+
+    world = World(load, picky, member_batch_items=1)
+    pipeline = flow(world.tasks["load"], world.tasks["picky"].map)
+    map_failed = False
+    # The first batch goes at once and the next waits, so the expansion is
+    # still sending when the map ends.
+    world.session.has_room = lambda: map_failed or members_sent(world) == 0
+
+    async def body():
+        nonlocal map_failed
+        with pytest.raises(ValueError, match="bad input"):
+            await pipeline.start(world.session, Greeting())
+        map_failed = True
+        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+
+    run(with_events(world, body))
+
+    assert members_sent(world) == 1, "only the batch sent before the map ended was taken"
+    reports = [event[0] for event in world.runtime.events]
+    assert reports.count("complete") == 1, "only the list's own task completed; the cancelled expansion did not"
+    assert reports.count("fail") == 1, "only the bad member failed; the cancelled expansion reported nothing"
+
+
 def test_a_collect_all_failure_reaches_awaiting_code_and_the_next_stage_as_the_member_failed():
     def explode(request: Greeting) -> Greeting:
         raise ValueError("member failed")
@@ -784,6 +817,7 @@ def test_a_map_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_ta
 # a submission that would go past the hard one is refused.
 SOFT_LIMIT = 100
 HARD_LIMIT = 1_000
+PAST_SOFT_LIMIT = Greeting(text="x" * 150)
 
 
 def held_world(*functions, hard_limit=HARD_LIMIT, **options):
@@ -814,22 +848,181 @@ def run_states(world):
     ]
 
 
-def test_a_group_past_the_hard_limit_is_refused_whole_and_starts_nothing():
-    # Two members would fit and the third would not: the group is refused as a
-    # whole, so none of them is started.
-    world, released = held_world(hard_limit=100)
+def members_sent(world):
+    """How many members the leader took in batches so far."""
+    return sum(count for _, _, count in world.runtime.members_sent)
+
+
+async def until_slow_down_seen(world):
+    """Waits until the runtime says memory use is past its soft limit."""
+    while world.session.has_room():
+        await asyncio.sleep(0.005)
+
+
+async def with_watcher_only(world, body):
+    """Like `with_events`, but no worker claims anything, so every task the
+    body submits stays pending and its input stays counted."""
+    await asyncio.wait_for(world.native.wait_until_leader(), WAIT)
+    events = asyncio.ensure_future(world.session.watch_events())
+    try:
+        return await asyncio.wait_for(body(), WAIT)
+    finally:
+        events.cancel()
+        await asyncio.gather(events, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("end", "error"),
+    [
+        pytest.param(
+            lambda world, handle: asyncio.ensure_future(world.session.stop_claiming()), RunStoppedError, id="stop"
+        ),
+        pytest.param(lambda world, handle: handle.cancel(), TaskCancelledError, id="cancel"),
+    ],
+)
+def test_stopping_or_cancelling_a_streamed_group_that_is_waiting_out_slow_down_sends_nothing_more(end, error):
+    world = World(shout, memory_soft_limit=SOFT_LIMIT, memory_hard_limit=HARD_LIMIT, member_batch_items=1)
+    members = group(world.tasks["shout"], world.tasks["shout"])
+
+    async def body():
+        world.call("shout", PAST_SOFT_LIMIT)  # never claimed: its input stays counted
+        await until_slow_down_seen(world)
+        handle = members.start(world.session, Greeting())
+        await asyncio.sleep(0.05)
+        end(world, handle)
+        with pytest.raises(error):
+            await asyncio.wait_for(handle, WAIT)
+
+    run(with_watcher_only(world, body))
+
+    assert members_sent(world) == 0
+
+
+def test_a_streamed_group_that_hits_the_hard_limit_midway_fails_and_cancels_the_members_it_sent():
+    # Two members fit and the third does not. With equal limits SlowDown is
+    # never raised first, so the stream reaches the hard limit rather than
+    # pausing. Members hold, so the cancel reaches them still running.
+    world, released = held_world(hard_limit=100, member_batch_items=1)
     members = group(*([world.tasks["hold"]] * 3))
 
     async def body():
+        handle = members.start(world.session, Greeting(text="x" * 40))
         with pytest.raises(BackpressureError):
-            members.start(world.session, Greeting(text="x" * 40))
+            await handle
         released.set()
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+        return await world.native.composite_status(handle.task_id)
+
+    state, _, pending, running, succeeded, failed, cancelled = run(with_events(world, body))
+
+    assert members_sent(world) == 2
+    assert (state, cancelled, pending + running + succeeded + failed) == ("cancelled", 2, 0)
+
+
+def test_a_streamed_group_given_an_input_its_members_cannot_take_is_refused_at_start_with_nothing_submitted():
+    world = World(shout, member_batch_items=1)
+    members = group(world.tasks["shout"], world.tasks["shout"])
+
+    async def body():
+        with pytest.raises(SerializationError):
+            members.start(world.session, "not a greeting")
 
     run(with_events(world, body))
 
-    assert world.runtime.claimed == []
-    assert run_states(world) == []
+    assert world.runtime.members_sent == []
+
+
+def test_a_stream_that_cannot_cancel_what_it_sent_still_fails_its_handle_and_says_so(caplog):
+    world, released = held_world(hard_limit=100, member_batch_items=1)
+    members = group(*([world.tasks["hold"]] * 3))
+
+    def not_the_leader(composite_id):
+        raise RuntimeError("this worker is not the leader")
+
+    world.runtime.cancel_composite = not_the_leader
+
+    async def body():
+        handle = members.start(world.session, Greeting(text="x" * 40))
+        with pytest.raises(BackpressureError):
+            await handle
+        released.set()  # the members it could not cancel finish
+        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+        return handle.task_id
+
+    with caplog.at_level("WARNING", logger="kabudachi"):
+        composite_id = run(with_events(world, body))
+
+    assert [record.getMessage() for record in caplog.records if record.name == "kabudachi"] == [
+        f"the members of {composite_id} that were sent could not be cancelled: this worker is not the leader"
+    ]
+
+
+# A pure-logic edge-case exception to testing through the public seam: the
+# boundaries of a batch are many and cheap to reach here, and slow to reach by
+# running a map for each.
+@pytest.mark.parametrize(
+    ("lengths", "max_items", "max_bytes", "expected"),
+    [
+        pytest.param([0] * 5, 2, 10**6, [[0, 0], [0, 0], [0]], id="at most max_items members"),
+        pytest.param([36] * 5, 100, 250, [[36, 36], [36, 36], [36]], id="at most max_bytes of input"),
+        pytest.param([86, 86], 100, 300, [[86, 86]], id="a batch may fill max_bytes exactly"),
+        pytest.param([10, 1000, 10], 100, 250, [[10], [1000], [10]], id="a member past max_bytes has its own batch"),
+        pytest.param([1000, 10], 100, 250, [[1000], [10]], id="an oversized first member is not held back"),
+        pytest.param([], 100, 250, [], id="no members make no batch"),
+    ],
+)
+def test_members_are_batched_by_count_and_by_bytes_with_an_oversized_member_alone(
+    lengths, max_items, max_bytes, expected
+):
+    members = [b"x" * length for length in lengths]
+
+    batches = [[len(member) for member in batch] for batch in _batches(members, max_items, max_bytes)]
+
+    assert batches == expected
+
+
+def test_a_streamed_group_pauses_when_slow_down_is_raised_while_it_is_still_sending_but_a_plain_call_does_not():
+    world, released = held_world(shout, concurrency=8, member_batch_items=1)
+    members = group(*([world.tasks["hold"]] * 40))
+
+    async def body():
+        handle = members.start(world.session, Greeting(text="x" * 60))
+        await until_slow_down_seen(world)
+        paused_at = members_sent(world)
+        await asyncio.sleep(0.05)
+        while_slow = members_sent(world)
+        plain = await world.call("shout", Greeting(text="plain"))
+        released.set()  # the held members finish, which clears SlowDown
+        await asyncio.wait_for(handle, WAIT)
+        return paused_at, while_slow, plain, members_sent(world)
+
+    paused_at, while_slow, plain, after = run(with_events(world, body))
+
+    assert while_slow == paused_at, "the group kept sending past the soft limit"
+    assert paused_at < 40
+    assert plain == Greeting(text="PLAIN"), "a plain call does not wait"
+    assert after == 40
+
+
+def test_cancelling_a_streamed_group_part_way_through_starts_no_further_member():
+    world, released = held_world(concurrency=8, member_batch_items=1)
+    members = group(*([world.tasks["hold"]] * 6))
+
+    async def body():
+        handle = members.start(world.session, Greeting())
+        while members_sent(world) < 2:
+            await asyncio.sleep(0)
+        assert handle.cancel() is True
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(handle, WAIT)
+        released.set()
+        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+        return await world.native.composite_status(handle.task_id)
+
+    state, _, pending, running, succeeded, _, cancelled = run(with_events(world, body))
+
+    assert members_sent(world) < 6
+    assert (state, pending, running, succeeded, cancelled) == ("cancelled", 0, 0, 0, members_sent(world))
 
 
 def test_a_stage_reading_a_large_result_holds_it_against_the_memory_limit_until_its_run_ends():
@@ -974,20 +1167,6 @@ def test_a_returned_step_runs_after_the_certification_and_the_handle_is_its_resu
     assert order[: first_certification + 1].count("started") == 1
 
 
-def test_a_returned_step_bound_to_a_value_too_large_to_inline_runs_with_that_value():
-    big = "z" * 1_100_000
-    world = continuing_world()
-
-    def plan(request: Greeting) -> Group:
-        return group(world.tasks["shout"].bind(Greeting(text=big)), world.tasks["acknowledge"].bind(request))
-
-    planner = declare_planner(world, plan)
-
-    results = run_planner(world, planner, Greeting(text="in"))
-
-    assert results == [Greeting(text=big.upper()), Receipt(ok=True)]
-
-
 def test_a_returned_step_that_needs_an_input_is_refused_and_fails_the_run():
     world = continuing_world()
 
@@ -1020,6 +1199,67 @@ def test_a_returned_step_bound_to_a_value_past_the_hard_limit_alone_fails_the_ru
     run(with_events(world, body))
 
     assert [e[0] for e in world.runtime.events][-1] == "fail"
+
+
+def test_a_returned_step_whose_bound_values_pass_a_record_runs_with_them_stored_as_blobs():
+    world = continuing_world()
+    # One value alone is past a record; the other two are past it together.
+    large = [Greeting(text=letter * size) for letter, size in zip("abc", (1_100_000, 600_000, 600_000))]
+
+    def plan(request: Greeting) -> Group:
+        return group(
+            *(world.tasks["shout"].bind(value) for value in large), world.tasks["acknowledge"].bind(request)
+        )
+
+    planner = declare_planner(world, plan)
+    results = run_planner(world, planner, Greeting())
+
+    assert results == [Greeting(text=value.text.upper()) for value in large] + [Receipt(ok=True)]
+
+
+def test_a_returned_step_too_large_by_its_structure_alone_fails_its_run_for_good_with_continuation_too_large():
+    world = continuing_world()
+    members = 32_000  # 35 bytes each: just past the 1,114,112 a record may hold
+
+    step = group(*([world.tasks["shout"].bind(Greeting(text="x"))] * members))
+
+    def plan(request: Greeting) -> Group:
+        return step
+
+    tree = step.describe(world.session)
+    assert len(_native.describe_step(tree)) > _native.MAX_RECORD_BYTES, "the structure alone passes a record"
+    planner = declare_planner(world, plan)
+
+    async def body():
+        handle = world.session.submit(planner.definition, Greeting())
+        with pytest.raises(TaskBodyError) as failure:
+            await handle
+        assert failure.value.kind == "ContinuationTooLarge"
+        return await world.native.task_record(handle.task_id)
+
+    record = run(with_events(world, body))
+
+    assert [(attempt.failure_kind, attempt.state) for attempt in record.runs] == [
+        ("ContinuationTooLarge", _native.RunState.FAILED)
+    ], "failed once, with no retry"
+
+
+def test_a_two_thousand_item_map_toggles_slow_down_and_keeps_its_order():
+    # Every batch of 100 items (about 900 bytes) passes the soft limit on
+    # its own, so each one raises SlowDown and the next waits for it to clear.
+    world = World(shout, memory_soft_limit=500, memory_hard_limit=1_000_000, concurrency=8, member_batch_items=100)
+    items = [Greeting(text=f"item {index}") for index in range(2_000)]
+
+    async def body():
+        with activated(world):
+            return await world.tasks["shout"].map(items)
+
+    results = run(with_events(world, body))
+
+    assert [result.text for result in results] == [item.text.upper() for item in items]
+    starts = [start for _, start, _ in world.runtime.members_sent]
+    assert starts == list(range(0, 2_000, 100)), "every batch once, in order"
+    assert world.runtime.slow_downs.count(True) >= 10 and world.runtime.slow_downs.count(False) >= 10
 
 
 def test_a_task_annotated_to_return_a_step_but_returning_something_else_fails():

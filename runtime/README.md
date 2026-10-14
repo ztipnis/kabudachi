@@ -246,6 +246,37 @@ failure is a `TaskFailure` with its `kind` and `message`. A coalescing task cann
 A stage that consumes the array of a `collect_all` group receives failures in it, so it needs a
 serializer that can encode them; the protobuf serializer cannot.
 
+### Large groups and maps
+
+A group or map sends its members to the leader in batches, so how many it can hold is bounded by
+memory, not by the size of one record. A `.map` placed after a stage is fed the same way: the
+worker that splits the prior stage's list sends the items in batches.
+
+- Each batch waits while the leader says SlowDown (memory in use is past `memory_soft_limit`). A
+  networked worker hears SlowDown from the leader and checks again every heartbeat interval. Past
+  `memory_hard_limit` the stream stops, the members already sent are cancelled and the handle fails
+  with `BackpressureError`. A stop of the run, or a cancel of the handle, ends the stream the same
+  way, failing the handle with `RunStoppedError` or `TaskCancelledError`.
+- Because the first batch can go before the rest are sent, a group or map that hits the hard limit
+  midway fails through its handle: `.start()` and the call have already returned, and the composite
+  exists, cancelled. What stays synchronous is everything that can be checked before anything is
+  sent: the arguments (`TypeError`), a member the serializer cannot encode, a run that is stopping
+  (`RunStoppedError`) or not serving (`RuntimeNotStartedError`), and `BackpressureError` when even
+  the group's first record is refused. A group's members are all described when it starts; a map's
+  items are encoded as they are sent.
+- A group or map whose submitter dies before sending every member keeps running the members the
+  leader has until it is cancelled; it never finishes on its own.
+- A value bound into a step, a group's member or a map item that is too large to travel inline is
+  stored in the shard instead. Only the structure of a flow or a returned step has to fit one record
+  (about 1 MiB). A flow whose stages themselves pass that, roughly 25,000 bound stages, is refused
+  with a `BackpressureError` that names the record limit, and a task that returns such a step fails
+  with `ContinuationTooLarge` and is not run again. A single value past this process's memory limit
+  raises `PayloadTooLargeError` instead. To run that many tasks, start a group or map, which sends
+  its members in batches, instead of a flow or a returned step.
+- Bound bytes fields of a message (set with `task.bind(field=value)`) are not stored in the shard:
+  they count as part of the structure, as do names and settings. A single group member whose own
+  structure passes one message to the leader raises `ValueError`.
+
 ## Coalescing and backpressure
 
 A newer pending submission of a `@coalescing_task` with the same key supersedes the older one, whose
