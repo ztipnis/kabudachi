@@ -3077,6 +3077,8 @@ Open: no burst test of the networked runtime's outcome event queue. Wanted: 10 0
 
 Open: mixed schema versions in one shard can strand a task. A record's submission digest (`ShardRecord::submission_digest`, `core/src/task_record/key.rs`) is computed over the re-encoded protobuf of its `Task` or `StepDescription`, and prost drops fields it does not know. A shard whose members run two schema versions can therefore compute different digests for one submission, and a holder that has the first revision's digest refuses a later revision with `SubmissionChanged`, so the task cannot be rewritten (a claim or a result included). Exposure: rare, a rolling upgrade that adds a field to `Task` or `StepDescription` while such a record is live. Impact: severe for the task, which stays stuck until it expires. A shard must run one schema version today; this is part of the mixed-version gate in §27.2. Fix: make the digest ignore unknown fields, or tag it with the schema version.
 
+Open: `//runtime/tests:test_session::test_cancel_grace_comes_from_the_process_unless_the_task_chose_its_own` failed once with `quick < 0.2` measuring 0.265 s while eighteen test targets ran in parallel on one machine. It compares a 50 ms cancel-grace timeout against a fixed 0.2 s bound, so a loaded host can overrun it. Exposure: the test harness only. Impact: benign (a red test, no product effect). Fix: widen the bound relative to the fast case or measure the two timeouts against each other instead of a wall-clock constant.
+
 ### Phase 7: observability
 
 Prometheus and tracing should exist earlier for development, but this phase hardens:
