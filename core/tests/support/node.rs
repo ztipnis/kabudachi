@@ -1,20 +1,22 @@
 //! Helpers for driving `WorkerNode`s by hand and reading back what they
 //! asked their driver to do.
 
-use kabudachi_core::election::{Entry, Identity, Input, Output, WorkerNode};
+use kabudachi_core::election::{
+    ElectionTimings, Entry, Identity, Input, KnownConfiguration, Output, WorkerNode,
+};
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
-    AckEcho, ElectionMessage, ElectionReject, RollCall,
+    AckEcho, ElectionMessage, ElectionReject, LeaderHeartbeatAck, RollCall,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::LeadershipGrant;
 use kabudachi_core::time::{Clock, Duration};
 
 use crate::support::builders::{
-    checked, g0, heartbeat, heartbeat_message, message_input, past_any_suspicion, roll_call_reply, shard, timings,
-    vote_grant, vote_grant_message, voter_of,
+    checked, g0, heartbeat, heartbeat_message, message_input, past_any_suspicion, roll_call_reply,
+    shard, timings, vote_grant, vote_grant_message, voter_of, worker,
 };
 use crate::support::clock::FakeClock;
 
@@ -48,6 +50,17 @@ pub fn voter_node_reconnecting(
         Some(ticks) => timings.with_reconnect_timeout(Duration::from_ticks(ticks)),
         None => timings,
     };
+    known_node(clock, my_id, voter_of(voter_count), timings)
+}
+
+/// `my_id`'s node in `shard-1`, started in the configuration `known` says,
+/// with no authority and running `timings`.
+pub fn known_node(
+    clock: &FakeClock,
+    my_id: &WorkerId,
+    known: KnownConfiguration,
+    timings: ElectionTimings,
+) -> TestNode {
     WorkerNode::start(
         Identity {
             id: my_id.clone(),
@@ -55,7 +68,7 @@ pub fn voter_node_reconnecting(
             shard: shard("shard-1"),
             timings,
         },
-        Entry::Known(voter_of(voter_count)),
+        Entry::Known(known),
         clock.clone(),
         None,
     )
@@ -111,6 +124,17 @@ pub fn rejects_sent_to(outputs: &[Output], recipient: &WorkerId) -> Vec<Checked<
         .into_iter()
         .filter_map(|message| match checked(message).into_payload() {
             Some(CheckedPayload::ElectionReject(reject)) => Some(reject),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The acks among `outputs` addressed to `recipient`, in order.
+pub fn acks_to(outputs: &[Output], recipient: &WorkerId) -> Vec<Checked<LeaderHeartbeatAck>> {
+    sent_to(outputs, recipient)
+        .into_iter()
+        .filter_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::HeartbeatAck(ack)) => Some(ack),
             _ => None,
         })
         .collect()
@@ -318,4 +342,27 @@ pub fn commit_founding(
             .is_some_and(|configuration| !configuration.is_joint()),
         "commit_founding: the leader must have committed"
     );
+}
+
+/// `w1`, elected in term 1 leader of a configuration of 3 by `p1` and `p2`,
+/// connected to both, having committed what its election founded.
+pub fn leader_of_three(clock: &FakeClock, suspect_timeout: u64) -> TestNode {
+    leader_of_three_reconnecting(clock, suspect_timeout, None)
+}
+
+/// `leader_of_three`, reporting a worker lost `reconnect_timeout` ticks past
+/// the suspicion timeout rather than the default (see
+/// `voter_node_reconnecting`).
+pub fn leader_of_three_reconnecting(
+    clock: &FakeClock,
+    suspect_timeout: u64,
+    reconnect_timeout: Option<u64>,
+) -> TestNode {
+    let mut node =
+        voter_node_reconnecting(clock, &worker("w1"), 3, suspect_timeout, reconnect_timeout);
+    let peers = [worker("p1"), worker("p2")];
+    connect(&mut node, &peers);
+    elect(&mut node, clock, suspect_timeout, &peers);
+    commit_founding(&mut node, clock, &peers);
+    node
 }

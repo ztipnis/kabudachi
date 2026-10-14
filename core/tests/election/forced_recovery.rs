@@ -7,19 +7,18 @@
 //! straight back, as a driver does.
 
 use crate::support::builders::{
-    message_input,
-    ack_message, configuration_of, g0, leader_ack, roll_call_reply, shard, timings, voter_of,
-    worker,
+    ack_message, configuration_at_epoch, configuration_of, g0, leader_ack, message_input,
+    roll_call_reply, shard, timings, vote_grant, vote_grant_message, voter_of, worker,
 };
 
 use kabudachi_core::configuration::{Configuration, Generation, Single};
-use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch, ShardRecord};
+use kabudachi_core::coordination_authority::{
+    AuthorityError, CoordinationAuthority, RecoveryEpoch, ShardRecord,
+};
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind,
-    DropMessages,
-    ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step,
-    StopReason, WorkerNode,
-    carry_out,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, AuthorityTimings,
+    CallKind, DropMessages, ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration,
+    Output, ReplyToken, Step, StopReason, WorkerNode, carry_out,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::{
@@ -637,6 +636,42 @@ fn awaiting_its_live_set_read() -> (Driven, AuthorityCall) {
     (driven, read)
 }
 
+/// The authority call of `call` run as `w1`, as the reply it would bring.
+fn performed(driven: &Driven, call: AuthorityCall) -> Input {
+    Input::Authority(call.perform(
+        &driven.authority,
+        &name_of(&shard(SHARD)),
+        &shard(SHARD),
+        &worker("w1"),
+        "w1",
+    ))
+}
+
+/// `w1` in a five-voter shard at epoch 0, past its roll call and its two
+/// authority reads, stopped where it awaits its swap to epoch 1: that call, not
+/// yet performed.
+fn awaiting_its_swap() -> (Driven, AuthorityCall) {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
+    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
+    driven.answer_roll_call(&[worker("w2")]);
+    driven.clock.advance(default_timings().roll_call_deadline);
+    let closed = driven.node.step(Input::Tick);
+    let live = asked(&closed.outputs, AuthorityRequest::ReadLiveRegistrations);
+    let read = driven.node.step(performed(&driven, live));
+    let epoch_read = asked(&read.outputs, AuthorityRequest::ReadRecoveryEpoch);
+    let read = driven.node.step(performed(&driven, epoch_read));
+    let swap = asked(
+        &read.outputs,
+        AuthorityRequest::SwapRecoveryEpoch {
+            expected: Some(epoch(0)),
+            new: epoch(1),
+        },
+    );
+    (driven, swap)
+}
+
 // A reply is matched by its call's issuer, kind and number, not by when the
 // call was sent: a reply of another kind carrying the awaited number (a stray
 // or a duplicate), or one the bootstrap cascade issued (it numbers its calls
@@ -644,27 +679,31 @@ fn awaiting_its_live_set_read() -> (Driven, AuthorityCall) {
 // empty its slot so the real answer is ignored.
 #[test]
 fn a_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
-    type Stray = fn(&Driven, &AuthorityCall) -> AuthorityReply;
+    type Stray = fn(&Driven, &AuthorityCall) -> Input;
     let strays: [Stray; 2] = [
-        |_, read| AuthorityReply::RecoveryEpoch {
-            token: ReplyToken {
-                kind: CallKind::ReadRecoveryEpoch,
-                ..read.token
-            },
-            sent_at: read.sent_at,
-            result: Ok(Some(record_at(epoch(0)))),
+        |_, read| {
+            Input::Authority(AuthorityReply::RecoveryEpoch {
+                token: ReplyToken {
+                    kind: CallKind::ReadRecoveryEpoch,
+                    ..read.token
+                },
+                sent_at: read.sent_at,
+                result: Ok(Some(record_at(epoch(0)))),
+            })
         },
         // A real live set, of the awaited kind and number, which would move
         // the recovery on if it were taken.
         |driven, read| {
-            AuthorityCall {
-                token: ReplyToken {
-                    issuer: Issuer::Cascade,
-                    ..read.token
+            performed(
+                driven,
+                AuthorityCall {
+                    token: ReplyToken {
+                        issuer: Issuer::Cascade,
+                        ..read.token
+                    },
+                    ..*read
                 },
-                ..*read
-            }
-            .perform(&driven.authority, &name_of(&shard(SHARD)), &shard(SHARD), &worker("w1"), "w1")
+            )
         },
     ];
 
@@ -672,24 +711,42 @@ fn a_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
         let (mut driven, read) = awaiting_its_live_set_read();
         assert_eq!(read.token.issuer, Issuer::Node, "setup invariant");
 
-        let reply = stray(&driven, &read);
-        let ignored = driven.node.step(Input::Authority(reply));
+        let ignored = driven.node.step(stray(&driven, &read));
         assert!(authority_calls(&ignored.outputs).is_empty(), "{:?}", ignored.outputs);
         assert_eq!(driven.node.state(), WorkerState::NoQuorum);
 
-        let answered = driven.node.step(Input::Authority(read.perform(
-            &driven.authority,
-            &name_of(&shard(SHARD)),
-            &shard(SHARD),
-            &worker("w1"),
-            "w1",
-        )));
+        let answered = driven.node.step(performed(&driven, read));
         assert!(
             authority_calls(&answered.outputs).contains(&AuthorityRequest::ReadRecoveryEpoch),
             "the recovery is still going: {:?}",
             answered.outputs
         );
     }
+}
+
+// A leader's ack takes a node off the authority path. Had the path stood, the
+// node would take it for the read of the epoch it runs, never ask for a
+// confirmation of its own, and so never call again when it suspects its leader
+// anew.
+#[test]
+fn a_node_a_leaders_ack_took_off_the_authority_path_calls_again_when_it_suspects_anew() {
+    let (mut driven, _awaited) = awaiting_its_live_set_read();
+    let leader = worker("w2");
+    driven.step(message_input(
+        &leader,
+        ack_message(leader_ack(&leader, 1, &configuration_of(5), Some(g0()))),
+    ));
+    assert_eq!(driven.node.state(), WorkerState::Active, "setup invariant");
+    driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
+    assert_eq!(
+        driven.node.state(),
+        WorkerState::LeaderSuspect,
+        "setup invariant"
+    );
+
+    let started = driven.tick();
+
+    assert_eq!(published_roll_calls(&started).len(), 1, "{started:?}");
 }
 
 /// `w1`, a voter of 5, its roll call answered by `w2` alone, with `live`
@@ -1039,7 +1096,7 @@ fn nodes_at_one_epoch_number_of_two_lineages_agree_which_epoch_is_newer() {
         let authority = warmed_up_authority(&clock);
         swap_epoch(&authority, &shard(SHARD), None, own)
             .expect("the shard has no epoch yet");
-        let configuration = configuration_at_epoch(own);
+        let configuration = configuration_at_epoch(own, 3);
         let (mut driven, _) = Driven::with(
             &clock,
             &authority,
@@ -1071,17 +1128,6 @@ fn nodes_at_one_epoch_number_of_two_lineages_agree_which_epoch_is_newer() {
     }
 }
 
-/// A configuration of three voters founded at `recovery_epoch`.
-fn configuration_at_epoch(recovery_epoch: RecoveryEpoch) -> Configuration {
-    let generation = Generation::new(recovery_epoch, 0, 0);
-    Configuration::single(Single {
-        generation,
-        base: generation,
-        voter_count: 3,
-    })
-    .expect("valid")
-}
-
 /// An ack from `leader` of `recovery_epoch`, term 9.
 fn ack_of_epoch(leader: &WorkerId, recovery_epoch: RecoveryEpoch) -> Input {
     message_input(
@@ -1092,7 +1138,7 @@ fn ack_of_epoch(leader: &WorkerId, recovery_epoch: RecoveryEpoch) -> Input {
             ..leader_ack(
                 leader,
                 9,
-                &configuration_at_epoch(recovery_epoch),
+                &configuration_at_epoch(recovery_epoch, 3),
                 Some(Generation::new(recovery_epoch, 0, 0)),
             )
         }),
@@ -1225,36 +1271,9 @@ fn a_lost_swap_race_sends_the_node_to_rejoin_the_epoch_that_won() {
 // call timeout finds the attempt given up, and changes nothing.)
 #[test]
 fn a_swap_reply_after_the_rolls_retry_within_the_call_timeout_still_makes_the_node_stand_at_the_new_epoch() {
-    let clock = FakeClock::new();
-    let authority = warmed_up_authority(&clock);
-    seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
-    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
-    driven.answer_roll_call(&[worker("w2")]);
-    driven.clock.advance(default_timings().roll_call_deadline);
-    let closed = driven.node.step(Input::Tick);
-
-    let perform = |driven: &Driven, call: AuthorityCall| {
-        Input::Authority(call.perform(
-            &driven.authority,
-            &name_of(&shard(SHARD)),
-            &shard(SHARD),
-            &worker("w1"),
-            "w1",
-        ))
-    };
-    let live = asked(&closed.outputs, AuthorityRequest::ReadLiveRegistrations);
-    let read = driven.node.step(perform(&driven, live));
-    let epoch_read = asked(&read.outputs, AuthorityRequest::ReadRecoveryEpoch);
-    let read = driven.node.step(perform(&driven, epoch_read));
-    let swap = asked(
-        &read.outputs,
-        AuthorityRequest::SwapRecoveryEpoch {
-            expected: Some(epoch(0)),
-            new: epoch(1),
-        },
-    );
+    let (mut driven, swap) = awaiting_its_swap();
     // The swap lands, and its reply is held past the next roll call's due time.
-    let reply = perform(&driven, swap);
+    let reply = performed(&driven, swap);
     driven.clock.advance(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS * 10));
     let _ = driven.node.step(Input::Tick);
 
@@ -1288,4 +1307,219 @@ fn a_roll_call_that_returns_a_quorum_beside_a_later_epoch_is_a_census_not_an_ele
     assert_eq!(driven.node.recovery_epoch(), 2);
     driven.finish_reconciling();
     assert_eq!(driven.node.state(), WorkerState::Leader);
+}
+
+/// A reply to a swap of the record that the node itself never awaited, handed
+/// to it as a driver would.
+fn swap_reply(
+    expected: Option<RecoveryEpoch>,
+    new: RecoveryEpoch,
+    sent_at: kabudachi_core::time::Instant,
+    result: Result<(), AuthorityError>,
+) -> Input {
+    Input::Authority(AuthorityReply::RecoveryEpochSwapped {
+        token: ReplyToken {
+            issuer: Issuer::Node,
+            kind: CallKind::SwapRecoveryEpoch,
+            number: 1_000,
+        },
+        expected,
+        new,
+        sent_at,
+        result,
+    })
+}
+
+/// A reply to a request for the fence at `recovery_epoch`.
+fn fence_reply(
+    recovery_epoch: RecoveryEpoch,
+    sent_at: kabudachi_core::time::Instant,
+    result: Result<Duration, AuthorityError>,
+) -> Input {
+    Input::Authority(AuthorityReply::Fence {
+        token: ReplyToken {
+            issuer: Issuer::Node,
+            kind: CallKind::AcquireFence,
+            number: 1_000,
+        },
+        recovery_epoch,
+        sent_at,
+        result,
+    })
+}
+
+fn asks_for_a_hint(outputs: &[Output]) -> bool {
+    authority_calls(outputs)
+        .iter()
+        .any(|call| matches!(call, AuthorityRequest::PublishLeaderHint { .. }))
+}
+
+fn asks_for_the_fence(outputs: &[Output]) -> bool {
+    authority_calls(outputs)
+        .iter()
+        .any(|call| matches!(call, AuthorityRequest::AcquireFence { .. }))
+}
+
+// A leader that sees a swap of the record come back takes it for its own
+// republish only if the swap put its own epoch over a missing record; it then
+// says where it can be reached, and asks for its fence again at once. Any
+// other swap reply says nothing about its record.
+#[test]
+fn a_leader_takes_a_swap_reply_for_its_republish_only_when_its_own_epoch_went_over_a_missing_record() {
+    let conflict_at = |held| {
+        Err(AuthorityError::ShardConflict {
+            current: Some(record_at(held)),
+        })
+    };
+    // (expected, new, result, whether it was the leader's republish)
+    let rows = [
+        (None, epoch(0), Ok(()), true),
+        (None, epoch(0), conflict_at(epoch(0)), true),
+        (Some(epoch(0)), epoch(0), Ok(()), false),
+        (None, epoch(0), Err(AuthorityError::Unavailable), false),
+        (None, epoch(0), conflict_at(epoch(3)), false),
+        (None, epoch(0), Err(AuthorityError::ShardConflict { current: None }), false),
+        (None, epoch(3), Ok(()), false),
+    ];
+    for (expected, new, result, republished) in rows {
+        let (mut driven, _) = lone_winner(Some(AuthorityTimings {
+            ttl: authority_ttl(),
+        }));
+        let sent_at = driven.clock.now();
+        let label = format!("{expected:?} -> {new:?}: {result:?}");
+
+        let reply = driven.node.step(swap_reply(expected, new, sent_at, result));
+
+        assert_eq!(asks_for_a_hint(&reply.outputs), republished, "{label}");
+        assert_eq!(asks_for_the_fence(&reply.outputs), republished, "{label}");
+    }
+}
+
+// A leader whose fence finds no record under its name republishes it, and
+// publishes no hint until the record is its own again: not on its
+// registration's schedule, and not before its republish has landed.
+#[test]
+fn a_leader_whose_record_is_gone_publishes_no_hint_until_its_republish_lands() {
+    let (mut driven, _) = lone_winner(Some(AuthorityTimings {
+        ttl: authority_ttl(),
+    }));
+    let interval = Duration::from_ticks(ttl_ticks() / 3);
+    let sent_at = driven.clock.now();
+
+    let missing = driven.node.step(fence_reply(
+        epoch(0),
+        sent_at,
+        Err(AuthorityError::ShardConflict { current: None }),
+    ));
+    assert!(
+        authority_calls(&missing.outputs).contains(&AuthorityRequest::SwapRecoveryEpoch {
+            expected: None,
+            new: epoch(0),
+        }),
+        "{:?}",
+        missing.outputs
+    );
+
+    driven.clock.advance(interval);
+    let due = driven.node.step(Input::Tick);
+    assert!(
+        authority_calls(&due.outputs).contains(&AuthorityRequest::Register),
+        "setup invariant: a registration is due: {:?}",
+        due.outputs
+    );
+    assert!(!asks_for_a_hint(&due.outputs), "no hint beside a missing record");
+
+    let landed = driven.node.step(swap_reply(None, epoch(0), driven.clock.now(), Ok(())));
+    assert!(asks_for_a_hint(&landed.outputs));
+
+    driven.clock.advance(interval);
+    let due_again = driven.node.step(Input::Tick);
+    assert!(
+        asks_for_a_hint(&due_again.outputs),
+        "the record is its own again, so its hint follows its registration: {:?}",
+        due_again.outputs
+    );
+}
+
+// A leader owes the hint it publishes on taking office until a step that
+// publishes none for another reason. A registration that falls due at the step
+// the node wins does not consume the pending hint, so the node publishes the
+// same hint again at its next step and then stops. The repeat is redundant but
+// harmless. The `next` assertion pins the order in which the due registration
+// and the owed hint are weighed: the registration, short-circuiting, leaves the
+// hint owed.
+#[test]
+fn a_hint_owed_for_taking_office_outlasts_a_registration_that_falls_due_with_it() {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    seed_shard(&authority, &shard(SHARD), 0, []);
+    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 3);
+    let voters = [worker("w2"), worker("w3")];
+    driven.answer_roll_call(&voters);
+    let deadline = default_timings().roll_call_deadline;
+    driven.advance(deadline.as_ticks());
+    assert_eq!(driven.node.state(), WorkerState::Candidate, "setup invariant");
+    driven.clock.advance(Duration::from_ticks(ttl_ticks() / 3));
+
+    let won = driven.node.step(message_input(
+        &voters[0],
+        vote_grant_message(vote_grant(worker("w1"), voters[0].clone(), 1)),
+    ));
+    assert_eq!(driven.node.state(), WorkerState::LeaderReconciling);
+    assert!(
+        authority_calls(&won.outputs).contains(&AuthorityRequest::Register),
+        "setup invariant: a registration falls due as it takes office: {:?}",
+        won.outputs
+    );
+    assert!(asks_for_a_hint(&won.outputs), "{:?}", won.outputs);
+
+    let next = driven.node.step(Input::Tick);
+    assert!(asks_for_a_hint(&next.outputs), "{:?}", next.outputs);
+    let after = driven.node.step(Input::Tick);
+    assert!(!asks_for_a_hint(&after.outputs), "{:?}", after.outputs);
+}
+
+// A reply is matched to the swap of the authority path by its token alone: a
+// swap reply that is not the awaited call's, whatever it says, neither
+// completes the path nor ends it.
+#[test]
+fn a_swap_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
+    let (mut driven, swap) = awaiting_its_swap();
+
+    let stray = driven.node.step(swap_reply(
+        Some(epoch(0)),
+        epoch(1),
+        swap.sent_at,
+        Ok(()),
+    ));
+
+    assert_eq!(driven.node.state(), WorkerState::NoQuorum, "{:?}", stray.outputs);
+    let answered = driven.node.step(performed(&driven, swap));
+    assert_ne!(
+        driven.node.state(),
+        WorkerState::NoQuorum,
+        "the real reply still moves the path on: {:?}",
+        answered.outputs
+    );
+}
+
+// A reply to a fence asked at another epoch than the leader's own is stale: a
+// conflict it reports does not move the leader.
+#[test]
+fn a_leader_ignores_a_fence_reply_for_another_epoch_than_its_own() {
+    let (mut driven, _) = lone_winner(Some(AuthorityTimings {
+        ttl: authority_ttl(),
+    }));
+    let sent_at = driven.clock.now();
+
+    let stale = driven.node.step(fence_reply(
+        epoch(3),
+        sent_at,
+        Err(AuthorityError::ShardConflict {
+            current: Some(record_at(epoch(9))),
+        }),
+    ));
+
+    assert_eq!(driven.node.state(), WorkerState::Leader, "{:?}", stale.outputs);
+    assert!(state_changes(&stale.outputs).is_empty(), "{:?}", stale.outputs);
 }

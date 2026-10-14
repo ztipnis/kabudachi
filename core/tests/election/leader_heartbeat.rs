@@ -11,7 +11,8 @@
 
 use crate::support::builders::{
     epoch, g0, heartbeat, heartbeat_message, message_input, roll_call_reply, self_remove,
-    self_remove_message, shard, timings, vote_grant, vote_grant_message, voter_of, worker,
+    self_remove_message, shard, timings, vote_grant, vote_grant_message, voter_at_epoch, voter_of,
+    worker,
 };
 
 use kabudachi_core::configuration::Generation;
@@ -19,18 +20,18 @@ use std::collections::BTreeSet;
 
 use crate::support::clock::FakeClock;
 use crate::support::node::{
-    close_roll_call, connect, deliver, finish_reconciling, grants, published_roll_calls,
-    stand_as_candidate, start_roll_call,
+    acks_to, close_roll_call, connect, deliver, finish_reconciling, grants, known_node,
+    published_roll_calls, stand_as_candidate, start_roll_call,
 };
 use crate::support::scenarios::{
     abort_deadline_at, assert_aborts_by, bootstrap_5_and_elect_leader, reported_lost_at,
 };
 use kabudachi_core::election::{
-    ElectionTimings, Entry, Identity, Input, Output, Step, WorkerNode,
+    ElectionTimings, Entry, Identity, Input, KnownConfiguration, Output, Step, WorkerNode,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    AckEcho, WorkerHeartbeat,
+    AckEcho, VoteGrant, WorkerHeartbeat,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd};
@@ -66,26 +67,8 @@ fn leader_of(clock: &FakeClock, size: usize) -> Won {
 
 /// `leader_of` for a node that runs `timings`.
 fn leader_with_timings(clock: &FakeClock, size: usize, timings: ElectionTimings) -> Won {
-    assert!(size >= 3, "leader_of needs a configuration of at least 3");
     let quorum = size / 2 + 1;
-    let me = worker("leader");
-    let others: Vec<WorkerId> = (0..size - 1)
-        .map(|i| worker(&format!("peer-{i}")))
-        .collect();
-
-    let mut node = WorkerNode::start(
-        Identity {
-            id: me.clone(),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings,
-        },
-        Entry::Known(voter_of(size)),
-        clock.clone(),
-        None,
-    )
-    .0;
-    connect(&mut node, &others);
+    let (mut node, me, others) = connected_node(clock, voter_of(size), size, timings);
 
     stand_as_candidate(
         &mut node,
@@ -100,6 +83,60 @@ fn leader_with_timings(clock: &FakeClock, size: usize, timings: ElectionTimings)
             voter,
             vote_grant_message(vote_grant(me.clone(), voter.clone(), 1)),
         );
+    }
+    finish_reconciling(&mut node);
+    assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
+
+    Won {
+        node,
+        others,
+        won_at: clock.now(),
+    }
+}
+
+/// A node that runs `timings` and starts in `known`, a configuration of
+/// `size` voters (at least 3), connected to the `size - 1` others: the node
+/// as `leader`, the others as `peer-0`, `peer-1` and so on.
+fn connected_node(
+    clock: &FakeClock,
+    known: KnownConfiguration,
+    size: usize,
+    timings: ElectionTimings,
+) -> (TestNode, WorkerId, Vec<WorkerId>) {
+    assert!(size >= 3, "a leader needs a configuration of at least 3");
+    let me = worker("leader");
+    let others: Vec<WorkerId> = (0..size - 1)
+        .map(|i| worker(&format!("peer-{i}")))
+        .collect();
+    let mut node = known_node(clock, &me, known, timings);
+    connect(&mut node, &others);
+    (node, me, others)
+}
+
+/// `leader_of` for a node whose configuration was founded at recovery epoch 1:
+/// every heartbeat the builders make is from the earlier epoch 0.
+fn leader_at_epoch_1(clock: &FakeClock, size: usize) -> Won {
+    let epoch_1 = Generation::new(epoch(1), 0, 0);
+    let timings = timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS));
+    let (mut node, me, others) =
+        connected_node(clock, voter_at_epoch(epoch(1), size), size, timings);
+
+    let started = start_roll_call(&mut node, clock, SUSPECT_TIMEOUT_TICKS);
+    let call = published_roll_calls(&started).remove(0);
+    for peer in &others {
+        deliver(
+            &mut node,
+            peer,
+            roll_call_reply(&me, call.term, peer, Some(epoch_1)),
+        );
+    }
+    close_roll_call(&mut node, clock, SUSPECT_TIMEOUT_TICKS);
+    for voter in &others[..size / 2] {
+        let grant = VoteGrant {
+            recovery_epoch: 1,
+            ..vote_grant(me.clone(), voter.clone(), call.term)
+        };
+        deliver(&mut node, voter, vote_grant_message(grant));
     }
     finish_reconciling(&mut node);
     assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
@@ -157,6 +194,27 @@ fn a_heartbeat_from_another_sender_shard_or_recovery_epoch_gets_no_ack() {
         let outputs = receive(&mut won.node, &sender, rejected.clone()).outputs;
         assert!(outputs.is_empty(), "{rejected:?} got {outputs:?}");
     }
+}
+
+// An earlier epoch's heartbeat names a term of another count: it deposes no
+// leader, and the ack it echoes confirms nothing here.
+#[test]
+fn a_heartbeat_from_an_earlier_recovery_epoch_is_acked_but_neither_deposes_nor_confirms() {
+    let clock = FakeClock::new();
+    let mut won = leader_at_epoch_1(&clock, 3);
+    let follower = won.others[0].clone();
+    clock.advance(Duration::from_ticks(1));
+
+    let naming_a_later_term = WorkerHeartbeat {
+        term_seen: 5,
+        ..heartbeat(&follower, None)
+    };
+    let outputs = receive(&mut won.node, &follower, naming_a_later_term).outputs;
+    assert_eq!(won.node.state(), WorkerState::Leader);
+    assert_eq!(acks_to(&outputs, &follower).len(), 1, "{outputs:?}");
+
+    let echoing = confirm(&mut won.node, &follower, ticks_after(won.won_at, 1));
+    assert_eq!(grants(&echoing.outputs), vec![]);
 }
 
 // ---- The quorum-contact lease ----

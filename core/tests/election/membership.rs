@@ -8,16 +8,17 @@ use crate::support::builders::checked;
 use crate::support::builders::{
     ack_message, committed_from_g0, configuration_of, epoch, g0, heartbeat, heartbeat_message,
     leader_ack, past_any_suspicion, roll_call, roll_call_message, roll_call_reply, self_remove,
-    self_remove_message, vote_grant, vote_grant_message, vote_request, vote_request_message,
-    worker,
+    self_remove_message, single_at, vote_grant, vote_grant_message, vote_request,
+    vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
-    TestNode, close_roll_call, commit_founding, connect, deliver, elect, finish_reconciling,
-    published_roll_calls, sent, sent_to, voter_node, voter_node_reconnecting,
+    TestNode, acks_to, close_roll_call, commit_founding, connect, deliver, elect,
+    finish_reconciling, leader_of_three_reconnecting, published_roll_calls, sent, voter_node,
+    voter_node_reconnecting,
 };
-use kabudachi_core::configuration::{Configuration, Generation, Single};
+use kabudachi_core::configuration::{Configuration, Generation};
 use kabudachi_core::election::{HandOffTo, Input, Output};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::prelude::*;
@@ -39,22 +40,13 @@ const RECONNECT: u64 = 100;
 /// `w1`, elected in term 1 leader of a configuration of 3 by `p1` and `p2`,
 /// connected to both, having committed what its election founded.
 fn leader_of_three(clock: &FakeClock) -> TestNode {
-    leader_of_three_reconnecting(clock, None)
+    crate::support::node::leader_of_three(clock, SUSPECT)
 }
 
 /// `leader_of_three`, reporting a worker lost `RECONNECT` ticks past the
 /// suspicion timeout rather than the default.
 fn leader_of_three_losing_quickly(clock: &FakeClock) -> TestNode {
-    leader_of_three_reconnecting(clock, Some(RECONNECT))
-}
-
-fn leader_of_three_reconnecting(clock: &FakeClock, reconnect: Option<u64>) -> TestNode {
-    let mut node = voter_node_reconnecting(clock, &worker("w1"), 3, SUSPECT, reconnect);
-    let peers = [worker("p1"), worker("p2")];
-    connect(&mut node, &peers);
-    elect(&mut node, clock, SUSPECT, &peers);
-    commit_founding(&mut node, clock, &peers);
-    node
+    leader_of_three_reconnecting(clock, SUSPECT, Some(RECONNECT))
 }
 
 /// What `leader_of_three` leads: its founding of three, committed and
@@ -67,25 +59,6 @@ fn three_voters_founded_in_term_1() -> Configuration {
 /// at and based at (0, 1, 3).
 fn two_voters_at_the_next_generation() -> Configuration {
     single_at(Generation::new(epoch(0), 1, 3), 2)
-}
-
-fn single_at(generation: Generation, voter_count: usize) -> Configuration {
-    Configuration::single(Single {
-        generation,
-        base: generation,
-        voter_count,
-    }).expect("valid")
-}
-
-/// The acks among `outputs` sent to `to`.
-fn acks_to(outputs: &[Output], to: &WorkerId) -> Vec<Checked<LeaderHeartbeatAck>> {
-    sent_to(outputs, to)
-        .into_iter()
-        .filter_map(|message| match checked(message).into_payload() {
-            Some(CheckedPayload::HeartbeatAck(ack)) => Some(ack),
-            _ => None,
-        })
-        .collect()
 }
 
 /// The one ack among `outputs` sent to `to`.
@@ -353,6 +326,31 @@ fn a_draining_leader_ignores_a_crawl_report_from_an_earlier_admission() {
     assert_eq!(leader.state(), WorkerState::Stopped);
 }
 
+// A crawl report naming an admission the roster does not yet count the voter
+// by is dropped, not kept for when the voter is given that admission: a
+// removal re-admits the voters left at the next generation, and a crawl made
+// at an admission nobody held when it was reported proves nothing about it.
+#[test]
+fn a_draining_leader_ignores_a_crawl_reported_ahead_of_the_admission_a_removal_then_gives() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let _ = leader.step(Input::Drain);
+    let next = two_voters_at_the_next_generation().generation();
+    let _ = crawled_at(&clock, &mut leader, &p2, next);
+    remove_having_seen(&mut leader, &p1, 1);
+
+    let _ = leader.step(Input::Tick);
+    assert_eq!(
+        leader.state(),
+        WorkerState::Leader,
+        "p2 reported its crawl before it held that admission"
+    );
+
+    let _ = crawled(&clock, &mut leader, &p2);
+    assert_eq!(leader.state(), WorkerState::Stopped);
+}
+
 // A crawl reported while the founding configuration was still joint counted
 // at the admission the roster held then; the commit re-admits every voter,
 // so that crawl does not free the leader to leave.
@@ -598,6 +596,59 @@ fn a_promised_joiner_that_heartbeats_but_confirms_nothing_new_does_not_hold_back
     }
 
     assert!(promised_late, "the joiner heard from every tick is never promised");
+}
+
+/// A joiner that holds its promise but whose confirmed ack has aged past the
+/// two heartbeat intervals a batch wants, while still within a suspicion
+/// timeout, keeps its round standing: the next heartbeat brings it back. Once
+/// that confirmation is a suspicion timeout old the round is replaced.
+#[test]
+fn a_round_whose_promise_is_held_stands_while_its_joiner_confirmed_within_a_suspicion_timeout() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let joiner = worker("joiner");
+    let peers = [worker("p1"), worker("p2")];
+    connect(&mut leader, std::slice::from_ref(&joiner));
+    let committed = leader.configuration().map(Configuration::generation);
+    let confirm_voters = |clock: &FakeClock, leader: &mut TestNode| {
+        for peer in &peers {
+            let beat = confirming_heartbeat(clock, leader, peer, committed);
+            deliver(leader, peer, heartbeat_message(beat));
+        }
+    };
+    confirm_voters(&clock, &mut leader);
+    let beat = confirming_heartbeat(&clock, &leader, &joiner, None);
+    let promise = ack_to(&deliver(&mut leader, &joiner, heartbeat_message(beat)), &joiner)
+        .recipient_admission()
+        .expect("setup: the joiner is promised");
+    let holding = |leader: &mut TestNode| {
+        let mut beat = heartbeat(&joiner, None);
+        beat.admission_generation = Some(promise.into());
+        ack_to(&deliver(leader, &joiner, heartbeat_message(beat)), &joiner)
+    };
+
+    // Past two heartbeat intervals and inside the suspicion timeout.
+    clock.advance(Duration::from_ticks(SUSPECT / 2));
+    confirm_voters(&clock, &mut leader);
+    let ack = holding(&mut leader);
+    assert_eq!(
+        ack.recipient_admission(),
+        Some(promise),
+        "the round stands while the joiner still confirms"
+    );
+    assert!(
+        !ack.configuration().is_joint(),
+        "no batch starts on a confirmation too old for one"
+    );
+
+    // The voters confirmed within a lease length of this, so the leader still leads.
+    clock.advance(Duration::from_ticks(SUSPECT / 2 + 1));
+    confirm_voters(&clock, &mut leader);
+    assert_eq!(
+        holding(&mut leader).recipient_admission(),
+        None,
+        "a joiner whose confirmation is a suspicion timeout old loses its promise"
+    );
 }
 
 /// Runs `leader` of three for `ticks` in heartbeat-sized steps: `p2` confirms

@@ -214,6 +214,23 @@ fn a_voter_refuses_a_request_it_must_not_grant_and_says_why() {
     }
 }
 
+// Granting a vote in a term later than the one a node calls for tells it that
+// term is being decided elsewhere, so it gives up its own call.
+#[test]
+fn a_node_that_grants_a_vote_in_a_later_term_gives_up_the_roll_call_it_runs() {
+    let clock = FakeClock::new();
+    let mut node = voter_node(&clock, &worker("w2"), 3, SUSPECT);
+    let own = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    let rival = worker("w1");
+    answer(&mut node, &rival, own.term + 1, 0);
+    assert_eq!(node.state(), WorkerState::RollCall, "setup invariant");
+
+    let outputs = request(&mut node, vote_request(rival.clone(), 0, own.term + 1));
+
+    the_grant(&outputs, &rival);
+    assert_eq!(node.state(), WorkerState::LeaderSuspect);
+}
+
 #[test]
 fn a_request_for_another_shard_or_not_from_its_candidate_is_ignored() {
     let clock = FakeClock::new();

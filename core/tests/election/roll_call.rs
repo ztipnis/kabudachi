@@ -5,18 +5,19 @@
 
 use crate::support::builders::checked;
 use crate::support::builders::{
-    ack_message, configuration_of, epoch, g0, leader_ack, message, past_any_suspicion, roll_call,
-    roll_call_message, roll_call_reply, shard, timings, worker,
+    ack_message, configuration_at_epoch, configuration_of, epoch, g0, leader_ack, message,
+    past_any_suspicion, roll_call, roll_call_message, roll_call_reply, shard, timings,
+    voter_at_epoch, voter_of, worker,
 };
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
-    TestNode, close_roll_call, connect, deliver, elect, published_roll_calls,
+    TestNode, close_roll_call, connect, deliver, elect, known_node, published_roll_calls,
     rejects_sent_to, sent_to, start_roll_call, state_changes, tick, voter_node,
 };
 use kabudachi_core::configuration::{Configuration, Generation, Single};
-use kabudachi_core::election::{Entry, Identity, Input, KnownConfiguration, Output, WorkerNode};
-use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
+use kabudachi_core::election::{Input, Output};
+use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
     ElectionMessage, ElectionReject, ElectionRejectReason, KnownLeader,
@@ -205,6 +206,170 @@ fn answers_in_turn_hold_a_node_back_no_longer_than_its_episode_and_one_minimum_m
     }
 }
 
+/// A base roll-call deadline of this many ticks, in [`slow_call_node`].
+const SLOW_CALL_DEADLINE: u64 = 40;
+/// The suspicion timeout of [`slow_call_node`].
+const SLOW_CALL_SUSPECT: u64 = 100;
+
+/// `me`, a voter of three whose roll-call deadline is long next to its
+/// suspicion timeout, so that the hold an answer puts on it outlasts a
+/// suspicion that follows it whatever the jitter on that suspicion.
+fn slow_call_node(clock: &FakeClock, me: &WorkerId) -> TestNode {
+    let timings = timings(Duration::from_ticks(SLOW_CALL_SUSPECT))
+        .with_roll_call_deadline(Duration::from_ticks(SLOW_CALL_DEADLINE));
+    known_node(clock, me, voter_of(3), timings)
+}
+
+/// How long an answer holds a node of [`slow_call_node`] back from its own
+/// calls: two base deadlines and a suspicion timeout.
+fn slow_call_hold() -> Duration {
+    Duration::from_ticks(2 * SLOW_CALL_DEADLINE + SLOW_CALL_SUSPECT)
+}
+
+/// Delivers `caller`'s roll call for `term` to `node`, which must answer it.
+fn answer_call(node: &mut TestNode, caller: &WorkerId, term: u64) {
+    let answered = deliver(
+        node,
+        caller,
+        roll_call_message(roll_call(caller, term, &configuration_of(3), 0)),
+    );
+    assert_eq!(replies_to(&answered, caller).len(), 1, "setup invariant");
+}
+
+// An answered call holds the node's own calls back until a leader's ack
+// resolves it: the ack ends the hold, so a node that suspects the leader
+// again calls as soon as its suspicion allows, not when the hold would have
+// run out.
+#[test]
+fn a_leaders_ack_releases_the_hold_an_answered_call_put_on_a_node() {
+    let clock = FakeClock::new();
+    let (caller, me) = (worker("w1"), worker("w3"));
+    let mut node = slow_call_node(&clock, &me);
+    clock.advance(past_any_suspicion(SLOW_CALL_SUSPECT));
+    tick(&mut node);
+    assert_eq!(node.state(), WorkerState::LeaderSuspect, "setup invariant");
+    let answered_at = clock.now();
+    answer_call(&mut node, &caller, 1);
+    clock.advance(Duration::from_ticks(1));
+    deliver(
+        &mut node,
+        &caller,
+        ack_message(leader_ack(&caller, 1, &configuration_of(3), Some(g0()))),
+    );
+    assert_eq!(node.state(), WorkerState::Active, "setup invariant");
+
+    let called = first_call_before(&mut node, &clock, answered_at + slow_call_hold());
+
+    assert!(
+        called.is_some(),
+        "the node calls before the hold the ack released would have run out"
+    );
+}
+
+// Starting a call of its own ends the hold an episode of answers ran to its
+// cap, which owed the node that call; an answer after it holds the node
+// afresh, so its next call waits out that answer's whole hold.
+#[test]
+fn an_answer_after_a_node_called_in_its_own_right_holds_it_afresh() {
+    let clock = FakeClock::new();
+    let (first, second, third) = (worker("w1"), worker("w2"), worker("w4"));
+    let mut node = slow_call_node(&clock, &worker("w3"));
+    clock.advance(past_any_suspicion(SLOW_CALL_SUSPECT));
+    tick(&mut node);
+    assert_eq!(node.state(), WorkerState::LeaderSuspect, "setup invariant");
+    let start = clock.now();
+    let window = slow_call_hold().as_ticks();
+    let episode_end = 2 * window;
+    // Two answers within one episode, the second cut by the episode's end.
+    answer_call(&mut node, &first, 1);
+    clock.advance(start + Duration::from_ticks(window - 1) - clock.now());
+    answer_call(&mut node, &second, 2);
+    clock.advance(start + Duration::from_ticks(episode_end - 2) - clock.now());
+    answer_call(&mut node, &first, 3);
+    let called = first_call_before(
+        &mut node,
+        &clock,
+        start + Duration::from_ticks(episode_end + 2 * SLOW_CALL_DEADLINE + 2),
+    )
+    .expect("the hold ends and the node calls");
+    assert_eq!(node.state(), WorkerState::RollCall, "setup invariant");
+
+    // Answered just before its own call closes, so the hold outlasts the
+    // retry the closed call puts the node on whatever the jitter on it.
+    clock.advance(Duration::from_ticks(SLOW_CALL_DEADLINE - 1));
+    answer_call(&mut node, &third, called.1 + 1);
+    let answered_at = clock.now();
+    clock.advance(Duration::from_ticks(1));
+    tick(&mut node);
+    assert_eq!(node.state(), WorkerState::NoQuorum, "setup invariant");
+
+    let next = first_call_before(
+        &mut node,
+        &clock,
+        answered_at + slow_call_hold() + Duration::from_ticks(2),
+    );
+
+    assert_eq!(
+        next.map(|(at, _)| at),
+        Some(answered_at + slow_call_hold()),
+        "the node calls once the answer's hold ends, no sooner"
+    );
+}
+
+/// Ticks `node` until its roll call closes; how many ticks that took.
+fn ticks_until_its_roll_call_closes(node: &mut TestNode, clock: &FakeClock) -> u64 {
+    let mut ticks = 0;
+    while node.state() == WorkerState::RollCall {
+        assert!(ticks < 1_000, "the roll call never closed");
+        clock.advance(Duration::from_ticks(1));
+        tick(node);
+        ticks += 1;
+    }
+    ticks
+}
+
+// Each roll call of a node's own that closes without a quorum doubles the next
+// one's deadline, up to the suspicion timeout; a leader's ack ends the
+// widening, so a node that suspects its leader again calls at the base
+// deadline.
+#[test]
+fn a_leaders_ack_ends_the_widening_of_a_nodes_roll_call_deadlines() {
+    let clock = FakeClock::new();
+    let (leader, me) = (worker("w1"), worker("w3"));
+    let mut node = slow_call_node(&clock, &me);
+    let horizon = |clock: &FakeClock| clock.now() + Duration::from_ticks(1_000);
+    let call = |node: &mut TestNode| {
+        clock.advance(past_any_suspicion(SLOW_CALL_SUSPECT));
+        let called = first_call_before(node, &clock, horizon(&clock)).expect("the node calls");
+        assert_eq!(node.state(), WorkerState::RollCall);
+        called.1
+    };
+
+    call(&mut node);
+    assert_eq!(
+        ticks_until_its_roll_call_closes(&mut node, &clock),
+        SLOW_CALL_DEADLINE
+    );
+    let term = call(&mut node);
+    assert_eq!(
+        ticks_until_its_roll_call_closes(&mut node, &clock),
+        2 * SLOW_CALL_DEADLINE,
+        "a call after one that closed short is widened"
+    );
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, term, &configuration_of(3), Some(g0()))),
+    );
+    assert_eq!(node.state(), WorkerState::Active, "setup invariant");
+
+    call(&mut node);
+    assert_eq!(
+        ticks_until_its_roll_call_closes(&mut node, &clock),
+        SLOW_CALL_DEADLINE
+    );
+}
+
 // ---- Roll calls a node drops ----
 
 #[test]
@@ -269,38 +434,12 @@ fn reject_message(
 /// `me`, a voter of `voters` at recovery epoch 1, whose leader contact has
 /// not yet gone stale.
 fn voter_at_epoch_1(clock: &FakeClock, me: &WorkerId, voters: usize) -> TestNode {
-    let epoch_1 = Generation::new(epoch(1), 0, 0);
-    WorkerNode::start(
-        Identity {
-            id: me.clone(),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard("shard-1"),
-            timings: timings(Duration::from_ticks(SUSPECT)),
-        },
-        Entry::Known(KnownConfiguration {
-            configuration: Configuration::single(Single {
-                generation: epoch_1,
-                base: epoch_1,
-                voter_count: voters,
-            }).expect("valid"),
-            admission: Some(epoch_1),
-        }),
-        clock.clone(),
-        None,
+    known_node(
+        clock,
+        me,
+        voter_at_epoch(epoch(1), voters),
+        timings(Duration::from_ticks(SUSPECT)),
     )
-    .0
-}
-
-// A refusal from a lower recovery
-// epoch counts that epoch's terms, which order nothing here.
-fn epoch_1_configuration(voters: usize) -> Configuration {
-    let epoch_1 = Generation::new(epoch(1), 0, 0);
-    Configuration::single(Single {
-        generation: epoch_1,
-        base: epoch_1,
-        voter_count: voters,
-    })
-    .expect("valid")
 }
 
 /// `refusal` as `epoch` and `lineage` name the epoch its refuser stands in,
@@ -351,7 +490,7 @@ fn a_refusal_is_placed_by_the_epoch_and_lineage_it_names() {
             "a higher lineage at this epoch number",
             Some(1),
             Some(1),
-            Some(epoch_1_configuration(3)),
+            Some(configuration_at_epoch(epoch(1), 3)),
             ElectionRejectReason::LeaderStillValid,
             (0, WorkerState::RollCall, true),
         ),
@@ -398,6 +537,82 @@ fn a_refusal_is_placed_by_the_epoch_and_lineage_it_names() {
         assert_eq!(node.highest_term_seen(), term_seen, "{name}");
         assert_eq!(node.state(), state, "{name}");
         assert_eq!(!sent_to(&outputs, &their_leader).is_empty(), heartbeats, "{name}");
+    }
+}
+
+// A refusal is read only by the node whose call it refuses.
+#[test]
+fn a_refusal_of_another_nodes_call_teaches_a_node_nothing() {
+    let clock = FakeClock::new();
+    let mut node = voter_at_epoch_1(&clock, &worker("w1"), 3);
+    let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    let (rejecter, their_leader) = (worker("w2"), worker("their-leader"));
+    let refusal = refusal_at(
+        reject_message(
+            &call,
+            &rejecter,
+            ElectionRejectReason::LeaderStillValid,
+            9,
+            Some((&their_leader, 9)),
+        ),
+        Some(1),
+        None,
+        None,
+    );
+    let mut for_another = refusal.clone();
+    let Some(election_message::Payload::ElectionReject(reject)) = for_another.payload.as_mut()
+    else {
+        panic!("reject_message builds a refusal");
+    };
+    reject.initiator_id = Some(worker("w3").into());
+
+    let ignored = deliver(&mut node, &rejecter, for_another);
+    assert_eq!(node.highest_term_seen(), 0);
+    assert!(sent_to(&ignored, &their_leader).is_empty(), "{ignored:?}");
+
+    let heeded = deliver(&mut node, &rejecter, refusal);
+    assert_eq!(node.highest_term_seen(), 9, "setup invariant");
+    assert!(!sent_to(&heeded, &their_leader).is_empty(), "{heeded:?}");
+}
+
+// A leader named for a node to follow is never the node itself: a refusal that
+// names it, whichever epoch the refuser stands in, leaves the node naming no
+// leader when it refuses a caller left on an earlier epoch in its turn.
+#[test]
+fn a_refusal_naming_a_node_itself_makes_it_follow_no_one() {
+    for (name, refuser_epoch) in [("this epoch", 1), ("a later epoch", 2)] {
+        let clock = FakeClock::new();
+        let me = worker("w1");
+        let mut node = voter_at_epoch_1(&clock, &me, 3);
+        let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+        let rejecter = worker("w2");
+        deliver(
+            &mut node,
+            &rejecter,
+            refusal_at(
+                reject_message(
+                    &call,
+                    &rejecter,
+                    ElectionRejectReason::LeaderStillValid,
+                    9,
+                    Some((&me, 9)),
+                ),
+                Some(refuser_epoch),
+                None,
+                None,
+            ),
+        );
+
+        let stranded = worker("stranded");
+        let outputs = deliver(
+            &mut node,
+            &stranded,
+            roll_call_message(roll_call(&stranded, 5, &configuration_of(3), 0)),
+        );
+
+        let refusals = rejects_sent_to(&outputs, &stranded);
+        assert_eq!(refusals.len(), 1, "{name}: {outputs:?}");
+        assert_eq!(refusals[0].named_leader(), None, "{name}");
     }
 }
 

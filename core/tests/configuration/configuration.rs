@@ -428,6 +428,47 @@ fn a_removal_that_empties_the_old_side_collapses_the_joint_configuration() {
     assert_eq!(roster.prior_admission_of(&worker("p")), None);
 }
 
+/// A removal that leaves one voter on the old side of a joint configuration
+/// keeps it joint: a side with a single voter can still supply a majority.
+#[test]
+fn a_removal_that_leaves_one_old_side_voter_keeps_the_configuration_joint() {
+    let g0 = generation(0, 0, 0);
+    // C0 of two voters, "x" and "y"; its election in term 1 drew x, y and p.
+    let two_voters = Configuration::single(Single {
+        generation: g0,
+        base: g0,
+        voter_count: 2,
+    })
+    .expect("valid");
+    let mut roster = Roster::after_election(
+        epoch(0),
+        1,
+        &two_voters,
+        &BTreeMap::from([
+            (worker("x"), Admission::from(Some(g0))),
+            (worker("y"), Admission::from(Some(g0))),
+            (worker("p"), Admission::from(None)),
+        ]),
+    );
+
+    remove(&mut roster, "x", 1);
+
+    let shrunk = generation(0, 1, 2);
+    assert_eq!(
+        roster.configuration(),
+        &Configuration::joint(Joint {
+            generation: shrunk,
+            base: shrunk,
+            batch_generation: shrunk,
+            old_base: g0,
+            old_generation: g0,
+            old_voter_count: 1,
+            new_voter_count: 2,
+        })
+        .expect("valid")
+    );
+}
+
 // ---- What an election founds ----
 
 /// C0: three voters admitted at the genesis generation (0, 0, 0).
@@ -1030,6 +1071,16 @@ fn a_configuration_that_breaks_a_rule_is_refused_by_its_constructor() {
             Joint {
                 old_base: g(2),
                 old_generation: g(1),
+                ..valid_joint()
+            },
+        ),
+        (
+            InvalidConfiguration::OldBaseAfterOldGeneration,
+            // Also breaks the rule after it (old generation before batch
+            // generation); the earlier rule in the documented order wins.
+            Joint {
+                old_base: g(4),
+                old_generation: g(3),
                 ..valid_joint()
             },
         ),
