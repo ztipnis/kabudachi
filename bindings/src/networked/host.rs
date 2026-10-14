@@ -155,11 +155,13 @@ impl Drop for StoppedOnDrop {
     }
 }
 
-/// Whether a run's input travels as blobs rather than in the claim.
+/// Whether a run's input travels as blobs this process fetches before the run
+/// is handed over. A composite member's does not: its manifest names results
+/// of the composite, which its body reads through the composite's record.
 fn input_is_blobs(wire: &WireClaim) -> bool {
     wire.task
         .as_ref()
-        .is_some_and(|task| task.input_manifest.is_some())
+        .is_some_and(|task| task.input_manifest.is_some() && task.composite_id.is_none())
 }
 
 impl Drop for Host {

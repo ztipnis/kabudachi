@@ -2,6 +2,7 @@
 //! per area. Shared helpers live in `support`.
 
 mod authority_contract;
+mod composite;
 mod configuration;
 mod election;
 mod proptest;

@@ -5,10 +5,14 @@ use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{TaskRecord, TaskRun, chain_entry};
 use kabudachi_core::protocol::task::TaskRunState as DomainRunState;
+use kabudachi_core::manifest::Failure;
+use kabudachi_core::scheduler::composite::EXPANSION_DEFINITION;
 use kabudachi_core::scheduler::{Certification, Claim, Event};
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use crate::composite::state_name;
 use crate::outcomes::{PyEventKind, PyRunState};
 
 /// A task handed to a worker to run, and the run that now belongs to it.
@@ -41,6 +45,18 @@ pub struct PyClaim {
     /// The worker awaiting the result; None for a task nobody awaits across workers.
     #[pyo3(get)]
     client: Option<String>,
+    /// The composite this task is a stage or member of; `None` for a task
+    /// that is not.
+    #[pyo3(get)]
+    composite_id: Option<String>,
+    /// Which stage or member of its composite this task is; 0 when it is
+    /// none.
+    #[pyo3(get)]
+    composite_index: u64,
+    /// Whether this is an expansion run: its input is a list a map is to be
+    /// split over, and it reports the map that results.
+    #[pyo3(get)]
+    expansion: bool,
 }
 
 #[pymethods]
@@ -66,8 +82,13 @@ impl PyClaim {
 impl From<Claim> for PyClaim {
     fn from(claim: Claim) -> Self {
         let client = claim.task.client().map(|client| client.as_str().to_owned());
+        let composite_id = claim.task.composite_id().map(|id| id.as_str().to_owned());
+        let expansion = claim.task.task_definition_id().as_str() == EXPANSION_DEFINITION;
         PyClaim {
             client,
+            composite_id,
+            composite_index: claim.task.composite_index,
+            expansion,
             task_id: claim.task.task_id().as_str().to_owned(),
             task_run_id: claim.task_run_id.as_str().to_owned(),
             definition_id: claim.task.task_definition_id().as_str().to_owned(),
@@ -142,15 +163,43 @@ pub struct PyEvent {
     result_digest: Vec<u8>,
     /// For `OUTCOME`: the state the task's run ended in; `None` when the
     /// shard does not know the task.
-    #[pyo3(get)]
-    state: Option<PyRunState>,
-    /// For `OUTCOME`: the error's type name, when the run failed.
+    run_state: Option<PyRunState>,
+    /// For `COMPOSITE_FINISHED`: how the composite ended, `"succeeded"`,
+    /// `"failed"` or `"cancelled"`.
+    composite_state: Option<&'static str>,
+    /// For `OUTCOME` and `COMPOSITE_FINISHED`: the error's type name, when
+    /// the run or composite failed.
     #[pyo3(get)]
     failure_kind: String,
+    /// For `COMPOSITE_FINISHED`: the error's message, when the composite
+    /// failed.
+    #[pyo3(get)]
+    failure_message: String,
+    /// For `COMPOSITE_FINISHED`: the Task whose run raised the error that
+    /// ended the composite, when a run did.
+    #[pyo3(get)]
+    failure_task_id: Option<String>,
+    /// For `COMPOSITE_FINISHED`: the composite that is over.
+    #[pyo3(get)]
+    composite_id: String,
+    /// For `COMPOSITE_FINISHED`: the task whose continuation it is, if any.
+    #[pyo3(get)]
+    parent_task_id: Option<String>,
 }
 
 #[pymethods]
 impl PyEvent {
+    /// For `OUTCOME`: the `RunState` the task's run ended in; `None` when the
+    /// shard does not know the task. For `COMPOSITE_FINISHED`: how the
+    /// composite ended, `"succeeded"`, `"failed"` or `"cancelled"`.
+    #[getter]
+    fn state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match self.composite_state {
+            Some(state) => state.into_bound_py_any(py),
+            None => self.run_state.into_bound_py_any(py),
+        }
+    }
+
     /// For `RESULT`: the run's result, not certified yet.
     #[getter]
     fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
@@ -189,8 +238,13 @@ impl PyEvent {
             seconds_left: 0.0,
             payload: Vec::new(),
             result_digest: Vec::new(),
-            state: None,
+            run_state: None,
+            composite_state: None,
             failure_kind: String::new(),
+            failure_message: String::new(),
+            failure_task_id: None,
+            composite_id: String::new(),
+            parent_task_id: None,
         }
     }
 
@@ -224,7 +278,7 @@ impl PyEvent {
         superseded_by: Option<String>,
     ) -> Self {
         PyEvent {
-            state,
+            run_state: state,
             failure_kind,
             superseded_by,
             ..PyEvent::networked(PyEventKind::Outcome, task_id, task_run_id)
@@ -294,6 +348,18 @@ impl From<Event> for PyEvent {
                 superseded_by: Some(by.as_str().to_owned()),
                 ..nothing
             },
+            Event::CompositeFinished(finished) => {
+                let failure = finished.failure.unwrap_or(Failure::new("", ""));
+                PyEvent {
+                    failure_task_id: failure.task.map(|task| task.as_str().to_owned()),
+                    composite_id: finished.composite_id.as_str().to_owned(),
+                    parent_task_id: finished.parent_task.map(|task| task.as_str().to_owned()),
+                    composite_state: Some(state_name(finished.state)),
+                    failure_kind: failure.kind,
+                    failure_message: failure.message,
+                    ..nothing
+                }
+            }
         }
     }
 }

@@ -1,8 +1,9 @@
 use crate::blob::{BlobKey, BlobOwner, BlobRecord};
-use crate::protocol::generated::TaskRecord;
-use crate::protocol::ids::{TaskId, WorkerId};
+use crate::protocol::generated::{CompositePage, CompositeRecord, TaskRecord};
+use crate::protocol::ids::WorkerId;
 use crate::scheduler::Observer;
 use crate::task_record::gate::Write;
+use crate::task_record::key::ShardRecord;
 use crate::task_record::store::VersionedRecords;
 use crate::time::{Clock, Duration};
 
@@ -46,19 +47,30 @@ impl<C: Clock> LocalRecords<C> {
         self.records.sweep(self.clock.now())
     }
 
-    /// Keeps each of `chunks` as a blob owned by the task `owner`. A one-node
-    /// store has no grace and asks no one: the owner's record always arrives,
+    /// Keeps each of `chunks` as a blob owned by `owner`. A one-node store
+    /// has no grace and asks no one: the owner's record always arrives,
     /// unless its submission is refused or dropped, and then
     /// [`Self::forget_blobs_of`] is called.
-    pub fn put_blobs(&mut self, owner: &TaskId, chunks: Vec<Vec<u8>>) {
+    pub fn put_blobs(&mut self, owner: &BlobOwner, chunks: Vec<Vec<u8>>) {
+        self.put(owner, chunks, false);
+    }
+
+    /// [`Self::put_blobs`] for the blobs of a run's result: they stay with
+    /// the owner's record when it finishes, where an owner's inputs go at
+    /// once.
+    pub fn put_result_blobs(&mut self, owner: &BlobOwner, chunks: Vec<Vec<u8>>) {
+        self.put(owner, chunks, true);
+    }
+
+    fn put(&mut self, owner: &BlobOwner, chunks: Vec<Vec<u8>>, result: bool) {
         let now = self.clock.now();
         for chunk in chunks {
             let key = BlobKey::of(&chunk);
             let record = BlobRecord {
                 value: chunk,
-                owner: BlobOwner::Task(owner.clone()),
+                owner: owner.clone(),
                 placement: vec![self.worker.clone()],
-                result: false,
+                result,
             };
             self.records
                 .put_blob(&key, record, now)
@@ -71,9 +83,15 @@ impl<C: Clock> LocalRecords<C> {
         self.records.blob(key).map(|record| record.value)
     }
 
-    /// The task `owner` will never run: its blobs are dropped.
-    pub fn forget_blobs_of(&mut self, owner: &TaskId) {
-        self.records.forget_blobs_of(&BlobOwner::Task(owner.clone()));
+    /// The `owner` that will never run: its blobs are dropped.
+    pub fn forget_blobs_of(&mut self, owner: &BlobOwner) {
+        self.records.forget_blobs_of(owner);
+    }
+
+    /// The `owner` that is over: the blobs it stored as inputs are dropped,
+    /// and those it stored as results stay until its record is forgotten.
+    pub fn forget_input_blobs_of(&mut self, owner: &BlobOwner) {
+        self.records.forget_inputs_of(owner);
     }
 
     /// Each write since the last call, and whether the store kept it.
@@ -82,11 +100,26 @@ impl<C: Clock> LocalRecords<C> {
     }
 }
 
-impl<C: Clock> Observer for LocalRecords<C> {
-    fn revision(&mut self, mut revision: TaskRecord) {
-        revision.placement = vec![self.worker.clone().into()];
-        let write = Write::of(&revision);
-        let kept = self.records.put(revision, self.clock.now()).is_ok();
+impl<C: Clock> LocalRecords<C> {
+    /// Puts `record` into the store as placed on this node alone.
+    fn keep(&mut self, mut record: ShardRecord) {
+        record.set_placement(vec![self.worker.clone().into()], Vec::new());
+        let write = Write::of(&record);
+        let kept = self.records.put(record, self.clock.now()).is_ok();
         self.settled.push((write, kept));
+    }
+}
+
+impl<C: Clock> Observer for LocalRecords<C> {
+    fn revision(&mut self, revision: TaskRecord) {
+        self.keep(revision.into());
+    }
+
+    fn composite_revision(&mut self, revision: CompositeRecord) {
+        self.keep(revision.into());
+    }
+
+    fn page_revision(&mut self, revision: CompositePage) {
+        self.keep(revision.into());
     }
 }

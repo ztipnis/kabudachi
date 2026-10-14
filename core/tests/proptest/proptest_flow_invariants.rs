@@ -1,30 +1,37 @@
-//! Property tests for the coalescing invariants at one node: random sequences
-//! of submissions, claims, completions, continuations, failures, cancellations
-//! and worker losses over a few keys, checking after every step that
+//! Property tests for the coalescing and composite invariants at one node:
+//! random sequences of submissions (tasks, flows and groups), claims,
+//! completions (some returning a step), failures, cancellations of tasks and
+//! composites, and worker losses, checking after every step that
 //!
 //! - at most one generation of a key is claimed, running or continuing;
 //! - a generation that was claimed is never superseded;
-//! - a superseded payload is folded exactly once, into the
-//!   generation that absorbed it, oldest first;
+//! - a superseded payload is folded exactly once, into the generation that
+//!   absorbed it, oldest first;
 //! - a lost generation is replayed only if it is the newest for its key;
-//! - a continuation only exists for a certified run, and keeps its key
-//!   held until it ends;
+//! - a continuation exists only for a certified run, and keeps its key held
+//!   until its composite is over;
+//! - a flow's stage exists only once every stage before it succeeded, and no
+//!   stage exists after a failed one;
+//! - every composite finishes at most once, and a finished one changes no
+//!   more;
 //!
 //! and, once everything is drained, that memory accounting returns to zero.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::support::clock::FakeClock;
+use crate::support::composites::{flow_of, group_of, task_stage};
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
 use crate::support::scheduler::{lose_silent, state_of};
 use crate::support::spy::Spy;
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::{Claim, Completion, Scheduler, Submission};
+use kabudachi_core::scheduler::composite::{CompositeKind, CompositeState, CompositeStatus, OnError, Step};
+use kabudachi_core::scheduler::{Claim, Completion, Event, Scheduler, Submission};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 
@@ -48,13 +55,19 @@ enum Op {
         pick: u8,
         continues: bool,
     },
-    EndContinuation {
-        pick: u8,
+    /// A flow of two bound stages, or a group of two bound members under
+    /// either policy, submitted with a client.
+    SubmitComposite {
+        group: bool,
+        collect_all: bool,
     },
     Fail {
         pick: u8,
     },
     Cancel {
+        pick: u8,
+    },
+    CancelComposite {
         pick: u8,
     },
     WorkerFallsSilent,
@@ -68,9 +81,11 @@ fn op() -> impl Strategy<Value = Op> {
         2 => any::<u8>().prop_map(|pick| Op::Start { pick }),
         2 => (any::<u8>(), any::<bool>())
             .prop_map(|(pick, continues)| Op::Complete { pick, continues }),
-        1 => any::<u8>().prop_map(|pick| Op::EndContinuation { pick }),
+        2 => (any::<bool>(), any::<bool>())
+            .prop_map(|(group, collect_all)| Op::SubmitComposite { group, collect_all }),
         1 => any::<u8>().prop_map(|pick| Op::Fail { pick }),
         1 => any::<u8>().prop_map(|pick| Op::Cancel { pick }),
+        1 => any::<u8>().prop_map(|pick| Op::CancelComposite { pick }),
         1 => Just(Op::WorkerFallsSilent),
     ]
 }
@@ -92,8 +107,12 @@ struct Model {
     tasks: BTreeMap<TaskId, Submitted>,
     /// Claims handed out and not yet finished with, in the order handed out.
     claims: Vec<Claim>,
-    /// Tasks whose run was certified with a continuation that has not ended.
-    continuing: BTreeSet<TaskId>,
+    /// Every composite submitted or committed, in order.
+    composites: Vec<CompositeId>,
+    /// How many times each composite was announced finished.
+    finished: BTreeMap<CompositeId, usize>,
+    /// What each finished composite looked like when it was announced.
+    frozen: BTreeMap<CompositeId, CompositeStatus>,
     /// Tasks that were claimed at least once.
     ever_claimed: BTreeSet<TaskId>,
     /// The payload numbers each task folded when first claimed.
@@ -119,7 +138,9 @@ impl Model {
             next_number: 0,
             tasks: BTreeMap::new(),
             claims: Vec::new(),
-            continuing: BTreeSet::new(),
+            composites: Vec::new(),
+            finished: BTreeMap::new(),
+            frozen: BTreeMap::new(),
             ever_claimed: BTreeSet::new(),
             folded_by: BTreeMap::new(),
         }
@@ -129,8 +150,9 @@ impl Model {
         (!self.claims.is_empty()).then(|| pick as usize % self.claims.len())
     }
 
-    fn state_of(&self, task: &TaskId) -> TaskRunState {
-        state_of(&self.scheduler, &self.spy, task)
+    /// The state of `task`'s current run, or `None` once it is forgotten.
+    fn state_of(&self, task: &TaskId) -> Option<TaskRunState> {
+        (!self.scheduler.runs_of(task).is_empty()).then(|| state_of(&self.scheduler, &self.spy, task))
     }
 
     fn apply(&mut self, op: &Op) {
@@ -157,6 +179,17 @@ impl Model {
                 let task = self.scheduler.submit(submission).unwrap();
                 self.tasks.insert(task, Submitted { key: *key, number });
             }
+            Op::SubmitComposite { group, collect_all } => {
+                let step = if *group {
+                    let on_error = if *collect_all { OnError::CollectAll } else { OnError::FailFast };
+                    group_of(on_error, vec![task_stage("a", Some(b"a")), task_stage("b", Some(b"b"))])
+                } else {
+                    flow_of(vec![task_stage("first", Some(b"a")), task_stage("second", None)])
+                };
+                let minted = self.scheduler.mint_composite(step, Some(self.worker.clone()));
+                let id = self.scheduler.submit_composite(minted).unwrap();
+                self.composites.push(id);
+            }
             Op::Claim { limit } => {
                 let claims = self
                     .scheduler
@@ -177,38 +210,20 @@ impl Model {
             }
             Op::Complete { pick, continues } => {
                 if let Some(i) = self.pick_claim(*pick) {
-                    let claim = &self.claims[i];
-                    let run = &claim.task_run_id;
+                    let run = self.claims[i].task_run_id.clone();
                     let done = if *continues {
-                        self.scheduler.complete(
-                            &self.worker,
-                            run,
-                            Digest::blake3(b"d"),
-                            Completion::Continues,
-                        )
+                        let step = flow_of(vec![task_stage("stage", Some(b"s")), task_stage("next", None)]);
+                        self.scheduler.complete(&self.worker, &run, step.digest(), Completion::Continues(step))
                     } else {
                         self.scheduler
-                            .complete(&self.worker, run, Digest::blake3(b"d"), Completion::Final)
+                            .complete(&self.worker, &run, Digest::blake3(b"d"), Completion::Final)
                     };
                     if done.is_ok() {
-                        let task = claim.task.task_id();
                         if *continues {
-                            self.continuing.insert(task);
+                            self.composites.push(CompositeId::continuation_of(&run));
                         }
                         self.claims.remove(i);
                     }
-                }
-            }
-            Op::EndContinuation { pick } => {
-                if !self.continuing.is_empty() {
-                    let task = self
-                        .continuing
-                        .iter()
-                        .nth(*pick as usize % self.continuing.len())
-                        .unwrap()
-                        .clone();
-                    assert_eq!(self.scheduler.end_continuation(&task), Ok(true));
-                    self.continuing.remove(&task);
                 }
             }
             Op::Fail { pick } => {
@@ -227,13 +242,38 @@ impl Model {
                         .nth(*pick as usize % self.tasks.len())
                         .unwrap()
                         .clone();
-                    if self.scheduler.cancel(&task).is_ok() {
-                        // Whatever the worker held of it is no longer its to report on.
-                        self.claims.retain(|claim| claim.task.task_id() != task);
-                    }
+                    let _ = self.scheduler.cancel(&task);
+                }
+            }
+            Op::CancelComposite { pick } => {
+                if !self.composites.is_empty() {
+                    let id = self.composites[*pick as usize % self.composites.len()].clone();
+                    let _ = self.scheduler.cancel_composite(&id);
                 }
             }
             Op::WorkerFallsSilent => self.worker_falls_silent(),
+        }
+        // Whatever the worker held of a run that is over is no longer its to
+        // report on.
+        self.claims.retain(|claim| {
+            self.scheduler
+                .task_run(&claim.task_run_id)
+                .is_some_and(|run| matches!(run.current_state(), TaskRunState::Claimed | TaskRunState::Running))
+        });
+        self.collect_events();
+    }
+
+    /// Counts each composite finish announced since the last call, and notes
+    /// how the composite stood when it was.
+    fn collect_events(&mut self) {
+        for event in self.scheduler.take_events() {
+            if let Event::CompositeFinished(finished) = event {
+                let id = finished.composite_id;
+                *self.finished.entry(id.clone()).or_default() += 1;
+                if let Some(status) = self.scheduler.composite_status(&id) {
+                    self.frozen.entry(id).or_insert(status);
+                }
+            }
         }
     }
 
@@ -244,11 +284,11 @@ impl Model {
         let waiting_keys: BTreeSet<u8> = self
             .tasks
             .iter()
-            .filter(|(task, _)| self.state_of(task) == TaskRunState::Queued)
+            .filter(|(task, _)| self.state_of(task) == Some(TaskRunState::Queued))
             .filter_map(|(_, submitted)| submitted.key)
             .collect();
         let lost = lose_silent(&mut self.scheduler, &self.clock, &self.worker);
-        for run in &lost {
+        for run in lost.iter().filter(|run| self.tasks.contains_key(&run.task_id)) {
             let key = self.tasks[&run.task_id].key;
             match key {
                 Some(key) if waiting_keys.contains(&key) => {
@@ -268,7 +308,11 @@ impl Model {
     /// oldest first, and no payload is folded twice.
     fn check_fold(&mut self, claim: &Claim) {
         let task = claim.task.task_id();
-        let own = self.tasks[&task].number;
+        // A composite's member has no key, so it folds nothing.
+        let Some(own) = self.tasks.get(&task).map(|submitted| submitted.number) else {
+            assert!(claim.chain.is_empty(), "a composite's member folded a payload");
+            return;
+        };
         let chain: Vec<u32> = claim.chain.iter().map(|p| number_of(p)).collect();
         assert!(chain.windows(2).all(|w| w[0] < w[1]), "chain out of order");
         assert!(chain.iter().all(|n| *n < own), "chain has a newer payload");
@@ -297,6 +341,16 @@ impl Model {
         }
     }
 
+    /// Whether `task` holds its key past its own run: its newest run was
+    /// certified with a continuation that is not over.
+    fn continues(&self, task: &TaskId) -> bool {
+        self.scheduler.runs_of(task).pop().is_some_and(|run| {
+            self.scheduler
+                .composite_status(&CompositeId::continuation_of(&run))
+                .is_some_and(|status| status.state == CompositeState::Running)
+        })
+    }
+
     fn check_invariants(&self) {
         for key in 0..KEYS {
             let mut holders = 0;
@@ -306,8 +360,8 @@ impl Model {
                 }
                 let holds = matches!(
                     self.state_of(task),
-                    TaskRunState::Claimed | TaskRunState::Running
-                ) || self.continuing.contains(task);
+                    Some(TaskRunState::Claimed | TaskRunState::Running)
+                ) || self.continues(task);
                 holders += usize::from(holds);
             }
             assert!(
@@ -316,31 +370,84 @@ impl Model {
             );
         }
         for task in &self.ever_claimed {
-            let first = self.scheduler.runs_of(task)[0].clone();
+            let Some(first) = self.scheduler.runs_of(task).first().cloned() else {
+                continue;
+            };
             assert_ne!(
                 self.scheduler.task_run(&first).unwrap().current_state(),
                 TaskRunState::Superseded,
                 "a claimed generation was superseded"
             );
         }
-        for task in &self.continuing {
+        for task in self.tasks.keys() {
             // A continuation only exists for a certified run.
-            assert_eq!(self.state_of(task), TaskRunState::Succeeded);
+            for run in self.scheduler.runs_of(task) {
+                let running = self
+                    .scheduler
+                    .composite_status(&CompositeId::continuation_of(&run))
+                    .is_some_and(|status| status.state == CompositeState::Running);
+                if running {
+                    assert_eq!(
+                        self.scheduler.task_run(&run).unwrap().current_state(),
+                        TaskRunState::Succeeded,
+                        "a continuation runs for a run that was not certified"
+                    );
+                }
+            }
+        }
+        for (id, times) in &self.finished {
+            assert!(*times <= 1, "{id:?} finished {times} times");
+            if let (Some(frozen), Some(now)) = (self.frozen.get(id), self.scheduler.composite_status(id)) {
+                assert_eq!(frozen.state, now.state, "{id:?} changed state after it finished");
+                assert_eq!(frozen.next_stage, now.next_stage, "{id:?} moved on after it finished");
+            }
+        }
+        for id in &self.composites {
+            if self.scheduler.composite_status(id).is_none() {
+                continue;
+            }
+            let record = self.scheduler.composite_record(id).unwrap();
+            let step = Step::try_from(record.description.as_ref().unwrap()).unwrap();
+            if step.kind != CompositeKind::Flow {
+                continue;
+            }
+            for index in 0..step.stages.len() as u64 {
+                let exists = !self.scheduler.runs_of(&id.member_task(index)).is_empty();
+                let before_succeeded = (0..index).all(|earlier| {
+                    self.state_of(&id.member_task(earlier)) == Some(TaskRunState::Succeeded)
+                });
+                assert!(
+                    !exists || before_succeeded,
+                    "stage {index} of {id:?} exists before the ones before it succeeded"
+                );
+            }
         }
     }
 
     /// Finishes everything still open, so accounting can be checked at rest.
     fn drain(&mut self) {
-        for task in self.continuing.clone() {
-            assert_eq!(self.scheduler.end_continuation(&task), Ok(true));
+        // Cancelling a continuation's composite finishes its task.
+        for id in self.composites.clone() {
+            let _ = self.scheduler.cancel_composite(&id);
+            // A composite that failed fast left its running members alone.
+            let stages = self
+                .scheduler
+                .composite_record(&id)
+                .map_or(0, |record| record.description.map_or(0, |step| step.stages.len()));
+            for index in 0..stages as u64 {
+                let _ = self.scheduler.cancel(&id.member_task(index));
+            }
         }
-        self.continuing.clear();
         for task in self.tasks.keys().cloned().collect::<Vec<_>>() {
             let _ = self.scheduler.cancel(&task);
         }
+        self.collect_events();
         // What was claimed and is running was just cancelled with the rest.
         assert_eq!(self.scheduler.pending_len(), 0);
         assert_eq!(self.scheduler.memory_in_use(), 0, "memory accounting drifted");
+        for (id, times) in &self.finished {
+            assert!(*times <= 1, "{id:?} finished {times} times");
+        }
     }
 }
 
@@ -378,4 +485,27 @@ proptest! {
         }
         model.drain();
     }
+}
+
+/// Runs `ops` as a history, checking every invariant after each.
+fn replay(ops: &[Op]) {
+    let mut model = Model::new();
+    for op in ops {
+        model.apply(op);
+        model.check_invariants();
+    }
+    model.drain();
+}
+
+#[test]
+fn a_second_generation_of_a_key_is_never_claimed_beside_the_first() {
+    let keyed = || Op::Submit { key: Some(0), size: 1, retries: 0 };
+    replay(&[keyed(), Op::Claim { limit: 1 }, keyed(), Op::Claim { limit: 1 }]);
+}
+
+#[test]
+fn a_silent_worker_replays_only_the_newest_generation_of_a_key() {
+    let plain = || Op::Submit { key: None, size: 1, retries: 0 };
+    let keyed = || Op::Submit { key: Some(0), size: 1, retries: 0 };
+    replay(&[plain(), plain(), keyed(), Op::Claim { limit: 3 }, keyed(), Op::WorkerFallsSilent]);
 }

@@ -8,7 +8,8 @@
 //! run's reconnect timeout passes. The leader, once the report that ended
 //! the task is stored, tells the client the run is certified
 //! ([`Net::send_certified`]) or how the task ended without a result
-//! ([`Net::send_concluded`]), asking again for up to [`PUSH_WITHIN`]. A
+//! ([`Net::send_concluded`]), and a composite's client that it is over
+//! ([`Net::send_composite_finished`]), asking again for up to [`PUSH_WITHIN`]. A
 //! client reads what arrived with [`Net::take_result_events`], which is
 //! when each message is acknowledged, so a sender that heard the
 //! acknowledgement knows the client's reader holds it. [`Net::result_arrived`]
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kabudachi_core::protocol::digest::Digest;
+use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     CertifiedAck, DeliverResult, OutcomeAnswer, ResultAck, ResultCertified, ResultMessage,
@@ -61,6 +63,8 @@ pub enum ResultEvent {
         task: TaskId,
         outcome: OutcomeAnswer,
     },
+    /// A composite this worker submitted is over. Its results are its pages.
+    CompositeFinished(generated::CompositeFinished),
 }
 
 /// A delivery the client never acknowledged within its time.
@@ -91,6 +95,13 @@ impl ResultEvent {
                 },
                 wrapped(Message::CertifiedAck(CertifiedAck {})),
             )),
+            Message::CompositeFinished(finished) => {
+                finished.composite_id.as_ref()?;
+                Some((
+                    ResultEvent::CompositeFinished(finished),
+                    wrapped(Message::CertifiedAck(CertifiedAck {})),
+                ))
+            }
             Message::Delivered(_) | Message::CertifiedAck(_) => None,
         }
     }
@@ -164,6 +175,17 @@ impl Net {
         outcome: OutcomeAnswer,
     ) -> impl Future<Output = bool> + Send + use<> {
         let message = wrapped(result_message::Message::Concluded(outcome));
+        self.push(client, message, PUSH_WITHIN)
+    }
+
+    /// Tells the client of a composite it is over, asking again for up to
+    /// [`PUSH_WITHIN`], as [`Self::send_certified`] does.
+    pub fn send_composite_finished(
+        &self,
+        client: WorkerId,
+        finished: generated::CompositeFinished,
+    ) -> impl Future<Output = bool> + Send + use<> {
+        let message = wrapped(result_message::Message::CompositeFinished(finished));
         self.push(client, message, PUSH_WITHIN)
     }
 

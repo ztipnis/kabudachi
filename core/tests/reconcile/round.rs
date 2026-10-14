@@ -5,14 +5,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::reconcile::{
     Answered, CoalescingKey, Cursor, HeldKey, ReconcileRound, ReconcileTerm, ReportPage, ReportedRun,
     ReportedState,
 };
 use kabudachi_core::scheduler::Claim;
-use kabudachi_core::task_record::RecordVersion;
+use kabudachi_core::task_record::{RecordKey, RecordVersion};
 use kabudachi_core::time::{Duration, Instant};
+
+use crate::support::composites::{composite_record, page as page_record};
 
 const TERM: ReconcileTerm = ReconcileTerm {
     recovery_epoch: RecoveryEpoch::new(0, 0),
@@ -34,10 +36,22 @@ fn version(term: u64, revision: u64) -> RecordVersion {
 
 fn held(task: &str, version: RecordVersion, placement: &[&str]) -> HeldKey {
     HeldKey {
-        task_id: TaskId::new(task),
+        key: RecordKey::Task(TaskId::new(task)),
         version,
         input_digest: None,
         latest_run: Some(TaskRunId::new(format!("{task}-run"))),
+        placement: placement.iter().map(|id| w(id)).collect(),
+        finished: false,
+        coalescing: None,
+    }
+}
+
+fn held_composite(key: RecordKey, version: RecordVersion, placement: &[&str]) -> HeldKey {
+    HeldKey {
+        key,
+        version,
+        input_digest: None,
+        latest_run: None,
         placement: placement.iter().map(|id| w(id)).collect(),
         finished: false,
         coalescing: None,
@@ -69,6 +83,7 @@ fn running(task: &str, run: &str) -> ReportedRun {
             chain: Vec::new(),
         },
         state: ReportedState::Running,
+        continuation: None,
     }
 }
 
@@ -147,11 +162,11 @@ fn a_reported_version_without_a_full_record_as_new_is_uncertain() {
             vec![held("t", version(4, 2), &["a", "b", "c"])],
         );
     }
-    assert_eq!(round.missing_records(|_| true), [TaskId::new("t")]);
+    assert_eq!(round.missing_records(|_| true), [RecordKey::Task(TaskId::new("t"))]);
     round.fetched(record("t", version(4, 1), &["a", "b", "c"]));
     assert_eq!(
         round.missing_records(|_| true),
-        [TaskId::new("t")],
+        [RecordKey::Task(TaskId::new("t"))],
         "an older record does not stand in for the newest"
     );
 
@@ -217,7 +232,7 @@ fn the_round_may_stop_when_every_voter_answered_or_a_quorum_did_after_the_grace(
 }
 
 #[test]
-fn pages_continue_after_the_last_run_then_the_last_key() {
+fn pages_continue_after_the_last_run_then_the_last_key_whatever_its_kind() {
     let mut round = ReconcileRound::new(TERM, [w("a")], Instant::at(0), GRACE);
     let run_page = ReportPage {
         runs: vec![running("t", "r9")],
@@ -233,7 +248,16 @@ fn pages_continue_after_the_last_run_then_the_last_key() {
     };
     assert_eq!(
         round.page(&w("a"), key_page, Instant::at(0)),
-        Some(Cursor::AfterKey(TaskId::new("t7")))
+        Some(Cursor::AfterKey(RecordKey::Task(TaskId::new("t7"))))
+    );
+    let composite_page = ReportPage {
+        keys: vec![held_composite(RecordKey::Page(CompositeId::new("c"), 2), version(1, 0), &["a"])],
+        ..ReportPage::default()
+    };
+    assert_eq!(
+        round.page(&w("a"), composite_page, Instant::at(0)),
+        Some(Cursor::AfterKey(RecordKey::Page(CompositeId::new("c"), 2))),
+        "a composite's key continues the page as a task's does"
     );
     assert_eq!(
         round.page(
@@ -332,7 +356,7 @@ fn a_newer_version_reported_after_an_older_fetch_is_not_covered_by_it() {
         vec![held("t", version(4, 0), &["a", "b", "c"])],
     );
 
-    assert_eq!(round.missing_records(|_| true), [TaskId::new("t")]);
+    assert_eq!(round.missing_records(|_| true), [RecordKey::Task(TaskId::new("t"))]);
     let settled = round.take_settled(|_| true);
     assert!(settled.records.is_empty(), "the term 3 record is not current");
     assert!(settled.uncertain.contains_key(&TaskId::new("t")));
@@ -440,4 +464,68 @@ fn a_re_asked_workers_newer_run_state_replaces_the_earlier_one() {
     let runs = &settled.reports[&w("a")].runs;
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].state, failed);
+}
+
+#[test]
+fn a_composite_record_a_quorum_of_its_holders_reported_is_rebuilt_and_one_short_of_it_is_uncertain() {
+    let (known, short) = (CompositeId::new("known"), CompositeId::new("short"));
+    let at = version(2, 1);
+    let mut round = ReconcileRound::new(TERM, [w("a"), w("b"), w("c")], Instant::at(0), GRACE);
+    for worker in ["a", "b"] {
+        answer(
+            &mut round,
+            worker,
+            vec![held_composite(RecordKey::Composite(known.clone()), at, &["a", "b", "c"])],
+        );
+    }
+    answer(
+        &mut round,
+        "c",
+        vec![held_composite(RecordKey::Composite(short.clone()), at, &["c", "d", "e"])],
+    );
+    let missing = round.missing_records(|_| true);
+    assert_eq!(
+        missing,
+        [RecordKey::Composite(known.clone()), RecordKey::Composite(short.clone())]
+    );
+    round.fetched(composite_record(&known, 2, 1));
+    round.fetched(composite_record(&short, 2, 1));
+
+    let rebuild = round.take_settled(|_| true);
+
+    let rebuilt: Vec<_> = rebuild
+        .composites
+        .iter()
+        .map(|record| record.composite_id.clone().unwrap().value)
+        .collect();
+    assert_eq!(rebuilt, ["known"]);
+    assert_eq!(rebuild.uncertain_composites, BTreeSet::from([short]));
+    assert!(rebuild.records.is_empty() && rebuild.uncertain.is_empty());
+}
+
+#[test]
+fn a_page_is_rebuilt_with_its_composite_and_an_uncertain_page_makes_its_composite_uncertain() {
+    let (whole, partial) = (CompositeId::new("whole"), CompositeId::new("partial"));
+    let at = version(2, 1);
+    let mut round = ReconcileRound::new(TERM, [w("a"), w("b"), w("c")], Instant::at(0), GRACE);
+    for worker in ["a", "b"] {
+        answer(
+            &mut round,
+            worker,
+            vec![held_composite(RecordKey::Page(whole.clone(), 0), at, &["a", "b", "c"])],
+        );
+    }
+    answer(
+        &mut round,
+        "c",
+        vec![held_composite(RecordKey::Page(partial.clone(), 1), at, &["c", "d", "e"])],
+    );
+    round.fetched(page_record(&whole, 0, 2, 1));
+    round.fetched(page_record(&partial, 1, 2, 1));
+
+    let rebuild = round.take_settled(|_| true);
+
+    assert_eq!(rebuild.pages.len(), 1);
+    assert_eq!(rebuild.pages[0].composite_id.clone().unwrap().value, "whole");
+    assert_eq!(rebuild.uncertain_composites, BTreeSet::from([partial]));
 }

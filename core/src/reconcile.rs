@@ -1,6 +1,7 @@
 //! What a new leader learns from its shard before it schedules anything:
 //! every worker reports the runs it holds, each with the claim it was granted
-//! under, and a summary of every Task record it holds, page by page (see
+//! under, and a summary of every record it holds (Task records, composite
+//! records and their pages), page by page (see
 //! [`wire`] for the messages and their limits).
 //!
 //! A [`ReconcileRound`] collects the answers, asks for the full records the
@@ -31,10 +32,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::digest::Digest;
-use crate::protocol::generated::TaskRecord;
-use crate::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
+use crate::protocol::generated::{CompositePage, CompositeRecord, TaskRecord};
+use crate::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use crate::scheduler::Claim;
-use crate::task_record::RecordVersion;
+use crate::scheduler::composite::Step;
+use crate::task_record::{RecordKey, RecordVersion, ShardRecord};
 use crate::time::{Duration, Instant};
 
 /// The office a leader reconciles for: its recovery epoch and term.
@@ -68,6 +70,9 @@ pub enum ReportedState {
 pub struct ReportedRun {
     pub claim: Claim,
     pub state: ReportedState,
+    /// The step a succeeded run returned, which the leader that certifies
+    /// the run commits with it.
+    pub continuation: Option<Step>,
 }
 
 /// The coalescing key a task belongs to: the generations of one key replace
@@ -81,9 +86,11 @@ pub struct CoalescingKey {
 /// One record a worker holds, summarised.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldKey {
-    pub task_id: TaskId,
+    pub key: RecordKey,
     pub version: RecordVersion,
+    /// A Task record's input digest; unset for any other record.
     pub input_digest: Option<Digest>,
+    /// A Task record's latest run; unset for any other record.
     pub latest_run: Option<TaskRunId>,
     pub placement: Vec<WorkerId>,
     pub finished: bool,
@@ -113,15 +120,33 @@ pub struct WorkerRuns {
 pub struct Rebuild {
     /// The newest record of every task known for certain.
     pub records: Vec<TaskRecord>,
+    /// The newest record of every composite known for certain.
+    pub composites: Vec<CompositeRecord>,
+    /// The newest revision of every composite page known for certain.
+    pub pages: Vec<CompositePage>,
     /// Tasks some worker holds whose newest record cannot be known yet, with
     /// the run ids known to be theirs.
     pub uncertain: BTreeMap<TaskId, BTreeSet<TaskRunId>>,
     /// The coalescing key of each uncertain task that has one, so the leader
     /// can hold the key's other generations back with it.
     pub uncertain_keys: BTreeMap<TaskId, CoalescingKey>,
+    /// Composites some worker holds the record of, or a page of, whose newest
+    /// revision cannot be known yet.
+    pub uncertain_composites: BTreeSet<CompositeId>,
     /// The runs each worker that answered reported. A worker missing here
     /// did not answer.
     pub reports: BTreeMap<WorkerId, WorkerRuns>,
+}
+
+impl Rebuild {
+    /// Every record of the rebuild, of every kind, as the revisions the
+    /// round found.
+    pub fn found(&self) -> Vec<ShardRecord> {
+        let tasks = self.records.iter().cloned().map(ShardRecord::Task);
+        let composites = self.composites.iter().cloned().map(ShardRecord::Composite);
+        let pages = self.pages.iter().cloned().map(ShardRecord::Page);
+        tasks.chain(composites).chain(pages).collect()
+    }
 }
 
 /// How many of a leader's voters have answered its reconciliation.

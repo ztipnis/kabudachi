@@ -6,6 +6,7 @@
 use prost::Message;
 
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId};
+use crate::protocol::messages::prelude::*;
 use crate::protocol::records::{TaskRunRecord, retry_of};
 use crate::protocol::task::TaskRunState;
 use crate::task_record::HISTORY_TOO_LARGE_FAILURE_KIND;
@@ -29,13 +30,51 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         self.update_pressure();
         self.conclude(task_id);
+        self.member_finished(task_id);
     }
 
     /// `task_id` is over and holds no payload any more: the task is forgotten
-    /// `result_ttl` from now.
+    /// `result_ttl` from now. A member of a composite this scheduler holds is
+    /// kept until the composite is forgotten, since the composite's results
+    /// name the blobs its members stored.
     pub(super) fn forget_later(&mut self, task_id: &TaskId, now: Instant) {
-        self.retention.record(task_id, now);
+        let composite = self.tasks.get(task_id).and_then(|task| task.composite_id());
+        if composite.is_some_and(|composite| self.composites.held.contains_key(&composite)) {
+            self.retention.hold(task_id, now);
+        } else {
+            self.retention.record(task_id, now);
+        }
         self.unpublished.insert(task_id.clone());
+    }
+
+    /// After composites were installed: a member kept for a composite this
+    /// scheduler neither holds nor waits to learn of has nothing to be kept
+    /// for.
+    pub(super) fn release_orphaned_members(&mut self) {
+        let orphans: Vec<TaskId> = self
+            .retention
+            .held()
+            .into_iter()
+            .filter(|task_id| {
+                let composite = self.tasks.get(task_id).and_then(|task| task.composite_id());
+                !composite.is_some_and(|composite| {
+                    self.composites.held.contains_key(&composite) || self.reconciliation.is_uncertain_composite(&composite)
+                })
+            })
+            .collect();
+        self.release_members(orphans);
+    }
+
+    /// The members of composites just forgotten are kept no longer: they are
+    /// forgotten when their own TTL has passed, and holders are told with
+    /// one last revision that their retention may begin.
+    pub(super) fn release_members(&mut self, members: Vec<TaskId>) {
+        for task_id in members {
+            if self.retention.is_held(&task_id) {
+                self.retention.release(&task_id);
+                self.unpublished.insert(task_id);
+            }
+        }
     }
 
     /// Expires `task_id`, which `take_expired` found still waiting, so its

@@ -284,11 +284,15 @@ class ProcessPool:
 
     def run(self, job: RunJob) -> RunningBody:
         slot = self._hand_over(job)
-        if job.after is not None and not job.after.done():
-            # Sent only once the earlier body has exited, so the wait does not
-            # count against this run's timeout, which starts then too.
+        gates = [gate for gate in (job.after, job.given) if gate is not None and not gate.done()]
+        if gates:
+            # Sent only once the earlier body has exited and what the run is
+            # given has arrived, so the wait does not count against this
+            # run's timeout, which starts then too.
             self._gated += 1
-            job.after.add_done_callback(lambda _: self._ungate(slot))
+            task = self._started_loop().create_task(self._ungate(slot, gates))
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
         else:
             self._queue(slot)
         return RunningBody(slot.outcome, slot.exited)
@@ -332,9 +336,23 @@ class ProcessPool:
         self._slots[job.run_id] = slot
         return slot
 
-    def _ungate(self, slot: _Slot) -> None:
+    async def _ungate(self, slot: _Slot, gates: "list[asyncio.Future[Any]]") -> None:
+        await asyncio.wait(gates)
         self._gated -= 1
-        if not slot.exited.done():
+        job = slot.job
+        reading = job.given if isinstance(job, RunJob) else None
+        if slot.exited.done():
+            pass
+        elif reading is not None and (reading.cancelled() or reading.exception() is not None):
+            # What the run was to be given could not be read: it fails with that.
+            if not slot.outcome.done():
+                slot.outcome.set_exception(
+                    TaskProcessLost("reading what the run is given was cancelled")
+                    if reading.cancelled()
+                    else reading.exception()
+                )
+            self._finish(slot)
+        else:
             self._queue(slot)
         self._wake()
 
@@ -625,10 +643,8 @@ class ProcessPool:
         if frame.definition_id is not None and frame.payload is not None:
             options = frame.options or SubmissionOptions()
             return nested.submit_serialized(frame.definition_id, frame.payload, options)
-        if frame.composite is not None and frame.step is not None and frame.previous is not None:
-            return nested.submit_composite(
-                frame.composite, pickle.loads(frame.step), pickle.loads(frame.previous)
-            )
+        if frame.composite and frame.step is not None and frame.previous is not None:
+            return nested.submit_composite(pickle.loads(frame.step), pickle.loads(frame.previous))
         raise ValueError("a submission names neither a task nor a flow or group")
 
     def _retire(self, child: _Child) -> None:
@@ -804,6 +820,7 @@ def _frame_for(job: RunJob | CompactJob) -> ipc.Run | ipc.Compact:
         job.task_id,
         job.shard,
         job.worker_id,
+        job.given.result() if job.given is not None else None,
     )
 
 

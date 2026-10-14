@@ -23,26 +23,27 @@ const CANCELLED_KIND: &str = "TaskCancelledError";
 const MALFORMED_KIND: &str = "MalformedClaim";
 
 /// What one piece of work leaves to do once the seam is unlocked: a report
-/// for the driver, and whether a waiting claim or event wait should look
-/// again.
+/// for the driver, whether a waiting claim or event wait should look again,
+/// and whether a place offered earlier is offered again.
 #[derive(Default)]
 struct Handled {
     report: Option<Report>,
     wake: bool,
+    place_back: bool,
 }
 
 impl Handled {
     fn report(report: Report) -> Self {
         Handled {
             report: Some(report),
-            wake: false,
+            ..Handled::default()
         }
     }
 
     fn wake() -> Self {
         Handled {
-            report: None,
             wake: true,
+            ..Handled::default()
         }
     }
 }
@@ -60,8 +61,17 @@ impl Shared {
                 Work::AbortWithdrawn(run) => seam.withdraw_abort(&run),
             }
         };
+        self.settle(handled);
+    }
+
+    /// Reports, offers a place again and wakes, as `handled` says, outside
+    /// the seam's lock.
+    fn settle(&self, handled: Handled) {
         if let Some(report) = handled.report {
             self.report(report);
+        }
+        if handled.place_back {
+            self.report(Report::Capacity(1));
         }
         if handled.wake {
             self.wake();
@@ -135,37 +145,31 @@ impl Shared {
     /// counted until the run ends, unless it ended meanwhile.
     fn finish_resolving(&self, claim: Claim, outcome: Result<Option<Taken>, Resolving>) {
         let run = claim.task_run_id.clone();
-        let report = {
+        let handled = {
             let mut seam = self.seam();
             if seam.resolving.remove(&run).is_none() {
                 // Cancelled, aborted or stopped meanwhile: already reported
                 // (the fetch was stopped, unless it was already here).
                 return;
             }
+            let failure = |reason: &str| Report::Failed {
+                run: run.clone(),
+                reason: reason.into(),
+                message: String::new(),
+            };
             match outcome {
                 Ok(taken) => {
                     if let Some(taken) = taken {
-                        seam.inputs_in_flight.insert(run, taken);
+                        seam.inputs_in_flight.insert(run, vec![taken]);
                     }
                     seam.handed.push_back(claim);
-                    None
+                    Handled::wake()
                 }
-                Err(Resolving::Unresolved) => Some(Report::Failed {
-                    run,
-                    reason: PAYLOAD_UNAVAILABLE_KIND.into(),
-                    message: String::new(),
-                }),
-                Err(Resolving::TooLarge) => Some(Report::Failed {
-                    run,
-                    reason: PAYLOAD_TOO_LARGE_KIND.into(),
-                    message: String::new(),
-                }),
+                Err(Resolving::Unresolved) => seam.untaken(Some(failure(PAYLOAD_UNAVAILABLE_KIND))),
+                Err(Resolving::TooLarge) => seam.untaken(Some(failure(PAYLOAD_TOO_LARGE_KIND))),
             }
         };
-        match report {
-            Some(report) => self.report(report),
-            None => self.wake(),
-        }
+        self.settle(handled);
     }
 }
 
@@ -181,14 +185,33 @@ impl Seam {
                 self.handed.push_back(claim);
                 Handled::wake()
             }
-            None => Handled {
-                report: wire.task_run_id.map(|run| Report::Failed {
+            None => {
+                let failed = wire.task_run_id.map(|run| Report::Failed {
                     run: run.into(),
                     reason: MALFORMED_KIND.into(),
                     message: String::new(),
-                }),
-                wake: false,
-            },
+                });
+                if self.closed {
+                    Handled {
+                        report: failed,
+                        wake: false,
+                        place_back: false,
+                    }
+                } else {
+                    self.untaken(failed)
+                }
+            }
+        }
+    }
+
+    /// Ends a run Python never took, reported with `report` if it is
+    /// named, and frees the place it used so it is offered again.
+    fn untaken(&mut self, report: Option<Report>) -> Handled {
+        self.offered += 1;
+        Handled {
+            report,
+            wake: false,
+            place_back: true,
         }
     }
 
@@ -208,9 +231,10 @@ impl Seam {
                 Handled {
                     report: Some(cancelled(run)),
                     wake: true,
+                    place_back: false,
                 }
             }
-            None if unstarted => Handled::report(cancelled(run)),
+            None if unstarted => self.untaken(Some(cancelled(run))),
             None => Handled::default(),
         }
     }
@@ -220,7 +244,7 @@ impl Seam {
     /// lost now; Python is told of one it holds.
     fn abort(&mut self, run: TaskRunId, deadline: StdInstant) -> Handled {
         if self.take_handed(&run) || self.stop_resolving(&run) {
-            return Handled::report(Report::Lost(run));
+            return self.untaken(Some(Report::Lost(run)));
         }
         let Some(held) = self.held.get(&run) else {
             return Handled::default();

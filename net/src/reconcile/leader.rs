@@ -6,17 +6,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kabudachi_core::election::WorkerNode;
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated::{ElectionCertificate, TaskRecord};
-use kabudachi_core::protocol::ids::{TaskId, WorkerId};
+use kabudachi_core::protocol::generated::ElectionCertificate;
+use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::ReconcileRequest;
 use kabudachi_core::reconcile::{Cursor, DriftWatch, ReconcileTerm, ReportPage, wire};
-use kabudachi_core::task_record::OfficeReconciliation;
+use kabudachi_core::task_record::{OfficeReconciliation, RecordKey, ShardRecord};
 use kabudachi_core::time::{Clock, Duration, Instant};
 use libp2p::futures::StreamExt;
 use libp2p::futures::future::BoxFuture;
 use libp2p::futures::stream::FuturesUnordered;
 
-use crate::messenger::Net;
+use crate::messenger::{Net, RecordLookup};
 use crate::reconcile::report::page_of;
 use crate::reconcile::request_after;
 
@@ -47,11 +47,11 @@ pub(crate) struct LeaderReconciliation<'n> {
     /// The roster's reconcilees as last seen, sorted.
     roster: Vec<WorkerId>,
     asked_again_at: Instant,
-    fetches: FuturesUnordered<BoxFuture<'n, (TaskId, Option<TaskRecord>)>>,
-    fetching: BTreeSet<TaskId>,
+    fetches: FuturesUnordered<BoxFuture<'n, (RecordKey, Option<ShardRecord>)>>,
+    fetching: BTreeSet<RecordKey>,
     /// When each record was last looked up over the network, and how many
     /// times it has been.
-    looked_up: BTreeMap<TaskId, (Instant, u32)>,
+    looked_up: BTreeMap<RecordKey, (Instant, u32)>,
     /// Whether the records missing may have changed since the last scan.
     scan: bool,
     scan_again_at: Option<Instant>,
@@ -168,7 +168,10 @@ impl<'n> LeaderReconciliation<'n> {
                 after: after.map(request_after),
                 ..ReconcileRequest::default()
             };
-            let report = page_of(&request, &runs, &held);
+            let Some(report) = page_of(&request, &runs, &held) else {
+                tracing::warn!("this worker's own reconciliation cursor could not be read");
+                return;
+            };
             let page = match wire::page(&report) {
                 Ok(page) => page,
                 Err(malformed) => {
@@ -195,8 +198,8 @@ impl<'n> LeaderReconciliation<'n> {
             Some((worker, asked_at, runs_only, page)) = self.asks.next() => {
                 self.asked(worker, asked_at, runs_only, page);
             }
-            Some((task, record)) = self.fetches.next() => {
-                self.fetching.remove(&task);
+            Some((key, record)) = self.fetches.next() => {
+                self.fetching.remove(&key);
                 if let Some(record) = record {
                     self.reconciling.round_mut().fetched(record);
                 }
@@ -275,12 +278,12 @@ impl<'n> LeaderReconciliation<'n> {
         self.scan_again_at = None;
         self.unlooked = 0;
         self.read_held_records(node);
-        for task in self
+        for key in self
             .reconciling
             .round()
             .missing_records(|worker| node.is_member(worker))
         {
-            self.look_up(task, now);
+            self.look_up(key, now);
         }
     }
 
@@ -293,49 +296,53 @@ impl<'n> LeaderReconciliation<'n> {
     /// Takes every record the round lacks that this worker's own store holds.
     fn read_held_records<C: Clock>(&mut self, node: &WorkerNode<C>) {
         let held = self.net.held_records();
-        for task in self
+        for key in self
             .reconciling
             .round()
             .missing_records(|worker| node.is_member(worker))
         {
-            if let Some(record) = held.get(&task) {
+            if let Some(record) = held.get_record(&key) {
                 self.reconciling.round_mut().fetched(record);
             }
         }
     }
 
-    /// Looks `task` up, unless a lookup of it runs, it was looked up too
-    /// recently (the round is scanned again when that cools down), or the
-    /// most lookups run that may (scanned again when one ends).
-    fn look_up(&mut self, task: TaskId, now: Instant) {
-        if self.fetching.contains(&task) {
+    /// Looks the record `key` names up over the network, unless a lookup of
+    /// it runs, it was looked up too recently (the round is scanned again
+    /// when that cools down), or the most lookups run that may (scanned again
+    /// when one ends).
+    fn look_up(&mut self, key: RecordKey, now: Instant) {
+        if self.fetching.contains(&key) {
             return;
         }
-        if let Some(again) = self.cooling_until(&task, now) {
+        if let Some(again) = self.cooling_until(&key, now) {
             self.scan_again_at = Some(self.scan_again_at.map_or(again, |at| at.min(again)));
             return;
         }
         if self.fetching.len() >= FETCHES_IN_FLIGHT {
             // Scanned again when a lookup ends.
-            if !self.looked_up.contains_key(&task) {
+            if !self.looked_up.contains_key(&key) {
                 self.unlooked += 1;
             }
             return;
         }
-        let times = self.looked_up.get(&task).map_or(0, |(_, times)| times + 1);
-        self.looked_up.insert(task.clone(), (now, times));
-        self.fetching.insert(task.clone());
+        let times = self.looked_up.get(&key).map_or(0, |(_, times)| times + 1);
+        self.looked_up.insert(key.clone(), (now, times));
+        self.fetching.insert(key.clone());
         let net = self.net;
         self.fetches.push(Box::pin(async move {
-            let record = net.get_record(task.clone()).await;
-            (task, record)
+            let record = match net.find_shard_record(key.clone()).await {
+                RecordLookup::Found(record) => Some(record),
+                RecordLookup::NotFound | RecordLookup::Unanswered => None,
+            };
+            (key, record)
         }));
     }
 
-    /// When `task`, looked up before, may be looked up again, while that is
+    /// When `key`, looked up before, may be looked up again, while that is
     /// still ahead of `now`.
-    fn cooling_until(&self, task: &TaskId, now: Instant) -> Option<Instant> {
-        let (at, times) = self.looked_up.get(task)?;
+    fn cooling_until(&self, key: &RecordKey, now: Instant) -> Option<Instant> {
+        let (at, times) = self.looked_up.get(key)?;
         let again = *at + self.cooldown(*times);
         (now < again).then_some(again)
     }

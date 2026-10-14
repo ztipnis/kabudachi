@@ -55,11 +55,13 @@ use std::time::{Duration, Instant};
 
 use kabudachi_core::election::AbortBy;
 use kabudachi_core::protocol::digest::Digest;
+use kabudachi_core::protocol::generated::StepDescription;
 use kabudachi_core::protocol::ids::{TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     Claim, ClaimResponse, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, TaskRejectReason,
     TaskResponse, claim_response, task_request,
 };
+use kabudachi_core::scheduler::composite::Step;
 use kabudachi_core::task_record::Settled;
 use kabudachi_core::time::{Clock, Duration as CoreDuration, Instant as NodeInstant, WallTime};
 use libp2p::futures::{FutureExt, StreamExt};
@@ -87,7 +89,9 @@ pub enum Work {
 pub enum Report {
     Capacity(u32),
     Started(TaskRunId),
-    Completed { run: TaskRunId, digest: Digest, delivered: bool },
+    /// The run succeeded. `continuation` is the step it returned: the run's
+    /// result is that step's digest, and the step is certified with it.
+    Completed { run: TaskRunId, digest: Digest, delivered: bool, continuation: Option<Step> },
     Failed { run: TaskRunId, reason: String, message: String },
     Lost(TaskRunId),
     Compacted { run: TaskRunId, payload: Vec<u8> },
@@ -564,12 +568,13 @@ impl<'n> Executing<'n> {
                     task_run_id: Some(run.into()),
                 })
             }
-            Report::Completed { run, digest, delivered } => {
+            Report::Completed { run, digest, delivered, continuation } => {
                 self.ended(&run);
                 task_request::Request::Completed(ReportCompleted {
                     task_run_id: Some(run.into()),
                     result_digest: Some(digest.into()),
                     delivered,
+                    continuation: continuation.as_ref().map(StepDescription::from),
                 })
             }
             Report::Failed { run, reason, message } => {

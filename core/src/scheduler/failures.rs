@@ -90,6 +90,25 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         failure_message: String,
     ) -> Result<Failure, ReportRejection> {
         self.start_if_claimed_compaction(worker, run_id);
+        self.fail_running(worker, run_id, failure_kind, failure_message, true)
+    }
+
+    /// Fails `worker`'s running run `run_id` with `failure_kind` and no
+    /// retry, whatever retries its task has left: a failure no new attempt
+    /// could change.
+    pub(super) fn fail_for_good(&mut self, worker: &WorkerId, run_id: &TaskRunId, failure_kind: &str) {
+        self.fail_running(worker, run_id, failure_kind.to_owned(), String::new(), false)
+            .expect("only a running run of its worker is failed for good");
+    }
+
+    fn fail_running(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+        failure_kind: String,
+        failure_message: String,
+        may_retry: bool,
+    ) -> Result<Failure, ReportRejection> {
         let now = self.clock.now();
         let stamped_at = WallTime::now(&self.clock);
         let run = self.owned_run(worker, run_id, TaskRunState::Running)?;
@@ -111,7 +130,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         self.mark_decided(run_id);
         self.note_failed_compaction(&task_id);
-        let retry = self.replace_failed_run(&task_id, run_id, attempt);
+        let retry = may_retry
+            .then(|| self.replace_failed_run(&task_id, run_id, attempt))
+            .flatten();
         if retry.is_none() {
             self.record_finished(&task_id, now);
         }

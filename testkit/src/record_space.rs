@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
-use kabudachi_core::task_record::{Origin, PlacedWrite, VersionedRecords, Write};
+use kabudachi_core::task_record::{Origin, PlacedWrite, RecordKey, ShardRecord, VersionedRecords, Write};
 use kabudachi_core::time::{Duration, Instant};
 
 /// The shard's Task records as the simulator's nodes hold them: each node
@@ -36,6 +36,8 @@ struct Space {
     /// Writers whose writes stay in flight, and the writes held so far.
     holding: BTreeSet<WorkerId>,
     in_flight: Vec<(WorkerId, PlacedWrite)>,
+    /// Which records every holder refuses, if any.
+    refusing: Option<Box<dyn Fn(&RecordKey) -> bool>>,
 }
 
 impl Space {
@@ -46,7 +48,10 @@ impl Space {
     fn deliver(&mut self, writer: &WorkerId, placed: &PlacedWrite, now: Instant, on_its_way: bool) {
         let write = Write::of(&placed.record);
         let mut stored = BTreeSet::new();
-        for holder in placed.recipients() {
+        let refused = self.refusing.as_ref().is_some_and(|refuses| {
+            placed.record.identify().is_ok_and(|(key, _)| refuses(&key))
+        });
+        for holder in placed.recipients().into_iter().filter(|_| !refused) {
             let reached = if on_its_way {
                 !self.down.contains(&holder)
             } else {
@@ -94,17 +99,17 @@ impl Space {
 }
 
 impl RecordSpace {
-    /// The `factor` voters a record of `task` is placed on (a stable order
-    /// of their ids mixed with the task's, not kad's metric) and its
+    /// The `factor` voters the record `key` names is placed on (a stable order
+    /// of their ids mixed with the key's kad bytes, not kad's metric) and its
     /// majority quorum. The order is the same in every run.
     pub fn placement(
-        task: &TaskId,
+        key: &RecordKey,
         voters: &[WorkerId],
         factor: usize,
     ) -> (Vec<WorkerId>, usize) {
         let mut ranked: Vec<(u64, &WorkerId)> = voters
             .iter()
-            .map(|voter| (mixed(voter.as_str(), task.as_str()), voter))
+            .map(|voter| (mixed(voter.as_str(), &key.kad_bytes()), voter))
             .collect();
         ranked.sort();
         let holders: Vec<WorkerId> = ranked
@@ -222,6 +227,13 @@ impl RecordSpace {
         self.0.borrow_mut().ack_delay = Some(delay);
     }
 
+    /// From now on every holder refuses the writes of the records `refused`
+    /// names, as it refuses a write it cannot store, until it is given another
+    /// rule. Writes made before are not undone.
+    pub fn refuse_writes_of(&self, refused: impl Fn(&RecordKey) -> bool + 'static) {
+        self.0.borrow_mut().refusing = Some(Box::new(refused));
+    }
+
     /// A holder that is down stores nothing until it is up again.
     pub fn set_up(&self, holder: &WorkerId, up: bool) {
         let mut space = self.0.borrow_mut();
@@ -246,7 +258,7 @@ impl RecordSpace {
         self.0.borrow().reaches(from, holder)
     }
 
-    /// Every record `holder` holds, the newest revision of each task.
+    /// Every Task record `holder` holds, the newest revision of each task.
     pub fn held_records(&self, holder: &WorkerId) -> Vec<TaskRecord> {
         self.0
             .borrow()
@@ -263,8 +275,37 @@ impl RecordSpace {
             .borrow()
             .stores
             .get(holder)
+            .map(|store| {
+                store
+                    .reported()
+                    .filter_map(|record| match record {
+                        ShardRecord::Task(record) => Some(record.clone()),
+                        ShardRecord::Composite(_) | ShardRecord::Page(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// What `holder` reports of every kind of record: each record it holds
+    /// and the stub of each revision held elsewhere.
+    pub fn reported_shard_records(&self, holder: &WorkerId) -> Vec<ShardRecord> {
+        self.0
+            .borrow()
+            .stores
+            .get(holder)
             .map(|store| store.reported().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// What `holder` holds of the record `key` names.
+    pub fn held_record(&self, holder: &WorkerId, key: &RecordKey) -> Option<ShardRecord> {
+        self.0
+            .borrow()
+            .stores
+            .get(holder)
+            .and_then(|store| store.get_record(key))
+            .cloned()
     }
 
     /// What `holder` holds of `task`.
@@ -286,16 +327,16 @@ fn is_stored(placed: &PlacedWrite, stored: &BTreeSet<WorkerId>) -> bool {
         && placed.prior.iter().all(|prior| reached(&prior.holders) >= prior.quorum)
 }
 
-/// FNV-1a over the voter's id, a separator and the task's id, finalized: fixed
+/// FNV-1a over the voter's id, a separator and the record's key, finalized: fixed
 /// by construction, unlike a randomly keyed hasher.
-fn mixed(voter: &str, task: &str) -> u64 {
+fn mixed(voter: &str, key: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in voter.bytes().chain([0xff]).chain(task.bytes()) {
+    for byte in voter.bytes().chain([0xff]).chain(key.iter().copied()) {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     // FNV's last bytes barely move the high bits, which order the voters: a
-    // finalizer lets the task's id, its last bytes, change the order.
+    // finalizer lets the key, its last bytes, change the order.
     hash ^= hash >> 33;
     hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
     hash ^= hash >> 33;

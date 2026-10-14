@@ -2,7 +2,7 @@
 //! publishes. The runtime installs the node's record store; a scheduler that
 //! nobody watches installs [`NoObserver`]; a test installs a recording spy.
 
-use crate::protocol::generated::TaskRecord;
+use crate::protocol::generated::{CompositePage, CompositeRecord, TaskRecord};
 
 /// Whoever the scheduler hands its published records to.
 pub trait Observer {
@@ -12,6 +12,14 @@ pub trait Observer {
     /// leads. Nothing is published once the lease has ended: a change made
     /// then is published at the next call that finds the scheduler leading.
     fn revision(&mut self, revision: TaskRecord);
+
+    /// Takes a composite's whole record as a call left it, versioned like a
+    /// task's and published under the same rules.
+    fn composite_revision(&mut self, revision: CompositeRecord);
+
+    /// Takes one page of a composite's member outcomes as a call left it,
+    /// versioned like a task's and published under the same rules.
+    fn page_revision(&mut self, revision: CompositePage);
 }
 
 /// The observer production uses: it ignores every revision.
@@ -20,4 +28,8 @@ pub struct NoObserver;
 
 impl Observer for NoObserver {
     fn revision(&mut self, _: TaskRecord) {}
+
+    fn composite_revision(&mut self, _: CompositeRecord) {}
+
+    fn page_revision(&mut self, _: CompositePage) {}
 }

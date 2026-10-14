@@ -261,7 +261,7 @@ def test_a_networked_handle_settled_before_its_task_was_stored_still_answers_dur
         if settle == "cancelled":
             world.runtime.inject_event(EventKind.CANCELLED, handle.task_id)
         else:
-            world.session.stop_claiming()
+            await world.session.stop_claiming()
         with pytest.raises(error, match=message):
             await asyncio.wait_for(handle, WAIT)
         with pytest.raises(error, match=message):
@@ -581,7 +581,7 @@ def test_stopping_fails_tasks_that_have_not_started_and_refuses_new_ones():
         running = world.call("slow", Greeting(text="running"))
         queued = world.call("slow", Greeting(text="queued"))
         await until(lambda: begun, "the slow task beginning")
-        world.session.stop_claiming()
+        await world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
             await queued
         with pytest.raises(RunStoppedError):
@@ -605,7 +605,7 @@ def test_a_claim_delivered_after_stopping_does_not_run_its_failed_task():
         # as the submission, so the claim arrives after the task was failed.
         await asyncio.sleep(0.02)
         handle = world.call("record", Greeting(text="late"))
-        world.session.stop_claiming()
+        await world.session.stop_claiming()
         await asyncio.sleep(0.05)
         with pytest.raises(RunStoppedError):
             await handle
@@ -641,7 +641,7 @@ def test_stopping_frees_a_running_task_that_was_waiting_for_one_that_never_start
         parent = world.session.submit(outer_task.definition, Greeting())
         while "waiting" not in order:
             await asyncio.sleep(0.005)
-        world.session.stop_claiming()
+        await world.session.stop_claiming()
         await world.session.wait_until_running_finish()
         with pytest.raises(RunStoppedError):
             await parent
@@ -764,7 +764,7 @@ def test_stopping_fails_a_task_that_is_waiting_for_its_retry():
         handle = world.call("flaky_body", Greeting())
         while not any(e[0] == "fail" for e in world.runtime.events):
             await asyncio.sleep(0.001)
-        world.session.stop_claiming()
+        await world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
             await handle
 
@@ -1179,7 +1179,7 @@ def test_a_running_task_that_fails_after_stopping_does_not_wait_for_a_retry_nobo
         handle = world.call("fails_once_released", Greeting())
         while not calls:
             await asyncio.sleep(0.001)
-        world.session.stop_claiming()
+        await world.session.stop_claiming()
         release.set()
         with pytest.raises(RunStoppedError):
             await asyncio.wait_for(handle, WAIT)
@@ -1699,7 +1699,7 @@ def test_stopping_while_a_submission_is_in_flight_refuses_or_fails_it_and_never_
         submitter = threading.Thread(target=submit)
         submitter.start()
         await asyncio.sleep(0.02)  # usually inside the native call by now
-        world.session.stop_claiming()
+        await world.session.stop_claiming()
         while submitter.is_alive():
             await asyncio.sleep(0.005)
         [result] = outcome
@@ -1758,7 +1758,7 @@ def test_stopping_ends_a_worker_loop_that_is_waiting_for_a_free_place():
         worker = asyncio.ensure_future(world.session.work())
         handle = world.call("hold", Greeting())
         await asyncio.wait_for(started.wait(), WAIT)  # the only place is taken
-        world.session.stop_claiming()
+        await world.session.stop_claiming()
         await asyncio.wait_for(worker, WAIT)  # woke, saw the stop, and returned
         release.set()
         return await asyncio.wait_for(handle, WAIT)

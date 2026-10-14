@@ -3051,7 +3051,13 @@ Open: `Subscription::Only` of an empty set maps to `Every` on the wire. Python r
 
 Open: a record that is re-placed off a killed voter stalls. The re-placement is a joint write that needs a majority of the prior placement, and a killed voter stays a member of the configuration until it leaves, so with replication 2 and a dead holder in the prior placement, every later write for that task (a claim included) cannot be acknowledged. The blobs of such a task do follow the new placement; the claim does not go through until the dead voter leaves the configuration.
 
-Open: the failed-composite-member message. A composite page entry and `CompositeFinished.failure` should carry the run's `failure_message`, so a networked `TaskFailure.message` is non-empty for a failed composite member. It is pending the composite code, which is not in this branch yet. A failure message may hold task input, and it is stored in the replicated record.
+Open: with a replication factor of 2, writes stall while a record's holder is dead, until the record is placed again. A majority of two is both holders, so an even factor tolerates no more loss than the odd one below it.
+
+Open: `//runtime/tests:test_networked` is intermittent under load in the composite scenarios: a stopped leader's hand-over sometimes outlasts its timeout. It is not shown fixed.
+
+Open: a leader killed between a pipeline's stages can replay the pipeline's body when the election outlasts the abort deadline of the follower running it: the follower aborts the body when it has been out of contact with a leader for too long, and the new leader replays it, so the body's first run is `LOST`. This is the at-least-once guarantee, not a defect, but the test must allow it. Also worth examining: leader failover sometimes needs a second term (the survivors log `no seed answered a round` and then rejoin), which can exceed that deadline.
+
+Open: the docs pass after composites. The description of an implicit flow's lifetime (`Scheduler::end_continuation`, in the sections on coalescing and on leader-change reconciliation) and the exit criterion that says nothing over the network ends a continuation still describe the previous design, in which a worker ended a continuation itself; now the leader derives a continuation from the run that returned the step and ends it with the step. `RemoteResultUnavailableError` is still described as raised by every await on a networked worker, though a flow, group or returned step awaited there now runs on the leader.
 
 ### Phase 7: observability
 

@@ -161,8 +161,10 @@ Set `listen` and the worker joins a networked shard instead of running one of it
   that deadline, and kills its task process at the deadline.
 - Awaiting a task's result works as on one worker, inside task bodies too: the worker that runs the task
   delivers its result to the one that submitted it, and the handle settles once the leader certifies it.
-  If the result cannot reach the submitter, the await raises `ResultUnavailableError`. A task that
-  returns a flow, group or bound task fails with `TaskDefinitionError`. A result larger than the worker
+  If the result cannot reach the submitter, the await raises `ResultUnavailableError`. Flows, groups,
+  maps and tasks that return a flow, group or bound task run on a networked shard as on one worker:
+  the leader drives them, and the worker that submitted one hears when it is over (and re-reads its
+  record when the leader changes). A result larger than the worker
   can hold (`memory_hard_limit`, or half of it on a networked worker) fails the run with
   `ResultTooLargeError`; it is retried per `retries`.
 - `handle.cancel()` sends the cancel to the leader without waiting and returns `True`; the worker
@@ -236,6 +238,10 @@ certified it, or raises what the task raised.
 - A task declared `-> Flow`, `-> Group` or `-> BoundTask` may return one, which then runs as its
   continuation: the run is certified first, and the task's handle resolves to the continuation's
   results.
+
+Flows, groups, `.map` and returned steps run on a networked worker as on one node. A `collect_all`
+failure is a `TaskFailure` with its `kind` and `message`. A coalescing task cannot be a stage, and
+`kabudachi.` is a reserved task-name prefix.
 
 A stage that consumes the array of a `collect_all` group receives failures in it, so it needs a
 serializer that can encode them; the protobuf serializer cannot.
@@ -350,4 +356,7 @@ matters.
   with task processes, and the body is abandoned to finish on its own, holding its concurrency place
   until it does. An async body that raises `KeyboardInterrupt` there is taken as a Ctrl-C and stops
   the whole run.
-- On a networked worker no result comes back to the process that submitted the task.
+- A flow's later stage or a group's member that the scheduler refuses when it starts (the queue is
+  full, or memory is past its limit) is not queued to try again: it fails, and so does the flow if
+  its policy fails on a failed member. The failure is a `BackpressureError`, which can pass once the
+  shard has room.

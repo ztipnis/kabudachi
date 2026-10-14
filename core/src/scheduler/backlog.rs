@@ -2,18 +2,18 @@
 
 use std::collections::BTreeSet;
 
-use crate::protocol::ids::{IdGenerator, TaskId};
+use crate::protocol::ids::{CompositeId, IdGenerator, TaskId};
 use crate::time::Clock;
 
+use super::composite::{CompositeState, CompositeStatus, MemberCounts, SubmittedComposite};
 use super::{
-    CancelRejection, Cancellation, ContinuationRejection, Observer, Scheduler, Submission,
-    SubmitRejection, Submitted,
+    CancelRejection, Cancellation, Observer, Scheduler, Submission, SubmitRejection, Submitted,
 };
 
-/// What its scheduler could not take yet: submissions made before it led,
-/// and ends of continuations it refused for want of leadership. Once it
-/// leads, [`Self::hand_over`] ends the continuations, then records the
-/// submissions in the order they were made within a coalescing key. A
+/// What its scheduler could not take yet: submissions and composites made
+/// before it led. Once it leads, [`Self::hand_over`] records the
+/// submissions in the order they were made within a coalescing key, then the
+/// composites in the order they were made. A
 /// submission whose record would not yet fit (it carries the input of the
 /// generation it supersedes) stays here until a later hand-over finds room,
 /// and so do the later submissions of its key, which must not be recorded
@@ -24,10 +24,15 @@ use super::{
 pub struct Backlog {
     /// Submissions not yet recorded, in the order they were made.
     queued: Vec<Submitted>,
-    /// The input bytes `queued` holds.
+    /// Composites not yet recorded, in the order they were made.
+    queued_composites: Vec<SubmittedComposite>,
+    /// Composites cancelled before they were recorded, whose clients are told
+    /// once the scheduler leads: a scheduler that is taking over forgets what
+    /// it said before it did.
+    dropped_composites: Vec<SubmittedComposite>,
+    /// The input bytes `queued` holds, and the record bytes of
+    /// `queued_composites`.
     queued_bytes: u64,
-    /// Continuations whose end was refused, in the order they were refused.
-    unended: Vec<TaskId>,
 }
 
 /// The coalescing key a submission competes under: its task definition and
@@ -81,6 +86,62 @@ impl Backlog {
         Ok(task)
     }
 
+    /// Records or queues `minted`, a composite that already has its id, as
+    /// [`Self::submit_minted`] does a task: a scheduler that leads records it
+    /// now, after what waits here; otherwise it waits here, counted with
+    /// everything else waiting against the hard limit. A step that takes an
+    /// input is refused either way.
+    pub fn submit_composite<C: Clock, I: IdGenerator, O: Observer>(
+        &mut self,
+        scheduler: &mut Scheduler<C, I, O>,
+        minted: SubmittedComposite,
+    ) -> Result<CompositeId, SubmitRejection> {
+        if scheduler.is_leader() {
+            self.record_queued(scheduler);
+            scheduler.check_composite(&minted, self.queued_bytes)?;
+            return scheduler.submit_composite(minted);
+        }
+        scheduler.check_composite(&minted, self.queued_bytes)?;
+        self.queued_bytes += minted.memory_bytes();
+        let id = minted.composite_id.clone();
+        self.queued_composites.push(minted);
+        Ok(id)
+    }
+
+    /// Cancels the composite `id`: one still waiting here is dropped, so it
+    /// never runs, and its client is told it was cancelled once the scheduler
+    /// leads; any other is the scheduler's to cancel.
+    pub fn cancel_composite<C: Clock, I: IdGenerator, O: Observer>(
+        &mut self,
+        scheduler: &mut Scheduler<C, I, O>,
+        id: &CompositeId,
+    ) -> Result<Cancellation, CancelRejection> {
+        if let Some(at) = self.queued_composites.iter().position(|queued| queued.composite_id == *id) {
+            let dropped = self.queued_composites.remove(at);
+            self.queued_bytes -= dropped.memory_bytes();
+            self.dropped_composites.push(dropped);
+            return Ok(Cancellation::Cancelled { was_running: false });
+        }
+        scheduler.cancel_composite(id)
+    }
+
+    /// Where the composite `id` stands: one waiting here is running with all
+    /// its members pending.
+    pub fn composite_status<C: Clock, I: IdGenerator, O: Observer>(
+        &self,
+        scheduler: &Scheduler<C, I, O>,
+        id: &CompositeId,
+    ) -> Option<CompositeStatus> {
+        if let Some(waiting) = self.queued_composites.iter().find(|queued| queued.composite_id == *id) {
+            return Some(CompositeStatus {
+                state: CompositeState::Running,
+                next_stage: 0,
+                counts: MemberCounts { pending: waiting.step.stages.len() as u64, ..MemberCounts::default() },
+            });
+        }
+        scheduler.composite_status(id)
+    }
+
     /// Cancels `task`: one still waiting here is dropped, so it never runs,
     /// and answers `Cancelled` as a task that never started; any other is
     /// the scheduler's to cancel.
@@ -97,24 +158,7 @@ impl Backlog {
         scheduler.cancel(task)
     }
 
-    /// Ends the continuation of `task`. Refused for want of leadership, it
-    /// is kept and ended by the first hand-over once the scheduler leads,
-    /// so the task is not left continuing for ever; the refusal is still
-    /// returned.
-    pub fn end_continuation<C: Clock, I: IdGenerator, O: Observer>(
-        &mut self,
-        scheduler: &mut Scheduler<C, I, O>,
-        task: &TaskId,
-    ) -> Result<bool, ContinuationRejection> {
-        let ended = scheduler.end_continuation(task);
-        if ended.is_err() && !self.unended.contains(task) {
-            self.unended.push(task.clone());
-        }
-        ended
-    }
-
-    /// Once the scheduler leads: ends the continuations kept, which frees
-    /// the memory they held, then records what waits here. Does nothing
+    /// Once the scheduler leads: records what waits here. Does nothing
     /// while it does not lead. Call it after every change that may free
     /// capacity or a key.
     pub fn hand_over<C: Clock, I: IdGenerator, O: Observer>(
@@ -124,13 +168,10 @@ impl Backlog {
         if !scheduler.is_leader() {
             return;
         }
-        for task in std::mem::take(&mut self.unended) {
-            // `Ok(false)` is a task that finished or was cancelled meanwhile and has
-            // nothing to end; the scheduler leads (checked above), so `NotLeader`
-            // cannot occur.
-            let _ = scheduler.end_continuation(&task);
-        }
         self.record_queued(scheduler);
+        for dropped in std::mem::take(&mut self.dropped_composites) {
+            scheduler.announce_dropped(&dropped);
+        }
     }
 
     /// Whether a submission of `submission`'s coalescing key still waits here.
@@ -169,10 +210,18 @@ impl Backlog {
                 self.queued.push(kept);
             }
         }
+        for composite in std::mem::take(&mut self.queued_composites) {
+            // A composite the scheduler refuses (its record would not fit
+            // yet) stays here and the next hand-over tries again.
+            if scheduler.submit_composite(composite.clone()).is_err() {
+                self.queued_composites.push(composite);
+            }
+        }
         self.queued_bytes = self
             .queued
             .iter()
             .map(|submitted| submitted.submission.payload_bytes())
-            .sum();
+            .sum::<u64>()
+            + self.queued_composites.iter().map(SubmittedComposite::memory_bytes).sum::<u64>();
     }
 }

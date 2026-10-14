@@ -97,6 +97,15 @@ async fn a_worker_submits_claims_starts_and_completes_a_task_through_the_leader(
         assert_eq!(reject.reason, ClaimRejectReason::ClaimRejectNotMember as i32);
         shard.join_as_pending(&client, leader).await;
 
+        // An id that begins as a composite's record key would name one.
+        let mut keyed = submitted.clone();
+        keyed.task_id = TaskId::new("composite/x");
+        let refused = shard
+            .drive_until(client.submit(leader_id.clone(), keyed))
+            .await
+            .expect("the leader answered");
+        assert_eq!(reject_reason(&refused), Some(TaskRejectReason::TaskRejectMalformed));
+
         let answer = shard
             .drive_until(client.submit(leader_id.clone(), submitted.clone()))
             .await

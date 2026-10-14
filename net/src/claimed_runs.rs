@@ -11,6 +11,7 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::TaskRunId;
 use kabudachi_core::protocol::messages::Claim as WireClaim;
 use kabudachi_core::reconcile::{ReportedRun, ReportedState};
+use kabudachi_core::scheduler::composite::Step;
 use kabudachi_core::scheduler::{Claim, MAX_FAILURE_MESSAGE_BYTES};
 
 /// The most bytes of a failure kind a reconciliation reports. A failure kind
@@ -19,13 +20,15 @@ use kabudachi_core::scheduler::{Claim, MAX_FAILURE_MESSAGE_BYTES};
 const MAX_FAILURE_KIND_BYTES: usize = 256;
 
 /// What this worker last did to a run it claimed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HeldRun {
     Claimed,
     Running,
     /// It succeeded with this digest, its result reached the task's client
-    /// first if `delivered`, and no leader has certified it yet.
-    Completed { result_digest: Digest, delivered: bool },
+    /// first if `delivered`, and no leader has certified it yet. A run that
+    /// returned a step keeps it, so that a leader that never took the report
+    /// is told it again: the digest is the step's.
+    Completed { result_digest: Digest, delivered: bool, continuation: Option<Step> },
     /// It failed, and no leader has recorded the failure yet.
     Failed { failure_kind: String, failure_message: String },
 }
@@ -84,6 +87,7 @@ impl ClaimedRuns {
                 HeldRun::Completed {
                     result_digest,
                     delivered,
+                    ..
                 } => ReportedState::Succeeded {
                     result_digest: result_digest.clone(),
                     delivered: *delivered,
@@ -98,9 +102,14 @@ impl ClaimedRuns {
             };
             // The chain's generations have records of their own, and a
             // claim alone can fill a message.
+            let continuation = match &held.state {
+                HeldRun::Completed { continuation, .. } => continuation.clone(),
+                _ => None,
+            };
             let run = ReportedRun {
                 claim: Claim { chain: Vec::new(), ..claim },
                 state,
+                continuation,
             };
             if !take(run) {
                 return;

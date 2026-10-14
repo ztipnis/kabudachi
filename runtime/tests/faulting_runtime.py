@@ -30,6 +30,7 @@ class FaultingRuntime:
         self.native = native
         self.events = []
         self.submitted = []
+        self.claimed = []
         self.submit_options = []
         self.refuse_completion = False
         self.altered_digest = None
@@ -41,6 +42,9 @@ class FaultingRuntime:
         self.claim_error = None
         self.event_error = None
         self.hold_claims = False
+        # How many of the next `store_result` calls give up, as a shard with no
+        # leader does: they resolve to `None` and store nothing.
+        self.store_gives_up = 0
         self.submit_lingers_for = 0
         self._claims_given = 0
         self._injected = asyncio.Queue()
@@ -86,6 +90,7 @@ class FaultingRuntime:
             await asyncio.Event().wait()
         claims = await self.native.claim_pending(limit)
         self._claims_given += len(claims)
+        self.claimed.extend(claims)
         return claims
 
     def inject_event(self, kind, task_id="", **fields):
@@ -106,6 +111,9 @@ class FaultingRuntime:
                     "result_digest": b"",
                     "state": None,
                     "failure_kind": "",
+                    "failure_message": "",
+                    "composite_id": "",
+                    "parent_task_id": None,
                     **fields,
                 }
             )
@@ -191,14 +199,14 @@ class FaultingRuntime:
         self.events.append(("lost", task_run_id))
         return self.native.report_lost(task_run_id)
 
-    def complete(self, task_run_id, result_digest, continues=False, *, result=None):
+    def complete(self, task_run_id, result_digest=None, continuation=None, *, result=None):
         # `result` goes to a networked task's client; one-node, nowhere.
         self.events.append(("complete", task_run_id))
         if self.on_complete is not None:
             self.on_complete(task_run_id)
         if self.refuse_completion:
             raise RuntimeError("the run does not belong to this worker")
-        certification = self.native.complete(task_run_id, result_digest, continues)
+        certification = self.native.complete(task_run_id, result_digest, continuation)
         if self.after_certification is not None:
             # The leader has accepted the completion; the caller has not heard yet.
             self.after_certification(task_run_id)
@@ -210,9 +218,35 @@ class FaultingRuntime:
             )
         return certification
 
-    def end_continuation(self, task_id):
-        self.events.append(("end_continuation", task_id))
-        return self.native.end_continuation(task_id)
+    # Forwarded unchanged, but named here: `isinstance` against a runtime
+    # protocol looks only at the class, so `__getattr__` alone is not enough.
+
+    def submit_composite(self, tree):
+        return self.native.submit_composite(tree)
+
+    def cancel_composite(self, composite_id):
+        return self.native.cancel_composite(composite_id)
+
+    async def composite_status(self, composite_id):
+        return await self.native.composite_status(composite_id)
+
+    async def store_result(self, task_id, data):
+        if self.store_gives_up > 0:
+            self.store_gives_up -= 1
+            return None
+        return await self.native.store_result(task_id, data)
+
+    async def store_composite_payload(self, composite_id, data):
+        return await self.native.store_composite_payload(composite_id, data)
+
+    async def composite_results(self, composite_id):
+        return await self.native.composite_results(composite_id)
+
+    async def resolve_expansion(self, task_run_id):
+        return await self.native.resolve_expansion(task_run_id)
+
+    async def resolve_input(self, task_run_id):
+        return await self.native.resolve_input(task_run_id)
 
     def cancel(self, task_id):
         # Forwarded unchanged, but named here: `isinstance` against a runtime

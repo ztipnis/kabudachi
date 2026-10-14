@@ -2,8 +2,9 @@
 //! holds.
 
 use kabudachi_core::protocol::generated;
-use kabudachi_core::protocol::ids::{TaskId, TaskRunId};
+use kabudachi_core::protocol::ids::TaskRunId;
 use kabudachi_core::protocol::messages::{ReconcileReport, ReconcileRequest, reconcile_request};
+use kabudachi_core::task_record::RecordKey;
 use prost::encoding::message;
 
 use crate::claimed_runs::ClaimedRuns;
@@ -19,12 +20,14 @@ const LAST_BYTES: usize = 2;
 /// after the cursor, then the records it holds (from `held`) after it, as
 /// many as fit in one message. Whether `request` may be answered is not decided
 /// here (see `WorkerNode::may_answer_reconcile`); the answer decides nothing
-/// by itself.
+/// by itself. `None` for a request whose cursor names a record key this node
+/// cannot read: any page would say something false about what follows it
+/// (an empty last page reads as holding nothing more), so there is no answer.
 pub(crate) fn page_of(
     request: &ReconcileRequest,
     runs: &ClaimedRuns,
     held: &HeldRecords,
-) -> ReconcileReport {
+) -> Option<ReconcileReport> {
     let mut page = Page::default();
     let mut exhausted = true;
 
@@ -33,7 +36,15 @@ pub(crate) fn page_of(
         Some(reconcile_request::After::AfterRun(run)) => Some(TaskRunId::from(run.clone())),
         _ => None,
     };
-    let runs_sent = matches!(&request.after, Some(reconcile_request::After::AfterKey(_)));
+    let keys_after = match &request.after {
+        Some(reconcile_request::After::AfterKey(task)) => Some(RecordKey::Task(task.clone().into())),
+        Some(reconcile_request::After::AfterRecord(bytes)) => Some(RecordKey::from_kad_bytes(bytes)?),
+        _ => None,
+    };
+    let runs_sent = matches!(
+        &request.after,
+        Some(reconcile_request::After::AfterKey(_) | reconcile_request::After::AfterRecord(_))
+    );
     if !runs_sent {
         runs.reported_runs_after(runs_after.as_ref(), |run| {
             let fits = page.add_run(generated::ReportedRun::from(&run));
@@ -43,17 +54,13 @@ pub(crate) fn page_of(
     }
 
     if exhausted && !request.runs_only {
-        let keys_after = match &request.after {
-            Some(reconcile_request::After::AfterKey(task)) => Some(TaskId::from(task.clone())),
-            _ => None,
-        };
         exhausted = held.keys_after(keys_after.as_ref(), |key| {
             page.add_key(generated::HeldKey::from(&key))
         });
     }
 
     page.report.last = exhausted;
-    page.report
+    Some(page.report)
 }
 
 /// A page as items are added to it, so that it never outgrows one message.

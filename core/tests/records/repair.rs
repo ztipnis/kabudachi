@@ -6,7 +6,9 @@
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::task_record::{PlacedWrite, PriorPlacement, RecordVersion, Repair, Write, WriteOutcome};
+use kabudachi_core::task_record::{
+    PlacedWrite, PriorPlacement, RecordKey, RecordVersion, Repair, ShardRecord, Write, WriteOutcome,
+};
 use kabudachi_core::time::{Duration, Instant};
 
 const RETRY_AFTER: Duration = Duration::from_ticks(100);
@@ -38,7 +40,7 @@ fn record(task: &str, revision: u64, holders: &[&str]) -> TaskRecord {
 /// Notes `record` as written and returns the placements the write must reach
 /// besides its own.
 fn written(repair: &mut Repair, record: &TaskRecord) -> Vec<PriorPlacement> {
-    let mut placed = PlacedWrite::new(record.clone(), record.placement.len() / 2 + 1);
+    let mut placed = PlacedWrite::new(ShardRecord::Task(record.clone()), record.placement.len() / 2 + 1);
     repair.written(&mut placed, |_| true);
     placed.prior
 }
@@ -49,12 +51,12 @@ fn holders(ids: &[&str]) -> Vec<WorkerId> {
 }
 
 fn outcome(record: &TaskRecord, stored: bool) -> WriteOutcome {
-    WriteOutcome { write: Write::of(record), stored }
+    WriteOutcome { write: Write::of(&ShardRecord::Task(record.clone())), stored }
 }
 
 /// What `check` returns for a leader that leads, may place records on
 /// `placeable`, holds every task, and would place each on `holders`.
-fn check(repair: &mut Repair, placeable: &[&str], holders: &[&str], at: u64) -> Vec<TaskId> {
+fn check(repair: &mut Repair, placeable: &[&str], holders: &[&str], at: u64) -> Vec<RecordKey> {
     let placeable: Vec<WorkerId> = placeable.iter().map(|id| worker(id)).collect();
     let holders: Vec<WorkerId> = holders.iter().map(|id| worker(id)).collect();
     repair.check(true, true, &placeable, |_| true, |_| Some(holders.clone()), Instant::at(at))
@@ -76,7 +78,7 @@ fn a_refused_write_is_published_again_after_the_delay_even_while_the_scheduler_d
     let placeable = [worker("a"), worker("b")];
     assert!(repair.check(true, false, &placeable, |_| true, |_| None, Instant::at(120)).is_empty());
     assert_eq!(repair.wake_at(), None);
-    assert_eq!(check(&mut repair, &["a", "b"], &["a", "b"], 130), [TaskId::new("t")]);
+    assert_eq!(check(&mut repair, &["a", "b"], &["a", "b"], 130), [RecordKey::Task(TaskId::new("t"))]);
 }
 
 #[test]
@@ -91,7 +93,7 @@ fn with_no_room_under_the_writes_in_flight_nothing_is_due_and_the_driver_is_not_
     assert!(check(&mut repair, &["a"], &["a"], 500).is_empty(), "64 writes are in flight");
     assert_eq!(repair.wake_at(), None, "an outcome will wake the driver, a past instant would spin it");
     repair.settled(&outcome(&records[0], true), Instant::at(501));
-    assert_eq!(check(&mut repair, &["a"], &["a"], 502), [TaskId::new("t064")]);
+    assert_eq!(check(&mut repair, &["a"], &["a"], 502), [RecordKey::Task(TaskId::new("t064"))]);
 }
 
 #[test]
@@ -109,7 +111,7 @@ fn a_change_of_voters_republishes_moved_records_a_bounded_number_at_a_time_and_o
     let batch = check(&mut repair, &["a", "c"], &["a", "c"], 1);
     assert_eq!(batch.len(), 64, "no more than fit under the limit");
     let republished: Vec<TaskRecord> =
-        batch.iter().map(|task| record(task.as_str(), 1, &["a", "c"])).collect();
+        batch.iter().map(|task| record(&String::from_utf8_lossy(&task.kad_bytes()), 1, &["a", "c"])).collect();
     for again in &republished {
         written(&mut repair, again);
     }
@@ -135,7 +137,7 @@ fn a_placement_a_record_moves_from_is_reached_only_at_the_holders_still_in_the_c
 
     // `b` and `c` left the configuration but still answer: they are not asked,
     // and so cannot stand in for `a`, the one holder that can know the record.
-    let mut moved = PlacedWrite::new(record("t", 1, &["a", "d", "e"]), 2);
+    let mut moved = PlacedWrite::new(ShardRecord::Task(record("t", 1, &["a", "d", "e"])), 2);
     repair.written(&mut moved, |holder| *holder != worker("b") && *holder != worker("c"));
 
     assert_eq!(moved.prior, [PriorPlacement { holders: holders(&["a"]), quorum: 1 }]);

@@ -1,10 +1,9 @@
 //! What a new leader decides from its shard's answers while it reconciles.
 
 use crate::election::WorkerNode;
-use crate::protocol::generated::TaskRecord;
 use crate::protocol::ids::WorkerId;
 use crate::reconcile::{Rebuild, ReconcileRound, ReconcileTerm, Republish};
-use crate::task_record::{PlacedWrite, WriteOutcome};
+use crate::task_record::{PlacedWrite, ShardRecord, WriteOutcome};
 use crate::time::{Clock, Duration, Instant};
 
 use super::RecordPorts;
@@ -17,7 +16,7 @@ pub(crate) enum Progress {
     Rebuild(Rebuild),
     /// The rebuilt scheduler's records are to be placed on the voters and
     /// written again: an earlier attempt could not place them all.
-    Place(Vec<TaskRecord>),
+    Place(Vec<ShardRecord>),
     /// The voters changed while records are still to be stored: place them
     /// on the new voters (see [`OfficeReconciliation::re_place`]).
     RePlace,
@@ -32,7 +31,7 @@ pub(crate) enum Stuck {
     /// The scheduler did not take the rebuild.
     Rebuild(Rebuild),
     /// These records could not all be placed on the voters.
-    Place(Vec<TaskRecord>),
+    Place(Vec<ShardRecord>),
 }
 
 impl Stuck {
@@ -258,7 +257,10 @@ impl OfficeReconciliation {
         }
         self.news = false;
         let learnt = self.round.take_settled(|worker| node.is_member(worker));
-        let teaches = !learnt.records.is_empty() || !learnt.reports.is_empty();
+        let teaches = !learnt.records.is_empty()
+            || !learnt.composites.is_empty()
+            || !learnt.pages.is_empty()
+            || !learnt.reports.is_empty();
         teaches.then_some(Progress::Learnt(learnt))
     }
 

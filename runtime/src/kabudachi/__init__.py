@@ -13,6 +13,7 @@ from kabudachi.errors import (
     PayloadTooLargeError,
     ResultTooLargeError,
     ResultUnavailableError,
+    TaskFailure,
     TaskOrphanedError,
     TaskOutcomeError,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "RunContext",
     "RunInfo",
     "task",
+    "TaskFailure",
     "TaskHandle",
     "TaskOrphanedError",
     "TaskOutcomeError",

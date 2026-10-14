@@ -7,20 +7,17 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 
-use kabudachi_core::protocol::generated::TaskRecord;
-use kabudachi_core::protocol::ids::{TaskId, WorkerId};
+use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::task_record::{
-    PlacedWrite, RecordVersion, VersionOrder, Write, WriteOutcome, identify,
+    PlacedWrite, RecordKey, RecordVersion, ShardRecord, VersionOrder, Write, WriteOutcome,
 };
 use libp2p::kad::store::RecordStore as _;
 use libp2p::{PeerId, Swarm, kad};
-use prost::Message as _;
 use tokio::sync::oneshot;
 
 use self::blobs::BlobRead;
 use super::{HandOffWrite, Inbound, PutBlobError, RecordLookup};
 use crate::swarm::Behaviour;
-use crate::task_store::record_key;
 
 mod blobs;
 
@@ -76,7 +73,7 @@ impl RecordQueries {
             return;
         };
         let value = placed.record.encode_to_vec();
-        let key = record_key(&write.task_id);
+        let key = kad::RecordKey::new(&write.key.kad_bytes());
         // This worker's own copy first, so its acknowledgement counts for
         // each placement it belongs to.
         let goes_here = placed
@@ -130,7 +127,7 @@ impl RecordQueries {
             let _ = respond_to.send(false);
             return;
         };
-        let Ok((task, _)) = identify(&write.record) else {
+        let Ok((key, _)) = write.record.identify() else {
             let _ = respond_to.send(false);
             return;
         };
@@ -144,20 +141,20 @@ impl RecordQueries {
             let _ = respond_to.send(false);
             return;
         };
-        let mut record = kad::Record::new(record_key(&task), write.record.encode_to_vec());
+        let mut record = kad::Record::new(kad::RecordKey::new(&key.kad_bytes()), write.record.encode_to_vec());
         record.publisher = Some(local);
         let query = records.put_record_to(record, remote.into_iter(), kad::Quorum::N(needed));
         self.hand_offs.insert(query, respond_to);
     }
 
-    /// Starts a lookup of `task`'s record, answered with the newest revision
-    /// any holder returns; at once unanswered when this `Net` stores no
-    /// shard's records.
+    /// Starts a lookup of the record `key` names, answered with the newest
+    /// revision any holder returns; at once unanswered when this `Net` stores
+    /// no shard's records.
     pub(super) fn start_read(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
-        task: TaskId,
-        respond_to: oneshot::Sender<RecordLookup>,
+        key: RecordKey,
+        respond_to: oneshot::Sender<RecordLookup<ShardRecord>>,
     ) {
         match swarm.behaviour_mut().records.as_mut() {
             Some(records) => {
@@ -165,10 +162,11 @@ impl RecordQueries {
                     .kbuckets()
                     .flat_map(|bucket| bucket.iter().map(|entry| *entry.node.key.preimage()).collect::<Vec<_>>())
                     .collect();
-                let query = records.get_record(record_key(&task));
+                let query = records.get_record(kad::RecordKey::new(&key.kad_bytes()));
                 self.reads.insert(
                     query,
                     Read {
+                        key,
                         best: None,
                         known,
                         respond_to,
@@ -230,7 +228,7 @@ impl RecordQueries {
         match result {
             Err(error) => {
                 tracing::debug!(
-                    task = unfinished.write.task_id.as_str(),
+                    key = ?unfinished.write.key,
                     %error,
                     "a record write did not reach its quorum"
                 );
@@ -336,22 +334,28 @@ struct UnfinishedWrite {
 
 /// A record lookup collecting the answers of its `kad` query.
 struct Read {
+    /// The record looked up.
+    key: RecordKey,
     /// The newest answer so far, with its version.
-    best: Option<(RecordVersion, TaskRecord)>,
+    best: Option<(RecordVersion, ShardRecord)>,
     /// The peers in this worker's routing table when the lookup started.
     known: HashSet<PeerId>,
-    respond_to: oneshot::Sender<RecordLookup>,
+    respond_to: oneshot::Sender<RecordLookup<ShardRecord>>,
 }
 
 impl Read {
-    /// Keeps `value` if it decodes to a record newer than the best so far.
+    /// Keeps `value` if it decodes to the record looked up, and is newer than
+    /// the best so far.
     fn offer(&mut self, value: &[u8]) {
-        let Ok(record) = TaskRecord::decode(value) else {
+        let Ok(record) = ShardRecord::decode(&self.key, value) else {
             return;
         };
-        let Ok((_, version)) = identify(&record) else {
+        let Ok((key, version)) = record.identify() else {
             return;
         };
+        if key != self.key {
+            return;
+        }
         let newer = self
             .best
             .as_ref()

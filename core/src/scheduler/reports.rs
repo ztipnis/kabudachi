@@ -1,5 +1,7 @@
 //! What a worker reports about a run it holds: that it started, and that it succeeded, with its result's
-//! digest, and how a certified run's continuation ends.
+//! digest, and the step a certified run returned.
+
+use prost::Message as _;
 
 use crate::protocol::digest::Digest;
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
@@ -8,7 +10,8 @@ use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, WallTime};
 
-use super::{Observer, Scheduler};
+use super::composite::Step;
+use super::{CONTINUATION_TOO_LARGE, Observer, Scheduler, UNVERSIONED};
 
 /// The leader's word that a run's result is the authoritative one. Until a
 /// client holds this, result bytes it received are only provisional.
@@ -20,15 +23,18 @@ pub struct Certification {
 }
 
 /// Whether a certified run ends its task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Completion {
     /// The task is over: its coalescing key is freed, its payload stops
     /// counting, and it is forgotten `result_ttl` later.
     Final,
-    /// The result is a continuation (an implicit flow): the run
-    /// is certified, but the task holds its key and its memory until
-    /// [`Scheduler::end_continuation`].
-    Continues,
+    /// The run returned `step`: it is certified with the step's digest as its
+    /// result, and the step is stored on the run itself
+    /// (`TaskRun.continuation`), in the revision that certifies it. The step
+    /// runs as a composite (`CompositeId::continuation_of(run)`) derived from
+    /// that run. The task keeps its coalescing key and its memory until that
+    /// composite is over, and then finishes.
+    Continues(Step),
 }
 
 /// Why a worker's report about a run was refused.
@@ -43,13 +49,10 @@ pub enum ReportRejection {
     /// The run's task has a newest record this leader cannot know yet: ask again.
     #[error("the run's task is not known for certain yet")]
     NotReady,
-}
-
-/// Why ending a continuation was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ContinuationRejection {
-    #[error("this node is not the leader")]
-    NotLeader,
+    /// The step the run returned would take the task's record past the
+    /// largest a record may be, so the run failed instead.
+    #[error("the step the run returned does not fit the task's record")]
+    ContinuationTooLarge,
 }
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
@@ -157,16 +160,34 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     ) -> Result<Certification, ReportRejection> {
         let now = self.clock.now();
         let stamped_at = WallTime::now(&self.clock);
+        self.owned_run(worker, run_id, TaskRunState::Running)?;
+        if let Completion::Continues(step) = &completion {
+            if step.digest() != result_digest {
+                return Err(ReportRejection::NotAuthoritative);
+            }
+            if self.continuation_overflows(run_id, step, &result_digest, stamped_at) {
+                // The same body would return the same step, so no retry.
+                self.fail_for_good(worker, run_id, CONTINUATION_TOO_LARGE);
+                return Err(ReportRejection::ContinuationTooLarge);
+            }
+        }
         let run = self.owned_run(worker, run_id, TaskRunState::Running)?;
         run.transition_to(TaskRunState::Succeeded, stamped_at)
             .expect("a Running run can always succeed");
         run.result_digest = Some(result_digest.clone().into());
         run.delivered = delivered;
+        // The step is part of the run, so the revision that certifies the run
+        // commits the step with it: a leader that loses everything else still
+        // finds it here.
+        if let Completion::Continues(step) = &completion {
+            run.continuation = Some(step.into());
+        }
         let task_id = run.task_id();
         self.mark_decided(run_id);
         match completion {
-            Completion::Continues => {
+            Completion::Continues(_) => {
                 self.continuing.insert(task_id.clone());
+                self.commit_continuation(&task_id, run_id);
             }
             Completion::Final => self.record_finished(&task_id, now),
         }
@@ -177,19 +198,48 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         })
     }
 
-    /// The continuation of `task_id` is over, however it ended: the task is
-    /// finished after all. Says whether it had a continuation to end, so
-    /// ending twice, or a task with none, changes nothing.
-    pub fn end_continuation(&mut self, task_id: &TaskId) -> Result<bool, ContinuationRejection> {
-        if !self.check_leader() {
-            return Err(ContinuationRejection::NotLeader);
-        }
-        let had_one = self.finish_continuation(task_id);
-        self.end_call();
-        Ok(had_one)
+    /// Whether the record of `run_id`'s task would pass the record limit once
+    /// the run is certified carrying `step`, measured on the record with the
+    /// certified run in place.
+    fn continuation_overflows(
+        &self,
+        run_id: &TaskRunId,
+        step: &Step,
+        result_digest: &Digest,
+        stamped_at: WallTime,
+    ) -> bool {
+        let task_id = self.runs[run_id].task_id();
+        let mut record = self.record_of(&task_id, UNVERSIONED, stamped_at);
+        let certified = record
+            .runs
+            .iter_mut()
+            .find(|run| run.task_run_id() == *run_id)
+            .expect("a task's record holds each of its runs");
+        certified
+            .transition_to(TaskRunState::Succeeded, stamped_at)
+            .expect("a Running run can always succeed");
+        certified.result_digest = Some(result_digest.clone().into());
+        certified.continuation = Some(step.into());
+        record.encoded_len() as u64 > Self::record_limit()
     }
 
-    fn finish_continuation(&mut self, task_id: &TaskId) -> bool {
+    /// The step a certified run returned, read from the run.
+    pub fn continuation_of_run(&self, run: &TaskRunId) -> Option<Step> {
+        let description = self.runs.get(run)?.continuation.as_ref()?;
+        match Step::try_from(description) {
+            Ok(step) => Some(step),
+            Err(malformed) => {
+                // A leader wrote it from a step it had validated, so this is a bug.
+                tracing::error!(run = run.as_str(), %malformed, "a run's stored step cannot be read");
+                None
+            }
+        }
+    }
+
+    /// `task_id`'s continuation is over, however it ended: the task is
+    /// finished after all. Says whether it had a continuation to end, so
+    /// ending twice, or a task with none, changes nothing.
+    pub(super) fn finish_continuation(&mut self, task_id: &TaskId) -> bool {
         if !self.continuing.remove(task_id) {
             return false;
         }

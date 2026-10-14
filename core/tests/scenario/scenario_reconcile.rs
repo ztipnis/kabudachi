@@ -44,11 +44,16 @@ fn advance_until(cluster: &mut Cluster, reached: impl Fn(&Cluster) -> bool) {
 /// elected a leader and it leads; returns it.
 pub(crate) fn leader_loss(cluster: &mut Cluster, leader: &WorkerId) -> WorkerId {
     cut_off(cluster, leader);
-    advance_until(cluster, |cluster| new_leader(cluster, leader).is_some());
-    new_leader(cluster, leader).expect("the others elected a leader")
+    await_new_leader(cluster, leader)
 }
 
-fn cut_off(cluster: &mut Cluster, leader: &WorkerId) {
+/// Advances until a node other than `deposed` leads; returns it.
+pub(crate) fn await_new_leader(cluster: &mut Cluster, deposed: &WorkerId) -> WorkerId {
+    advance_until(cluster, |cluster| new_leader(cluster, deposed).is_some());
+    new_leader(cluster, deposed).expect("the others elected a leader")
+}
+
+pub(crate) fn cut_off(cluster: &mut Cluster, leader: &WorkerId) {
     let rest: BTreeSet<WorkerId> = cluster
         .node_ids()
         .into_iter()
@@ -75,7 +80,7 @@ fn mute(cluster: &Cluster, workers: &[WorkerId], muted: bool) {
 }
 
 /// The newest revision of `task` any node holds.
-fn newest_record(cluster: &Cluster, task: &TaskId) -> Option<TaskRecord> {
+pub(crate) fn newest_record(cluster: &Cluster, task: &TaskId) -> Option<TaskRecord> {
     cluster
         .node_ids()
         .iter()

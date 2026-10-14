@@ -27,6 +27,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             link,
             finished,
             retained_chain,
+            retained_by_composite,
             ..
         } = record;
         let (Some(task), Some(current)) = (task, runs.last().map(TaskRunRecord::task_run_id))
@@ -41,7 +42,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.waiting
                 .admit(&task_id, &task.queue, now, not_before, expires_at);
         }
-        if finished {
+        if finished && retained_by_composite {
+            self.retention.hold(&task_id, now);
+        } else if finished {
             self.retention.record(&task_id, now);
         } else {
             self.count_unfinished(&task_id, &task, &retained_chain, state);

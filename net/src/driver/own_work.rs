@@ -5,7 +5,7 @@ use kabudachi_core::task_record::Settled;
 use kabudachi_core::time::{Clock, WallTime};
 use tokio::time::Instant as TokioInstant;
 
-use super::answers::{Deciding, HeldAnswer, Local, task_named};
+use super::answers::{Deciding, HeldAnswer, Local, record_named};
 use crate::claim;
 use crate::executor::{Executing, OwnAnswer, RunReport, granted};
 use crate::task_exchange;
@@ -120,7 +120,7 @@ fn decide_own_report<C: Clock, I: IdGenerator>(
     clock: &C,
     local: &mut Local,
 ) {
-    let named = task_named(deciding.scheduler, &request);
+    let named = record_named(deciding.scheduler, &request);
     deciding.net.note_sending(&request);
     let response = task_exchange::answer(
         deciding.scheduler,
@@ -130,7 +130,7 @@ fn decide_own_report<C: Clock, I: IdGenerator>(
     );
     deciding.hold(
         HeldAnswer::Own(OwnAnswer::Report { request, response }),
-        named.as_ref(),
+        named,
         local,
     );
 }

@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::election::ElectionTimings;
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
@@ -346,6 +347,7 @@ fn reported(claim: &Claim, state: ReportedState) -> ReportedRun {
             ..claim.clone()
         },
         state,
+        continuation: None,
     }
 }
 
@@ -1391,9 +1393,9 @@ fn a_claim_whose_key_another_installed_generation_holds_is_not_rebuilt() {
         })
         .unwrap();
 
-    assert!(new.scheduler.holds(&holder));
+    assert!(new.scheduler.holds(&RecordKey::Task(holder.clone())));
     assert!(
-        !new.scheduler.holds(&later),
+        !new.scheduler.holds(&RecordKey::Task(later.clone())),
         "a generation claimed while the key's records say another holds it is not rebuilt"
     );
 }
@@ -1438,7 +1440,7 @@ fn a_compaction_claim_is_not_rebuilt_over_the_compaction_its_key_records_name() 
         .unwrap();
 
     assert!(
-        !new.scheduler.holds(&stranger.task.task_id()),
+        !new.scheduler.holds(&RecordKey::Task(stranger.task.task_id())),
         "the key's compaction is the one its records name"
     );
 }
@@ -1475,7 +1477,7 @@ fn a_finished_generation_is_installed_though_the_record_of_the_one_it_absorbed_i
         rebuilt.uncertain, 0,
         "a finished generation's supersession is over, whatever became of the older record"
     );
-    assert!(new.scheduler.holds(&newer));
+    assert!(new.scheduler.holds(&RecordKey::Task(newer.clone())));
 }
 
 #[test]
@@ -1525,7 +1527,7 @@ fn a_generation_whose_predecessor_a_compaction_folded_is_installed_without_that_
         rebuilt.uncertain, 0,
         "the folded generations were released with the compaction"
     );
-    assert!(new.scheduler.holds(&waiting));
+    assert!(new.scheduler.holds(&RecordKey::Task(waiting.clone())));
 }
 
 #[test]

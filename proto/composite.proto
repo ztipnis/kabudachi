@@ -1,0 +1,143 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+import "digest.proto";
+import "task.proto";
+import "task_record.proto";
+import "blob.proto";
+import "step.proto";
+
+enum CompositeState {
+  COMPOSITE_STATE_UNSPECIFIED = 0;
+  COMPOSITE_STATE_RUNNING = 1;
+  COMPOSITE_STATE_SUCCEEDED = 2;
+  COMPOSITE_STATE_FAILED = 3;
+  COMPOSITE_STATE_CANCELLED = 4;
+}
+
+// How a nested composite's input decodes: one value, encoded by
+// `value_of`'s serializer, or a list whose entries name their own producers.
+message InputShape {
+  oneof shape {
+    TaskDefinitionId value_of = 1;
+    bool list = 2;
+  }
+}
+
+// How many members are in each state.
+message MemberCounts {
+  uint64 pending = 1;
+  uint64 succeeded = 2;
+  uint64 failed = 3;
+  uint64 cancelled = 4;
+  // Members whose current run is claimed or started, which `pending` leaves
+  // out. Only as of the revision that carries it.
+  uint64 running = 5;
+}
+
+// The outcome of one stage or member.
+message CompositeEntry {
+  uint64 index = 1;
+  oneof outcome {
+    // The digest of the result blob.
+    Digest value = 2;
+    Failure failure = 3;
+    // The member was itself a composite: its results are that composite's.
+    CompositeId child = 4;
+  }
+  // The task whose serializer encoded `value`.
+  TaskDefinitionId producer = 5;
+}
+
+// Everything the shard knows about one composite, written whole by its
+// leader on every change, like a Task record. Member outcomes live in
+// pages, so a large group stays out of this record.
+message CompositeRecord {
+  RecordVersion version = 1;
+  CompositeId composite_id = 2;
+  // Never changes after the first revision.
+  StepDescription description = 3;
+  // The worker told when it finishes; unset when nobody waits for it.
+  WorkerId client = 4;
+  oneof parent {
+    // A stage or member of this composite, at `parent_index`.
+    CompositeId parent_composite = 5;
+    // The continuation of this task's certified run.
+    TaskId parent_task = 6;
+  }
+  uint64 parent_index = 7;
+  // What a nested composite takes: the previous stage's result.
+  Manifest input = 8;
+  InputShape input_shape = 9;
+  CompositeState state = 10;
+  // A flow's stage that runs, or runs next.
+  uint64 next_stage = 11;
+  MemberCounts counts = 12;
+  // How many pages its member outcomes take.
+  uint32 pages = 13;
+  // Why it failed: the first failure that ended it.
+  Failure failure = 14;
+  WallTime submitted_at = 15;
+  repeated WorkerId placement = 16;
+  repeated PlacementHolders prior_placements = 17;
+  WallTime published_at = 18;
+  // The composite is over: nothing in it changes again.
+  bool finished = 19;
+  // The root of the step tree this composite is part of: the submitted
+  // composite, or the continuation a run returned. It owns the blobs of
+  // every large value bound anywhere in the tree, and its record is held
+  // unfinished until the whole tree is over. Its own id on the root.
+  CompositeId root = 23;
+}
+
+// Up to 1024 member outcomes of one composite: page `index` holds members
+// `index * 1024` up to the next page's first, each entry once it settled.
+message CompositePage {
+  RecordVersion version = 1;
+  CompositeId composite_id = 2;
+  uint32 index = 3;
+  repeated CompositeEntry entries = 4;
+  repeated WorkerId placement = 5;
+  repeated PlacementHolders prior_placements = 6;
+  WallTime published_at = 7;
+  bool finished = 8;
+}
+
+// The input of an expansion run: a list another stage returned, to split
+// into one blob per item. Field 3 of `then` is left for reduce.
+message Expansion {
+  Manifest source = 1;
+  oneof then {
+    // Run this task on every item, as a map.
+    BoundTaskStep map = 2;
+  }
+  // The task whose serializer encoded the list.
+  TaskDefinitionId producer = 4;
+  OnError on_error = 5;
+}
+
+// A client asks the leader to run a composite. The id and submission time
+// are fixed before any leader sees it, so asking again names the same one.
+message SubmitComposite {
+  CompositeId composite_id = 1;
+  WallTime submitted_at = 2;
+  StepDescription description = 3;
+  WorkerId client = 4;
+}
+
+message CompositeAccepted {
+  CompositeId composite_id = 1;
+}
+
+// The leader tells a composite's client it is over.
+message CompositeFinished {
+  CompositeId composite_id = 1;
+  CompositeState state = 2;
+  // The composite's pages, in order.
+  Manifest results = 3;
+  Failure failure = 4;
+  // Set when the composite is a task's continuation: that task's handle
+  // resolves to these results.
+  TaskId parent_task = 5;
+}

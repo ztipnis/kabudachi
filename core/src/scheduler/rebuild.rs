@@ -5,8 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::protocol::generated::TaskRecord;
-use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
+use crate::protocol::generated::{CompositePage, CompositeRecord, TaskRecord};
+use crate::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::reconcile::{Rebuild, ReconcileTerm};
 use crate::time::{Clock, WallTime};
@@ -109,8 +109,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let Rebuild {
             records,
+            composites,
+            pages,
             uncertain,
             uncertain_keys,
+            uncertain_composites,
             reports,
         } = rebuild;
         self.clear_tasks();
@@ -118,13 +121,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             reports.keys().cloned().collect(),
             uncertain,
             uncertain_keys,
+            uncertain_composites,
         );
         self.install_settled(records, false);
+        self.install_composites(composites, pages, false);
         // What applying the reports did (runs lost, certified or failed) is
         // not reported back: the caller learns of it from the revisions the
         // scheduler publishes and from the events it queues.
         let mut applied = Adopted::default();
         self.apply_reports(reports, &mut applied);
+        self.recover_composites();
         let republished = if self
             .leadership
             .may_publish_under(office.recovery_epoch, office.term)
@@ -167,8 +173,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let Rebuild {
             records,
+            composites,
+            pages,
             uncertain,
             uncertain_keys,
+            uncertain_composites,
             reports,
         } = learnt;
         let tasks = &self.tasks;
@@ -180,6 +189,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let mut adopted = Adopted::default();
         let installed = self.install_settled(candidates, true);
         adopted.installed = installed.len();
+        let learnt_composites = self.install_composites(composites, pages, true);
+        let held = &self.composites.held;
+        self.reconciliation
+            .learn_composites(&learnt_composites, uncertain_composites, |id| held.contains_key(id));
         let reporters: BTreeSet<WorkerId> = reports.keys().cloned().collect();
         for worker in &reporters {
             self.silent.remove(worker);
@@ -193,6 +206,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             }
         }
         self.apply_reports(reports, &mut adopted);
+        self.recover_composites();
         adopted.silent_holders = self
             .holders_of(installed.iter())
             .difference(&answered)
@@ -260,6 +274,51 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         installed
     }
 
+    /// Holds the composites of `composites`, each with the outcomes of its
+    /// `pages`; when `late`, a composite held already is kept as this leader
+    /// decided it, and takes only the outcomes of its pages it has none for.
+    /// Returns the composites whose records or pages are held now.
+    fn install_composites(
+        &mut self,
+        composites: Vec<CompositeRecord>,
+        pages: Vec<CompositePage>,
+        late: bool,
+    ) -> Vec<CompositeId> {
+        let now = self.clock.now();
+        let mut pages_of: BTreeMap<CompositeId, Vec<CompositePage>> = BTreeMap::new();
+        for page in pages {
+            if let Some(id) = page.composite_id.clone() {
+                pages_of.entry(CompositeId::from(id)).or_default().push(page);
+            }
+        }
+        let mut installed = Vec::new();
+        for record in composites {
+            let Some(id) = record.composite_id.clone().map(CompositeId::from) else {
+                continue;
+            };
+            let pages = pages_of.remove(&id).unwrap_or_default();
+            if late && self.composites.held.contains_key(&id) {
+                self.learn_pages(&id, &pages);
+                installed.push(id);
+            } else if self.install_composite(record, &pages, now) {
+                // Written again at the office's term, as every installed
+                // Task record is.
+                self.composites.mark_unpublished(&id);
+                installed.push(id);
+            }
+        }
+        // Pages that came without their composite's record.
+        for (id, pages) in pages_of {
+            if late && self.composites.held.contains_key(&id) {
+                self.learn_pages(&id, &pages);
+                installed.push(id);
+            }
+        }
+        self.release_orphaned_members();
+        self.update_pressure();
+        installed
+    }
+
     /// Forgets every task, run and what hangs on them, keeping the result
     /// TTL and the memory limits.
     fn clear_tasks(&mut self) {
@@ -271,6 +330,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.retention.clear();
         self.occupancy.clear();
         self.budget.reset_usage();
+        self.member_inputs.clear();
         self.continuing.clear();
         self.losses.clear();
         self.input_digests.clear();
@@ -283,5 +343,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.failed_compactions.clear();
         self.turns.clear();
         self.running.clear();
+        self.composites.clear();
     }
 }

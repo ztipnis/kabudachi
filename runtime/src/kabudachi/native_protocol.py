@@ -31,6 +31,13 @@ class Claim(Protocol):
     client: str | None
     """The worker awaiting the result; `None` for a task nobody awaits across
     workers."""
+    composite_id: str | None
+    """The composite this task is a stage or member of; `None` for a task that is not."""
+    composite_index: int
+    """Which stage or member of its composite this task is; 0 when it is none."""
+    expansion: bool
+    """Whether this is an expansion run: its input is a list a map is to be
+    split over, and it reports the map that results."""
 
 
 class Event(Protocol):
@@ -53,9 +60,23 @@ class Event(Protocol):
     """For `EventKind.CERTIFIED`: the digest the leader certified."""
     state: Any
     """For `EventKind.OUTCOME`: the `RunState` the task's run ended in;
-    `None` when the shard does not know the task."""
+    `None` when the shard does not know the task. For
+    `EventKind.COMPOSITE_FINISHED`: how the composite ended, `"succeeded"`,
+    `"failed"` or `"cancelled"`."""
     failure_kind: str
-    """For `EventKind.OUTCOME`: the error's type name, when the run failed."""
+    """For `EventKind.OUTCOME` and `EventKind.COMPOSITE_FINISHED`: the
+    error's type name, when the run or composite failed."""
+    failure_message: str
+    """For `EventKind.COMPOSITE_FINISHED`: the error's message, when the
+    composite failed."""
+    failure_task_id: str | None
+    """For `EventKind.COMPOSITE_FINISHED`: the task whose run raised the error
+    that ended the composite, when a run did."""
+    composite_id: str
+    """For `EventKind.COMPOSITE_FINISHED`: the composite that is over."""
+    parent_task_id: str | None
+    """For `EventKind.COMPOSITE_FINISHED`: the task that returned the
+    composite as its continuation; `None` for a composite submitted directly."""
 
 
 class Certification(Protocol):
@@ -269,14 +290,16 @@ class Runtime(Protocol):
     def complete(
         self,
         task_run_id: str,
-        result_digest: bytes,
-        continues: bool = False,
+        result_digest: bytes | None = None,
+        continuation: Any = None,
         *,
         result: bytes | None = None,
     ) -> Certification | None:
         """Reports that a running run succeeded; its certification. `None`
-        when the leader decides elsewhere. `result`, on a networked worker, is
-        delivered to the task's client before the report."""
+        when the leader decides elsewhere. Give the `result_digest`, or, for
+        a task that returned a step, the `continuation` tree
+        `_native.describe_step` encodes, not both. `result`, on a networked
+        worker, is delivered to the task's client before the report."""
 
     def task_run_state(self, task_run_id: str) -> Any:
         """The state of a run this runtime decides, or None. Only a runtime
@@ -291,5 +314,54 @@ class Runtime(Protocol):
         """Reports the fold of a compaction run; whether the leader applied
         it. `None` when the leader decides elsewhere."""
 
-    def end_continuation(self, task_id: str) -> bool:
-        """Ends the continuation of a task that returned a step; whether there was one."""
+    def submit_composite(self, tree: Any) -> str:
+        """Records the composite `tree` describes, as `_native.describe_step`
+        encodes it, and returns its id. Before this worker leads the
+        composite is queued, as a task is. The runtime reports its end as an
+        `EventKind.COMPOSITE_FINISHED` event. Raises `ValueError` for a step
+        the leader would not accept or one that takes an input, and
+        `BackpressureError` past the hard memory limit."""
+
+    def cancel_composite(self, composite_id: str) -> CancelOutcome | None:
+        """Cancels a composite and every member it has started; one still
+        queued for want of a leader is dropped. Raises `RuntimeError` when this
+        worker is not the leader and the composite is not queued. `None`: the
+        cancel was sent, and the leader decides."""
+
+    async def composite_status(
+        self, composite_id: str
+    ) -> tuple[str, int, int, int, int, int, int] | None:
+        """A composite's state, the stage it is on, and the number of its
+        members pending, running, succeeded, failed and cancelled; `None` when the
+        runtime holds no such composite. Awaited, since a networked runtime
+        asks its shard."""
+
+    async def store_result(self, task_id: str, data: bytes) -> bytes | None:
+        """Stores `data` as the blobs of a task's result and gives the digest
+        to certify it by; `None` if a networked shard could not take it in time,
+        in which case the run is to be reported lost. Raises
+        `BackpressureError` past the hard memory limit."""
+
+    async def store_composite_payload(self, composite_id: str, data: bytes) -> Any:
+        """Stores `data` as blobs the composite owns and gives its opaque
+        manifest, which goes into a tree as `("manifest", manifest)`. Raises
+        `BackpressureError` past the hard memory limit."""
+
+    async def composite_results(self, composite_id: str) -> Any:
+        """A composite's results in order: `("list", [...])` of `("value",
+        producer_definition_id, bytes)`, `("failure", kind, message, task_id)` and
+        nested lists. Raises `RuntimeError` when a result is no longer held."""
+
+    async def resolve_expansion(self, task_run_id: str) -> Any:
+        """The list the expansion run `task_run_id` is to split, as
+        `composite_results` has a list: `("value", producer_definition_id,
+        bytes)` of the list one task returned, or a `("list", [...])`.
+        Raises `RuntimeError` when the run is no expansion or the list is no
+        longer held."""
+
+    async def resolve_input(self, task_run_id: str) -> Any:
+        """What a composite member's run is given besides its claim, as
+        `(fields, input)`: the `(name, value)` pairs bound into its input, and
+        what it takes from before it as `composite_results` has it,
+        `("input", bytes)` for its own whole input stored as blobs, or `None`
+        when the claim's `serialized_input` is the whole input."""

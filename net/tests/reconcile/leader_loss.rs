@@ -7,14 +7,15 @@
 use std::sync::Arc;
 
 use kabudachi_core::protocol::generated::TaskRunState;
-use kabudachi_core::protocol::ids::TaskId;
+use kabudachi_core::protocol::ids::{CompositeId, TaskId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_net::messenger::Net;
 
 use crate::support::deadline::within_deadline;
 use crate::support::election::wait_until;
 use crate::support::records::{
-    RECONNECT_TIMEOUT_MS, SUSPECT_TIMEOUT_MS, Voters, claimed_and_started, plain_with,
+    RECONNECT_TIMEOUT_MS, SUSPECT_TIMEOUT_MS, Voters, claimed_and_started, completed_with_continuation,
+    composite_submitted_through, finished_count_heard_by, flow_of_bound, member_run_through, plain_with,
     submitted_through,
 };
 
@@ -112,4 +113,113 @@ async fn a_worker_that_died_with_the_leader_is_lost_a_suspicion_and_a_reconnect_
         assert!(waiting_states >= 3, "the newer generation is untouched and still waits");
     })
     .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flow_and_a_continuation_survive_their_leader_dying_between_stages_and_the_client_hears_each_once() {
+    within_deadline(async {
+        let (mut shard, client) = Voters::start(5).await;
+        let first = shard.drive_until_a_leader().await;
+        shard.join_as_pending(&client, first).await;
+        let worker = shard.others(first)[0];
+        let (nets, first_id) = (shard.nets.clone(), shard.id(first));
+        let heard = finished_count_heard_by(&client);
+        let flow = shard
+            .drive_until(composite_submitted_through(&client, &first_id, flow_of_bound(&["load", "shout"])))
+            .await;
+        shard
+            .drive_until(member_run_through(&nets[worker], &first_id, &flow, 0, b"loaded"))
+            .await;
+        // A plain task returns a step; its continuation is committed with its
+        // certification just before the leader dies.
+        let planner = shard
+            .drive_until(submitted_through(&client, &first_id, plain_with(b"plan").with_client(client.local_worker_id())))
+            .await;
+        let run = shard
+            .drive_until(claimed_and_started(&nets[worker], &first_id, &planner))
+            .await;
+        shard
+            .drive_until(completed_with_continuation(&nets[worker], &first_id, &run, flow_of_bound(&["stage"])))
+            .await;
+        shard.kill(first);
+        let watch = shard.watch();
+        let ids: Vec<_> = (0..nets.len()).map(|voter| shard.id(voter)).collect();
+        let continuation = CompositeId::continuation_of(&run);
+        // The successor's reconciliation lives in its driver, so everything
+        // after the death happens inside this one drive.
+        let (second, heard) = shard
+            .drive_until(async {
+                let mut second = None;
+                while second.is_none() {
+                    second = (0..nets.len()).find(|voter| {
+                        *voter != first
+                            && matches!(watch.state(*voter), WorkerState::Leader | WorkerState::LeaderReconciling)
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                let second = second.unwrap();
+                let survivor = (0..nets.len()).find(|voter| ![first, second].contains(voter)).unwrap();
+                member_run_through(&nets[survivor], &ids[second], &flow, 1, b"shouted").await;
+                member_run_through(&nets[survivor], &ids[second], &continuation, 0, b"staged").await;
+                (second, heard.until(2).await)
+            })
+            .await;
+        assert_eq!(heard.count(&flow), 1, "the flow finished once");
+        assert_eq!(heard.parent_task_count(&planner), 1, "the continuation finished once");
+        let runs = shard.with(second, move |_, scheduler| scheduler.runs_of(&planner)).await;
+        assert_eq!(runs.len(), 1, "the returning task never ran again");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_whose_run_no_leader_ever_certified_runs_once_under_the_successor_from_the_workers_report() {
+    within_deadline(async {
+        let (mut shard, client) = Voters::start(5).await;
+        let first = shard.drive_until_a_leader().await;
+        shard.join_as_pending(&client, first).await;
+        let [worker, bystander, ..] = shard.others(first)[..] else { unreachable!() };
+        let (nets, first_id, bystander_id) = (shard.nets.clone(), shard.id(first), shard.id(bystander));
+        let heard = finished_count_heard_by(&client);
+        let planner = shard
+            .drive_until(submitted_through(&client, &first_id, plain_with(b"plan").with_client(client.local_worker_id())))
+            .await;
+        let run = shard
+            .drive_until(claimed_and_started(&nets[worker], &first_id, &planner))
+            .await;
+        // The worker finishes the run by returning a step, but the report
+        // reaches no leader: the stored task is still running, and the step
+        // is held only in the worker's own account of the run.
+        let step = flow_of_bound(&["stage"]);
+        let _ = shard
+            .drive_until(tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                nets[worker].complete_continuing(bystander_id, run.clone(), &step),
+            ))
+            .await;
+        shard.kill(first);
+        let watch = shard.watch();
+        let ids: Vec<_> = (0..nets.len()).map(|voter| shard.id(voter)).collect();
+        let continuation = CompositeId::continuation_of(&run);
+        let (second, heard) = shard
+            .drive_until(async {
+                let mut second = None;
+                while second.is_none() {
+                    second = (0..nets.len()).find(|voter| {
+                        *voter != first
+                            && matches!(watch.state(*voter), WorkerState::Leader | WorkerState::LeaderReconciling)
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                let second = second.unwrap();
+                let survivor = (0..nets.len()).find(|voter| ![first, second].contains(voter)).unwrap();
+                member_run_through(&nets[survivor], &ids[second], &continuation, 0, b"staged").await;
+                (second, heard.until(1).await)
+            })
+            .await;
+        assert_eq!(heard.parent_task_count(&planner), 1, "the step finished once, as the task's continuation");
+        let runs = shard.with(second, move |_, scheduler| scheduler.runs_of(&planner)).await;
+        assert_eq!(runs.len(), 1, "the run that returned the step never ran again");
+    })
+    .await;
 }

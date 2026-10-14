@@ -7,6 +7,7 @@ compaction points, and the stage after a group runs exactly once."""
 
 import asyncio
 import functools
+import pickle
 import threading
 from types import SimpleNamespace
 
@@ -14,15 +15,18 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from kabudachi._native import RunState
+from kabudachi import _native
+from kabudachi._native import KabudachiError
 from kabudachi.body import fold_payloads
 from kabudachi.errors import (
+    BackpressureError,
+    PayloadTooLargeError,
     RunStoppedError,
     RuntimeNotStartedError,
     SerializationError,
     TaskCancelledError,
     TaskDefinitionError,
-    TaskInterruptedError,
+    TaskFailure,
     UnknownTaskError,
 )
 from kabudachi.flow import BoundTask, Flow, Group, flow, group
@@ -98,6 +102,85 @@ def test_a_bound_task_is_checked_when_it_is_bound():
         task.bind(times="many")
 
 
+# --- describe -----------------------------------------------------------
+
+
+def test_a_step_describes_the_same_bytes_every_time_and_a_bound_field_keeps_its_type():
+    world = World(shout, wrap)
+    inner = group(world.tasks["shout"].bind(times=0, text="b"), world.tasks["wrap"])
+    pipeline = flow(world.tasks["shout"].bind(Greeting(text="a")), inner)
+    first = _native.describe_step(pipeline.describe(world.session))
+    again = _native.describe_step(
+        flow(
+            world.tasks["shout"].bind(Greeting(text="a")),
+            group(world.tasks["shout"].bind(text="b", times=0), world.tasks["wrap"]),
+        ).describe(world.session)
+    )
+    assert first == again, "field order and object identity do not change the description"
+    [_, _, [bound, nested]] = pipeline.describe(world.session)
+    assert bound[4] == Greeting(text="a").SerializeToString()
+    [_, _, [overlaid, _]] = nested
+    assert overlaid[5] == [("text", "string", "b"), ("times", "int", 0)]
+
+
+COALESCING_STAGE = (
+    "a coalescing task cannot be a stage of a flow, group or map: "
+    "its generations would replace each other across them"
+)
+
+
+def test_a_coalescing_task_is_refused_as_a_stage_member_or_map_when_the_step_is_composed():
+    registry, serializers = TaskRegistry(), SerializerRegistry.with_defaults()
+
+    def refresh(request: Greeting) -> Greeting:
+        return request
+
+    coalescing = Task(
+        refresh, registry=registry, serializers=serializers, name="tests.refresh", kind=TaskKind.COALESCING
+    )
+    plain = declare(shout)
+    for compose in (
+        lambda: flow(plain, coalescing),
+        lambda: flow(coalescing.bind(Greeting(text="a"))),
+        lambda: group(plain, coalescing),
+        lambda: coalescing.map,
+    ):
+        with pytest.raises(TypeError) as refused:
+            compose()
+        assert str(refused.value) == COALESCING_STAGE
+
+
+def test_a_task_name_cannot_take_the_reserved_prefix():
+    def refresh(request: Greeting) -> Greeting:
+        return request
+
+    with pytest.raises(TaskDefinitionError, match="kabudachi."):
+        Task(
+            refresh,
+            registry=TaskRegistry(),
+            serializers=SerializerRegistry.with_defaults(),
+            name="kabudachi.expand",
+        )
+
+
+def test_a_task_named_by_default_cannot_land_in_the_reserved_prefix():
+    def refresh(request: Greeting) -> Greeting:
+        return request
+
+    refresh.__module__ = "kabudachi.extras"
+    refresh.__qualname__ = "refresh"
+
+    with pytest.raises(TaskDefinitionError, match="kabudachi."):
+        Task(refresh, registry=TaskRegistry(), serializers=SerializerRegistry.with_defaults())
+
+
+def test_a_task_failure_keeps_its_kind_and_message_across_the_task_process_pipe():
+    failure = pickle.loads(pickle.dumps(TaskFailure("ValueError", "bad input")))
+
+    assert isinstance(failure, KabudachiError)
+    assert (failure.kind, failure.message) == ("ValueError", "bad input")
+
+
 # --- flow definition ----------------------------------------------------
 
 
@@ -152,8 +235,8 @@ def stages(world, *names):
     return [world.tasks[name] for name in names]
 
 
-async def until_submitted(world, count):
-    while len(world.runtime.submitted) < count:
+async def until_claimed(world, count):
+    while len(world.runtime.claimed) < count:
         await asyncio.sleep(0.005)
 
 
@@ -226,7 +309,7 @@ def test_cancelling_a_flow_cancels_the_current_stage_and_starts_no_later_one():
 
     async def body():
         handle = pipeline.start(world.session, Greeting())
-        await until_submitted(world, 1)
+        await until_claimed(world, 1)
         assert handle.cancel() is True
         with pytest.raises(TaskCancelledError):
             await asyncio.wait_for(handle, WAIT)
@@ -235,6 +318,26 @@ def test_cancelling_a_flow_cancels_the_current_stage_and_starts_no_later_one():
     run(with_events(world, body))
 
     assert ran == []
+
+
+def test_a_stage_whose_result_cannot_be_stored_is_reported_lost_and_run_again_without_failing_the_flow():
+    ran = []
+
+    def counted(request: Greeting) -> Greeting:
+        ran.append(True)
+        return shout(request)
+
+    world = World(counted)
+    world.runtime.store_gives_up = 1
+    pipeline = flow(*stages(world, "counted"))
+
+    async def body():
+        return await pipeline.start(world.session, Greeting(text="a"))
+
+    assert run(with_events(world, body)) == [Greeting(text="A")]
+
+    assert len(ran) == 2
+    assert [event[0] for event in world.runtime.events].count("lost") == 1
 
 
 def test_a_task_that_waits_for_a_flow_gives_up_its_place_meanwhile():
@@ -322,29 +425,6 @@ def test_fail_fast_leaves_the_other_members_running_like_asyncio_gather():
     assert finished == [True]
 
 
-def test_a_stage_that_cannot_encode_a_failure_fails_the_flow_with_a_serialization_error():
-    def explode(request: Greeting) -> Greeting:
-        raise ValueError("member failed")
-
-    def fine(request: Greeting) -> Greeting:
-        return Greeting(text="fine")
-
-    def after(request: list[Greeting]) -> Greeting:
-        return Greeting(text="after")
-
-    world = World(explode, fine, after)
-    pipeline = flow(
-        group(world.tasks["explode"], world.tasks["fine"], on_error="collect_all"),
-        world.tasks["after"],
-    )
-
-    async def body():
-        with pytest.raises(SerializationError):
-            await pipeline.start(world.session, Greeting())
-
-    run(with_events(world, body))
-
-
 def test_cancelling_a_group_cancels_every_member_and_the_stage_after_never_starts():
     started = []
     ran_after = []
@@ -409,27 +489,24 @@ def two_member_group(world):
 
 
 FLOW_AND_GROUP = pytest.mark.parametrize(
-    ("build", "submitted_while_waiting", "results"),
+    ("build", "results"),
     [
-        pytest.param(two_stage_flow, 2, [Greeting(text="A"), Greeting(text="[A]")], id="flow"),
-        pytest.param(two_member_group, 3, [Greeting(text="A"), Greeting(text="[a]")], id="group"),
+        pytest.param(two_stage_flow, [Greeting(text="A"), Greeting(text="[A]")], id="flow"),
+        pytest.param(two_member_group, [Greeting(text="A"), Greeting(text="[a]")], id="group"),
     ],
 )
 
 
 @FLOW_AND_GROUP
-def test_a_flow_or_group_that_was_never_started_because_the_run_stopped_fails(
-    build, submitted_while_waiting, results
-):
+def test_a_flow_or_group_that_was_never_started_because_the_run_stopped_fails(build, results):
     world = World(shout, wrap)
     target = build(world)
     world.runtime.hold_claims = True
 
     async def body():
         await world.call("shout", Greeting())  # takes the only claim
-        handle = target.start(world.session, Greeting())
-        await until_submitted(world, submitted_while_waiting)  # everything is waiting for a claim
-        world.session.stop_claiming()
+        handle = target.start(world.session, Greeting())  # everything of it waits for a claim
+        await world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
             await asyncio.wait_for(handle, WAIT)
 
@@ -437,7 +514,7 @@ def test_a_flow_or_group_that_was_never_started_because_the_run_stopped_fails(
 
 
 @FLOW_AND_GROUP
-def test_cancelling_a_finished_flow_or_group_changes_nothing(build, submitted_while_waiting, results):
+def test_cancelling_a_finished_flow_or_group_changes_nothing(build, results):
     world = World(shout, wrap)
     target = build(world)
 
@@ -449,16 +526,33 @@ def test_cancelling_a_finished_flow_or_group_changes_nothing(build, submitted_wh
     assert run(with_events(world, body)) is False
 
 
+@pytest.mark.parametrize("shape", [flow, group])
+def test_cancelling_a_failed_flow_or_group_changes_nothing(shape):
+    def explode(request: Greeting) -> Greeting:
+        raise ValueError("stage failed")
+
+    world = World(shout, explode)
+    target = shape(*stages(world, "shout", "explode"))
+
+    async def body():
+        handle = target.start(world.session, Greeting(text="a"))
+        with pytest.raises(ValueError, match="stage failed"):
+            await handle
+        assert handle.cancel() is False
+        with pytest.raises(ValueError, match="stage failed"):
+            await handle
+
+    run(with_events(world, body))
+
+
 @FLOW_AND_GROUP
-def test_finishing_waits_for_a_flow_or_group_that_is_still_running(
-    build, submitted_while_waiting, results
-):
+def test_finishing_waits_for_a_flow_or_group_that_is_still_running(build, results):
     world = World(shout, wrap)
     target = build(world)
 
     async def body():
         handle = target.start(world.session, Greeting(text="a"))
-        # Nothing has been submitted yet, so only the flow or group itself is pending.
+        # Nothing has run yet, so only the flow or group itself is pending.
         await world.session.wait_until_idle()
         assert handle.done()
         return await handle
@@ -467,9 +561,7 @@ def test_finishing_waits_for_a_flow_or_group_that_is_still_running(
 
 
 @FLOW_AND_GROUP
-def test_a_flow_or_group_cancelled_before_it_starts_submits_nothing(
-    build, submitted_while_waiting, results
-):
+def test_a_flow_or_group_cancelled_before_it_starts_runs_nothing(build, results):
     world = World(shout, wrap)
     target = build(world)
 
@@ -481,7 +573,7 @@ def test_a_flow_or_group_cancelled_before_it_starts_submits_nothing(
 
     run(with_events(world, body))
 
-    assert world.runtime.submitted == []
+    assert world.runtime.claimed == []
 
 
 # --- map ----------------------------------------------------------------
@@ -568,6 +660,116 @@ def test_map_is_a_flow_stage_that_takes_the_prior_stages_list():
     assert [g.text for g in mapped] == ["A", "B", "C"]
 
 
+def test_a_map_after_a_stage_that_returns_a_list_is_expanded_by_a_worker_and_keeps_the_items_order():
+    def load(request: Greeting) -> list[Greeting]:
+        return [Greeting(text=text) for text in ("a", "b", "c")]
+
+    world = World(load, shout)
+    pipeline = flow(world.tasks["load"], world.tasks["shout"].map)
+
+    async def body():
+        return await pipeline.start(world.session, Greeting())
+
+    _, mapped = run(with_events(world, body))
+
+    assert [greeting.text for greeting in mapped] == ["A", "B", "C"]
+    assert any(claim.expansion for claim in world.runtime.claimed), "an expansion run split the list"
+
+
+def test_a_collect_all_failure_reaches_awaiting_code_and_the_next_stage_as_the_member_failed():
+    def explode(request: Greeting) -> Greeting:
+        raise ValueError("member failed")
+
+    seen = []
+
+    def after(request: list) -> str:
+        seen.append(request)
+        return "after"
+
+    world = World(shout, explode)
+    world.serializers.register(Pickle())
+    after_task = Task(
+        after,
+        registry=world.registry,
+        serializers=world.serializers,
+        name="tests.after",
+        serializer="pickle",
+    )
+    members = group(world.tasks["shout"], world.tasks["explode"], on_error="collect_all")
+
+    async def body():
+        direct = await members.start(world.session, Greeting(text="x"))
+        staged = await flow(members, after_task).start(world.session, Greeting(text="x"))
+        return direct, staged
+
+    direct, staged = run(with_events(world, body))
+
+    assert direct[0] == Greeting(text="X")
+    assert isinstance(direct[1], ValueError), "code awaiting the group is given the error its own member raised"
+    assert seen[0][0] == Greeting(text="X")
+    assert isinstance(seen[0][1], TaskFailure), "the next stage is given the failure, whatever its serializer"
+    assert (seen[0][1].kind, seen[0][1].message) == ("ValueError", "member failed")
+    assert str(direct[1]) == "member failed"
+    assert staged[-1] == "after"
+
+
+def test_a_member_that_failed_alike_but_ended_nothing_is_not_given_to_a_later_group():
+    def explode(request: Greeting) -> Greeting:
+        error = ValueError("alike")
+        error.who = request.text
+        raise error
+
+    world = World(explode)
+    both_fail = group(world.tasks["explode"], world.tasks["explode"])
+    one_fails = group(world.tasks["explode"])
+
+    async def failure_of(handle):
+        with pytest.raises(ValueError) as raised:
+            await handle
+        return raised.value
+
+    async def body():
+        # Both members raise, and the group fails with one of the errors: the
+        # other is left over, with the same type and message.
+        await failure_of(both_fail.start(world.session, Greeting(text="first")))
+        return await failure_of(one_fails.start(world.session, Greeting(text="second")))
+
+    error = run(with_events(world, body))
+
+    assert error.who == "second"
+
+
+def test_groups_whose_members_fail_alike_are_each_given_their_own_member_error():
+    released = asyncio.Event()
+
+    async def explode(request: Greeting) -> Greeting:
+        error = ValueError("alike")
+        error.who = request.text
+        raise error
+
+    async def linger(request: Greeting) -> Greeting:
+        await released.wait()
+        return request
+
+    world = World(explode, linger)
+    tasks = world.tasks
+    # The first group's member fails first, and its group ends last.
+    ends_last = group(tasks["explode"], tasks["linger"], on_error="collect_all")
+    ends_first = group(tasks["explode"], on_error="collect_all")
+
+    async def body():
+        late = ends_last.start(world.session, Greeting(text="late"))
+        early = ends_first.start(world.session, Greeting(text="early"))
+        (error_early,) = await early
+        released.set()
+        error_late, _ = await late
+        return error_early, error_late
+
+    error_early, error_late = run(with_events(world, body))
+
+    assert (error_early.who, error_late.who) == ("early", "late")
+
+
 def test_a_map_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_takes():
     def numbers_of(request: Greeting) -> list[Receipt]:
         return [Receipt(ok=True)]
@@ -582,7 +784,6 @@ def test_a_map_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_ta
 # a submission that would go past the hard one is refused.
 SOFT_LIMIT = 100
 HARD_LIMIT = 1_000
-PAST_SOFT_LIMIT = Greeting(text="x" * 150)
 
 
 def held_world(*functions, hard_limit=HARD_LIMIT, **options):
@@ -604,25 +805,6 @@ def held_world(*functions, hard_limit=HARD_LIMIT, **options):
     return world, released
 
 
-async def until_slow_down_seen(world):
-    """Waits until the session has acted on the runtime's SlowDown. Its own
-    flag is the only place that shows it; the runtime's event is consumed."""
-    while world.session.has_room():
-        await asyncio.sleep(0.005)
-
-
-async def with_watcher_only(world, body):
-    """Like `with_events`, but no worker claims anything, so every task the
-    body submits stays pending and its input stays counted."""
-    await asyncio.wait_for(world.native.wait_until_leader(), WAIT)
-    events = asyncio.ensure_future(world.session.watch_events())
-    try:
-        return await asyncio.wait_for(body(), WAIT)
-    finally:
-        events.cancel()
-        await asyncio.gather(events, return_exceptions=True)
-
-
 def run_states(world):
     """The state of each submitted task's latest run, in submission order."""
     native = world.native
@@ -632,153 +814,67 @@ def run_states(world):
     ]
 
 
-def test_a_group_pauses_submitting_while_slow_down_is_raised_but_a_plain_call_does_not():
-    world, released = held_world(shout)
-    members = group(*([world.tasks["shout"]] * 3))
-
-    async def body():
-        holder = world.call("hold", PAST_SOFT_LIMIT)
-        await until_slow_down_seen(world)
-        before = len(world.runtime.submitted)
-        handle = members.start(world.session, Greeting(text="a"))
-        await asyncio.sleep(0.05)
-        during = len(world.runtime.submitted) - before
-        await world.call("shout", Greeting(text="plain"))
-        while_slow = len(world.runtime.submitted) - before
-        released.set()  # the held input finishes, which clears SlowDown
-        await asyncio.wait_for(handle, WAIT)
-        await holder
-        return during, while_slow, len(world.runtime.submitted) - before
-
-    during, while_slow, after = run(with_events(world, body))
-
-    assert (during, while_slow, after) == (0, 1, 4)
-
-
-@pytest.mark.parametrize(
-    ("end", "error"),
-    [
-        pytest.param(lambda world, handle: world.session.stop_claiming(), RunStoppedError, id="stop"),
-        pytest.param(lambda world, handle: handle.cancel(), TaskCancelledError, id="cancel"),
-    ],
-)
-def test_stopping_or_cancelling_a_group_that_is_waiting_out_slow_down_submits_nothing_more(end, error):
-    world = World(shout, memory_soft_limit=SOFT_LIMIT, memory_hard_limit=HARD_LIMIT)
-    members = group(world.tasks["shout"], world.tasks["shout"])
-
-    async def body():
-        world.call("shout", PAST_SOFT_LIMIT)  # never claimed: its input stays counted
-        await until_slow_down_seen(world)
-        handle = members.start(world.session, Greeting())
-        await asyncio.sleep(0.05)
-        end(world, handle)
-        with pytest.raises(error):
-            await asyncio.wait_for(handle, WAIT)
-
-    run(with_watcher_only(world, body))
-
-    assert len(world.runtime.submitted) == 1, "only the task that raised SlowDown"
-
-
-def test_a_group_that_hits_the_hard_limit_midway_fails_and_cancels_the_members_it_started():
-    from kabudachi.errors import BackpressureError
-
-    # Two members fit and the third does not. With equal limits SlowDown is never
-    # raised first, so the group reaches the hard limit rather than pausing.
-    # Members hold rather than finish, so the cascade-cancel is guaranteed to
-    # reach a still-running member instead of racing its natural completion.
+def test_a_group_past_the_hard_limit_is_refused_whole_and_starts_nothing():
+    # Two members would fit and the third would not: the group is refused as a
+    # whole, so none of them is started.
     world, released = held_world(hard_limit=100)
     members = group(*([world.tasks["hold"]] * 3))
 
     async def body():
         with pytest.raises(BackpressureError):
-            await members.start(world.session, Greeting(text="x" * 40))
+            members.start(world.session, Greeting(text="x" * 40))
         released.set()
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
 
     run(with_events(world, body))
 
-    assert len(world.runtime.submitted) == 2
-    assert run_states(world) == [RunState.CANCELLED, RunState.CANCELLED]
+    assert world.runtime.claimed == []
+    assert run_states(world) == []
 
 
-def test_a_bulk_submission_pauses_when_slow_down_is_raised_while_it_is_still_submitting():
-    world, released = held_world(shout, concurrency=8)
-    members = group(*([world.tasks["hold"]] * 40))
+def test_a_stage_reading_a_large_result_holds_it_against_the_memory_limit_until_its_run_ends():
+    reading = asyncio.Event()
+    released = asyncio.Event()
 
-    async def body():
-        handle = members.start(world.session, Greeting(text="x" * 60))
-        await until_slow_down_seen(world)
-        paused_at = len(world.runtime.submitted)
-        await asyncio.sleep(0.05)
-        while_slow = len(world.runtime.submitted)
-        released.set()  # the held members finish, which clears SlowDown
-        await asyncio.wait_for(handle, WAIT)
-        return paused_at, while_slow, len(world.runtime.submitted)
+    async def big(request: Greeting) -> Greeting:
+        return Greeting(text="x" * 600)
 
-    paused_at, while_slow, after = run(with_events(world, body))
+    async def read(request: Greeting) -> Greeting:
+        reading.set()
+        await released.wait()
+        return Greeting()
 
-    assert while_slow == paused_at, "the group kept submitting past the soft limit"
-    assert paused_at < 40
-    assert after == 40
+    def small(request: Greeting) -> Greeting:
+        return request
 
-
-def test_cancelling_a_group_part_way_through_its_submission_starts_no_further_member():
-    # Members hold rather than finish, so the cascade-cancel is guaranteed to
-    # reach every submitted member instead of racing its natural completion.
-    world, released = held_world(concurrency=8)
-    members = group(*([world.tasks["hold"]] * 6))
+    world = World(big, read, small, memory_soft_limit=SOFT_LIMIT, memory_hard_limit=HARD_LIMIT)
+    pipeline = flow(world.tasks["big"], world.tasks["read"])
+    late = Greeting(text="y" * 500)
 
     async def body():
-        handle = members.start(world.session, Greeting())
-        while len(world.runtime.submitted) < 2:
-            await asyncio.sleep(0)
-        assert handle.cancel() is True
-        with pytest.raises(TaskCancelledError):
-            await asyncio.wait_for(handle, WAIT)
+        done = pipeline.start(world.session, Greeting(text="in"))
+        await asyncio.wait_for(reading.wait(), WAIT)
+        # The 600 bytes the stage was given and the 500 would pass the limit.
+        with pytest.raises(BackpressureError):
+            world.session.submit(world.tasks["small"].definition, late)
         released.set()
-        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+        await done
+        return await world.session.submit(world.tasks["small"].definition, late)
 
-    run(with_events(world, body))
-
-    assert len(world.runtime.submitted) < 6
-    assert set(run_states(world)) == {RunState.CANCELLED}
+    assert run(with_events(world, body)) == late
 
 
-def test_a_flow_whose_orchestration_is_cancelled_before_it_starts_still_settles_and_is_not_leaked():
-    world = World(shout)
-    pipeline = flow(*stages(world, "shout"))
+def test_a_step_bound_to_a_value_past_the_hard_limit_alone_is_refused_before_anything_is_stored():
+    world, released = held_world(hard_limit=100)
+    pipeline = flow(world.tasks["hold"].bind(Greeting(text="x" * 200)))
 
     async def body():
-        handle = pipeline.start(world.session, Greeting())
-        await asyncio.sleep(0)  # the orchestration task exists now, and has not started
-        for task in asyncio.all_tasks():
-            if "_run_flow" in repr(task.get_coro()):
-                task.cancel()
-        with pytest.raises(TaskInterruptedError):
-            await asyncio.wait_for(handle, WAIT)
-        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+        with pytest.raises(PayloadTooLargeError):
+            pipeline.start(world.session, Greeting())
 
     run(with_events(world, body))
 
-
-def test_a_flow_whose_orchestration_is_cancelled_while_it_runs_fails_as_interrupted():
-    world = World(shout)
-    pipeline = flow(*stages(world, "shout"))
-    world.runtime.hold_claims = True
-
-    async def body():
-        await world.call("shout", Greeting())  # takes the only claim
-        handle = pipeline.start(world.session, Greeting())
-        await until_submitted(world, 2)  # the stage is waiting for a claim
-        for task in asyncio.all_tasks():
-            if "_run_flow" in repr(task.get_coro()):
-                task.cancel()
-        with pytest.raises(TaskInterruptedError, match="CancelledError"):
-            await asyncio.wait_for(handle, WAIT)
-        world.session.stop_claiming()  # fails the stage nothing ever claimed
-
-    run(with_events(world, body))
+    assert world.runtime.claimed == []
 
 
 # --- a task that returns a step --------------------------------------------
@@ -876,7 +972,20 @@ def test_a_returned_step_runs_after_the_certification_and_the_handle_is_its_resu
     first_certification = order.index("complete")
     # The planning run is certified before any stage of the continuation starts.
     assert order[: first_certification + 1].count("started") == 1
-    assert order.count("end_continuation") == 1
+
+
+def test_a_returned_step_bound_to_a_value_too_large_to_inline_runs_with_that_value():
+    big = "z" * 1_100_000
+    world = continuing_world()
+
+    def plan(request: Greeting) -> Group:
+        return group(world.tasks["shout"].bind(Greeting(text=big)), world.tasks["acknowledge"].bind(request))
+
+    planner = declare_planner(world, plan)
+
+    results = run_planner(world, planner, Greeting(text="in"))
+
+    assert results == [Greeting(text=big.upper()), Receipt(ok=True)]
 
 
 def test_a_returned_step_that_needs_an_input_is_refused_and_fails_the_run():
@@ -889,6 +998,23 @@ def test_a_returned_step_that_needs_an_input_is_refused_and_fails_the_run():
 
     async def body():
         with pytest.raises(TaskDefinitionError, match="input"):
+            await world.session.submit(planner.definition, Greeting())
+
+    run(with_events(world, body))
+
+    assert [e[0] for e in world.runtime.events][-1] == "fail"
+
+
+def test_a_returned_step_bound_to_a_value_past_the_hard_limit_alone_fails_the_run():
+    world = continuing_world(memory_soft_limit=SOFT_LIMIT, memory_hard_limit=200)
+
+    def plan(request: Greeting) -> Flow:
+        return flow(world.tasks["shout"].bind(Greeting(text="x" * 400)))
+
+    planner = declare_planner(world, plan)
+
+    async def body():
+        with pytest.raises(PayloadTooLargeError):
             await world.session.submit(planner.definition, Greeting())
 
     run(with_events(world, body))
@@ -945,10 +1071,13 @@ def test_a_run_the_leader_will_not_certify_leaves_no_continuation_behind():
         with pytest.raises(RuntimeError):
             await world.session.submit(planner.definition, Greeting())
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+        [refused] = [event[1] for event in world.runtime.events if event[0] == "complete"]
+        assert await world.native.composite_status(_native.continuation_of(refused)) is None
 
     run(with_events(world, body))
 
-    assert [entry[1] for entry in world.runtime.submitted] == ["tests.plan"]
+    assert world.runtime.claimed[0].definition_id == "tests.plan"
+    assert len(world.runtime.claimed) == 1, "no stage of a continuation was ever made"
 
 
 def test_a_failing_continuation_fails_the_handle_and_never_reruns_the_planning_task():
@@ -972,7 +1101,6 @@ def test_a_failing_continuation_fails_the_handle_and_never_reruns_the_planning_t
     run(with_events(world, body))
 
     assert plans == [True]
-    assert [e[0] for e in world.runtime.events].count("end_continuation") == 1
 
 
 def test_cancelling_the_handle_during_the_continuation_cancels_its_current_stage():
@@ -1005,7 +1133,6 @@ def test_cancelling_the_handle_during_the_continuation_cancels_its_current_stage
     run(with_events(world, body))
 
     assert ran_after == []
-    assert [e[0] for e in world.runtime.events].count("end_continuation") == 1
 
 
 def test_finishing_waits_for_a_continuation_that_is_still_running():
@@ -1036,9 +1163,9 @@ def test_stopping_fails_a_continuation_that_has_not_started_its_stage():
 
     async def body():
         handle = world.session.submit(planner.definition, Greeting())
-        while len(world.runtime.submitted) < 2:  # the planning task, then its first stage
-            await asyncio.sleep(0.005)
-        world.session.stop_claiming()
+        while ("complete" not in [event[0] for event in world.runtime.events]):
+            await asyncio.sleep(0.005)  # the planning run is certified; its stage waits for a claim
+        await world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
             await asyncio.wait_for(handle, WAIT)
 
@@ -1086,43 +1213,6 @@ def test_a_cancel_that_arrives_while_the_run_is_being_certified_reaches_the_cont
 
     assert cancelled == [True], "the cancel was lost in the window before the continuation existed"
     assert ran_after == []
-
-
-def test_a_cancel_that_arrives_while_the_first_stage_is_being_submitted_is_not_lost():
-    async def slow(request: Greeting) -> Greeting:
-        await asyncio.sleep(30)
-        return request
-
-    world = continuing_world(slow)
-
-    def plan(request: Greeting) -> BoundTask:
-        return world.tasks["slow"].bind(request)
-
-    planner = declare_planner(world, plan)
-    handles = []
-    cancelled = []
-    threads = []
-
-    def cancel_soon(run_id):
-        # Only the continuation's own submission is slow, so the cancel lands in it.
-        world.runtime.submit_lingers_for = 0.1
-        thread = threading.Thread(target=lambda: cancelled.append(handles[0].cancel()))
-        thread.start()
-        threads.append(thread)
-
-    world.runtime.after_certification = cancel_soon
-
-    async def body():
-        handles.append(world.session.submit(planner.definition, Greeting()))
-        with pytest.raises(TaskCancelledError):
-            await asyncio.wait_for(handles[0], WAIT)
-        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
-
-    run(with_events(world, body))
-    for thread in threads:
-        thread.join()
-
-    assert cancelled == [True]
 
 
 # --- properties ------------------------------------------------------------
@@ -1241,7 +1331,8 @@ def test_under_collect_all_the_stage_after_a_group_runs_once_with_every_outcome(
         if failures[index] <= RETRIES:
             assert entry == Greeting(text=f"m{index}")
         else:
-            assert isinstance(entry, ValueError)
+            assert isinstance(entry, TaskFailure)
+            assert (entry.kind, entry.message) == ("ValueError", f"member {index} failed")
     assert outcome[-1] == "stage"
 
 
@@ -1256,3 +1347,5 @@ def test_under_fail_fast_the_stage_runs_once_only_if_every_member_succeeds(failu
     else:
         assert seen == [], "a failed group must not start the stage after it"
         assert isinstance(outcome, ValueError)
+        failing = {f"member {i} failed" for i, count in enumerate(failures) if count > RETRIES}
+        assert str(outcome) in failing

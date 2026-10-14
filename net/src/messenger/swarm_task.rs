@@ -280,7 +280,7 @@ fn handle_command(
         Command::WithPeers(read) => read(peers),
         Command::WriteRecords(writes) => pending.records.start_writes(swarm, writes, inbound),
         Command::HandOff { write, respond_to } => pending.records.start_hand_off(swarm, write, respond_to),
-        Command::GetRecord { task, respond_to } => pending.records.start_read(swarm, task, respond_to),
+        Command::GetRecord { key, respond_to } => pending.records.start_read(swarm, key, respond_to),
         Command::PutBlob { key, record, placement, respond_to } => {
             pending.records.start_blob_put(swarm, key, record, &placement, respond_to);
         }

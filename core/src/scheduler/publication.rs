@@ -2,15 +2,13 @@
 //! versioned, at the end of every call that changed it, and what it forgets
 //! once a finished task's time to live has passed.
 
-use std::collections::BTreeSet;
-
 use crate::coalescing::ChainItem;
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::generated::{
     AbsorbedGeneration, ChainEntry, FoldedPayload, TaskRecord, chain_entry,
 };
 use crate::protocol::ids::{IdGenerator, TaskId};
-use crate::task_record::RecordVersion;
+use crate::task_record::{RecordKey, RecordVersion};
 use crate::time::{Clock, Duration, WallTime};
 
 use super::{Observer, Scheduler};
@@ -52,6 +50,39 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.observer.revision(record);
             published += 1;
         }
+        published + self.publish_composites(recovery_epoch, term, published_at)
+    }
+
+    /// Publishes the pages and then the records of the composites changed
+    /// since their last revision, so a reader that finds a composite's record
+    /// finds every page it names. Returns how many it published.
+    fn publish_composites(
+        &mut self,
+        recovery_epoch: RecoveryEpoch,
+        term: u64,
+        published_at: WallTime,
+    ) -> usize {
+        let pages = std::mem::take(&mut self.composites.unpublished_pages);
+        let records = std::mem::take(&mut self.composites.unpublished);
+        let mut published = 0;
+        for (id, page) in pages {
+            if !self.composites.held.contains_key(&id) {
+                continue;
+            }
+            let version = self.leadership.next_version(recovery_epoch, term);
+            let record = self.page_record_of(&id, page, version, published_at);
+            self.observer.page_revision(record);
+            published += 1;
+        }
+        for id in records {
+            if !self.composites.held.contains_key(&id) {
+                continue;
+            }
+            let version = self.leadership.next_version(recovery_epoch, term);
+            let record = self.composite_record_of(&id, version, published_at);
+            self.observer.composite_revision(record);
+            published += 1;
+        }
         published
     }
 
@@ -82,6 +113,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             prior_placements: Vec::new(),
             published_at: Some(published_at.into()),
             finished: self.retention.holds(task_id),
+            retained_by_composite: self.retention.is_held(task_id),
         }
     }
 
@@ -101,30 +133,53 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         ChainEntry { entry: Some(entry) }
     }
 
-    /// Publishes a new revision of each of `tasks` it holds, unchanged but for
-    /// its version, so its driver can write it where it now belongs. Tasks it
+    /// Publishes a new revision of each of `keys` it holds, unchanged but for
+    /// its version, so its driver can write it where it now belongs. Records it
     /// does not hold, or holds uncertain, are skipped. Only a leader
     /// publishes: any other returns 0. Returns how many it published.
-    pub fn republish(&mut self, tasks: &[TaskId]) -> usize {
+    pub fn republish(&mut self, keys: &[RecordKey]) -> usize {
         if !self.is_leader() {
             return 0;
         }
-        let eligible: BTreeSet<&TaskId> = tasks
-            .iter()
-            .filter(|task| {
-                self.tasks.contains_key(*task) && !self.reconciliation.is_uncertain(task)
-            })
-            .collect();
-        self.unpublished
-            .extend(eligible.iter().map(|task| (*task).clone()));
+        let mut republished = 0;
+        let mut seen = std::collections::BTreeSet::new();
+        for key in keys {
+            if !seen.insert(key) || !self.holds(key) {
+                continue;
+            }
+            match key {
+                RecordKey::Task(task) if !self.reconciliation.is_uncertain(task) => {
+                    self.unpublished.insert(task.clone());
+                    republished += 1;
+                }
+                RecordKey::Task(_) => {}
+                RecordKey::Composite(id) => {
+                    self.composites.unpublished.insert(id.clone());
+                    republished += 1;
+                }
+                RecordKey::Page(id, page) => {
+                    self.composites.unpublished_pages.insert((id.clone(), *page));
+                    republished += 1;
+                }
+            }
+        }
         self.end_call();
-        eligible.len()
+        republished
     }
 
     /// Forgets every task that finished at least `result_ttl` ago, with its
     /// run, and returns how many. Cheap when nothing is due, so every
     /// mutating call ends with it.
     pub(super) fn forget_due(&mut self) -> usize {
+        if let Some(ttl) = self.retention.ttl() {
+            let members = self.composites.forget_due(ttl, self.clock.now());
+            if !members.is_empty() {
+                // Holders learn their retention may begin before the leader
+                // forgets the members it may forget at once.
+                self.release_members(members);
+                self.publish_changed();
+            }
+        }
         let Some(due) = self.retention.next_due() else {
             return 0;
         };

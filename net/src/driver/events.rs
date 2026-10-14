@@ -1,6 +1,7 @@
 use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::scheduler::Event;
+use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::{Clock, Instant};
 
 use super::answers::{Deciding, HeldAnswer, Local};
@@ -25,7 +26,9 @@ pub(super) fn catch_up_if_due<C: Clock, I: IdGenerator>(
 }
 
 /// The events the scheduler raises name no client of their own, so they are
-/// logged and dropped rather than kept for ever, except a cancel of a running run: it is held until the cancel is stored,
+/// logged and dropped rather than kept for ever, except a composite that
+/// ended, which is held until its records are stored and then told to its
+/// client, and a cancel of a running run: it is held until the cancel is stored,
 /// then left in `local` for the run's worker to be told. So is a run stored
 /// as cancelled, perhaps by an earlier leader, that its worker reported it
 /// still holds. A task with a client that ended is told to the client the
@@ -41,6 +44,24 @@ pub(super) fn drain_events<C: Clock, I: IdGenerator>(
     let events = deciding.scheduler.take_events();
     deciding.write();
     for event in events {
+        if let Event::CompositeFinished(finished) = &event
+            && let Some(client) = finished.client.clone()
+        {
+            // Told only once the composite's terminal records are stored, and
+            // those of the Tasks whose ends led to it: a client that settles
+            // on this must never see a later leader undo it, as one that
+            // replays a member whose certification was lost could with a
+            // result the stored page does not name.
+            let held = HeldAnswer::Finished {
+                client,
+                finished: finished.into(),
+            };
+            let named: Vec<RecordKey> = std::iter::once(RecordKey::Composite(finished.composite_id.clone()))
+                .chain(finished.settled_by.iter().cloned().map(RecordKey::Task))
+                .collect();
+            deciding.hold_unwritten_on(held, &named, local);
+            continue;
+        }
         hold_for_worker(deciding, &event, local);
         tracing::debug!(?event, "scheduler event with no client to tell");
     }
@@ -49,11 +70,11 @@ pub(super) fn drain_events<C: Clock, I: IdGenerator>(
             worker: held.worker,
             run: held.task_run_id,
         };
-        deciding.hold_unwritten(answer, Some(&held.task_id), local);
+        deciding.hold_unwritten(answer, Some(RecordKey::Task(held.task_id)), local);
     }
     for conclusion in deciding.scheduler.take_conclusions() {
         let task = conclusion.outcome.task_id.clone();
-        deciding.hold_unwritten(HeldAnswer::Concluded(conclusion), Some(&task), local);
+        deciding.hold_unwritten(HeldAnswer::Concluded(conclusion), Some(RecordKey::Task(task)), local);
     }
 }
 
@@ -99,7 +120,7 @@ fn hold_cancelled_run<C: Clock, I: IdGenerator>(
             worker,
             run: run.clone(),
         },
-        Some(task),
+        Some(RecordKey::Task(task.clone())),
         local,
     );
 }

@@ -62,6 +62,13 @@
 //! too large is refused with `KeyBackpressure`, and a fold that does so fails
 //! the newest generation (`CoalescedPayloadTooLarge`).
 //!
+//! A run may return a step instead of a result ([`Completion::Continues`]).
+//! The run is certified under the step's digest and carries the step, so the
+//! revision that certifies it commits the step with it; the scheduler runs
+//! the step as a composite derived from that run. The task keeps its key and
+//! its memory until that composite is over, and then finishes; cancelling the
+//! task cancels the composite.
+//!
 //! Tasks and runs are stored privately and handed out only as shared
 //! references or clones, so nothing outside can edit a submitted Task or move
 //! a run without going through the transition table.
@@ -77,13 +84,14 @@ use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::TaskRunRecord;
 use crate::queues::{QueuePolicy, Subscription};
-use crate::task_record::RecordVersion;
+use crate::task_record::{RecordKey, RecordVersion};
 use crate::time::{Clock, Instant};
 
 mod backlog;
 mod cancel;
 mod claims;
 mod compaction;
+pub mod composite;
 mod deadlines;
 mod failures;
 mod fairness;
@@ -106,6 +114,7 @@ mod waiting_room;
 pub use backlog::Backlog;
 pub use cancel::{CancelRejection, Cancellation, HeldCancel};
 pub use claims::{Claim, ClaimRejection};
+use composite::Composites;
 pub use compaction::Compacted;
 pub use deadlines::CaughtUp;
 pub use failures::{Failure, MAX_FAILURE_MESSAGE_BYTES};
@@ -119,7 +128,7 @@ pub use observer::{NoObserver, Observer};
 pub use outcome::{Conclusion, Outcome, OutcomeRejection};
 pub use rebuild::{Adopted, ReconcileRefused, ReconcileRejection, Reconciled};
 use reconciliation::Reconciliation;
-pub use reports::{Certification, Completion, ContinuationRejection, ReportRejection};
+pub use reports::{Certification, Completion, ReportRejection};
 use retention::Retention;
 pub use submission::{Submission, SubmitRejection, Submitted, TraceContext, mint};
 use waiting_room::WaitingRoom;
@@ -163,6 +172,10 @@ const CHAIN_ENTRY_FRAMING_BYTES: u64 = 6;
 /// The failure kind of a coalescing generation whose folded chain grew too
 /// large to hand to any worker.
 pub const COALESCED_PAYLOAD_TOO_LARGE: &str = "CoalescedPayloadTooLarge";
+
+/// The failure kind of a run that returned a step too large for its task's
+/// record.
+pub const CONTINUATION_TOO_LARGE: &str = "ContinuationTooLarge";
 
 /// A version for measuring a record's size, which does not depend on it.
 const UNVERSIONED: RecordVersion = RecordVersion {
@@ -209,6 +222,9 @@ pub enum Event {
         task_id: TaskId,
         task_run_id: TaskRunId,
     },
+    /// A composite is over: its client, or the handle of the task it
+    /// continues, is to be told.
+    CompositeFinished(composite::CompositeFinished),
 }
 
 /// Owns all Tasks and TaskRuns and decides every claim and report. Drive it
@@ -239,7 +255,10 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     occupancy: Occupancy,
     /// The bytes tasks hold, the limits on them and `SlowDown`.
     budget: MemoryBudget,
-    /// Tasks whose run is certified but whose continuation has not ended.
+    /// The bytes of results a worker read as the input of a member's run,
+    /// counted in `budget` until the run is decided.
+    member_inputs: BTreeMap<TaskRunId, u64>,
+    /// Tasks whose run is certified but whose continuation composite is not over.
     continuing: BTreeSet<TaskId>,
     /// How many runs of each task were lost with their worker. A replay of a
     /// lost run is not a retry, so these attempts do not count against the
@@ -278,6 +297,8 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     /// Per queue, the runs that were claimed or running when added. Finished
     /// runs are ignored when counted and dropped as runs are added.
     running: BTreeMap<String, BTreeSet<TaskRunId>>,
+    /// The composites it drives, and keeps until their retention ends.
+    composites: Composites,
 }
 
 impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
@@ -308,6 +329,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             held_cancels: Vec::new(),
             occupancy: Occupancy::default(),
             budget: MemoryBudget::default(),
+            member_inputs: BTreeMap::new(),
             continuing: BTreeSet::new(),
             losses: BTreeMap::new(),
             unpublished: BTreeSet::new(),
@@ -323,6 +345,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             turns: Turns::default(),
             subscriptions: BTreeMap::new(),
             running: BTreeMap::new(),
+            composites: Composites::default(),
         }
     }
 
@@ -349,6 +372,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     pub fn task_run(&self, run_id: &TaskRunId) -> Option<&TaskRun> {
         self.runs.get(run_id)
+    }
+
+    /// The Task `run_id` is a run of; `None` if the run is unknown or its
+    /// task has been forgotten.
+    pub fn task_of_run(&self, run_id: &TaskRunId) -> Option<&Task> {
+        self.tasks.get(&self.runs.get(run_id)?.task_id())
     }
 
     /// Every run of `task_id`, oldest attempt first; empty if the task is
@@ -386,10 +415,18 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.reconciliation.is_uncertain(task)
     }
 
-    /// Whether it holds `task`: it decides the task, and a driver that kept
-    /// where it wrote its record can forget the task once this is false.
-    pub fn holds(&self, task: &TaskId) -> bool {
-        self.tasks.contains_key(task)
+    /// Whether it holds the record `key` names: it decides it, and a driver
+    /// that kept where it wrote the record can forget it once this is false.
+    pub fn holds(&self, key: &RecordKey) -> bool {
+        match key {
+            RecordKey::Task(task) => self.tasks.contains_key(task),
+            RecordKey::Composite(id) => self.composites.held.contains_key(id),
+            RecordKey::Page(id, page) => self
+                .composites
+                .held
+                .get(id)
+                .is_some_and(|composite| *page < composite.pages()),
+        }
     }
 
     /// How many tasks are queued to be claimed, including generations their
@@ -414,6 +451,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.run_decided_at
             .insert(run_id.clone(), self.clock.now());
         self.unpublished.insert(self.runs[run_id].task_id());
+        self.release_decided_member_input(run_id);
     }
 
     fn mark_current_decided(&mut self, task_id: &TaskId) {

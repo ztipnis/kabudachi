@@ -16,6 +16,7 @@ import pytest
 from cluster import (
     HEARTBEAT_TIMEOUT,
     RECONNECT_TIMEOUT,
+    STAGE_SECONDS,
     TIMINGS,
     Cluster,
     Worker,
@@ -23,6 +24,7 @@ from cluster import (
     digest_of,
     eventually,
     free_port,
+    outcome,
     probe,
     running_on,
     settled,
@@ -30,6 +32,11 @@ from cluster import (
 )
 from networked_tasks import BULK_BYTES, awaits, bulk, echo, fleeting, gather, hold, spin, varied_text
 from proto_messages import Greeting
+
+
+# What `pipeline` of "a" gives: a flow's last result, a group's results, and
+# a returned flow's results, and what a failed group member's client was told.
+PIPELINE_OF_A = ["LOADED A", "loaded a", "A", "loaded a", "LOADED A", "ValueError: refused a"]
 
 
 def finished(shard, task_id):
@@ -250,6 +257,103 @@ def worker_killed(cluster, leader):
             assert eventually("its handle", lambda: settled(leader, each))["error"] is None
 
 
+# The leader of a pipeline's cluster claims nothing, so killing it loses no
+# run. Of the others, the one that claims the pipeline's body claims nothing
+# besides it, so the stages it awaits run on the rest.
+LEADER_RUNS_NOTHING = {0: {"KABUDACHI_TEST_CLAIMS_NOTHING": "1"}}
+BODY_HOST_RUNS_ONLY_IT = {"KABUDACHI_TEST_CLAIMS_NOTHING_AFTER": "cluster.pipeline"}
+
+
+def first_stage_started_on(cluster, markers):
+    """The worker running the first `shout` stage, once it has started."""
+    marker = next(markers.glob("shout.*"), None)
+    if marker is None:
+        return None
+    return next(worker for worker in cluster.workers if worker.pid == int(marker.read_text()))
+
+
+def committed_at_most_once(cluster, markers, definitions):
+    """No task a pipeline made of the `definitions`, found by the claim markers
+    the workers left, has more than one run that succeeded; returns how many
+    have one. A stage whose run is lost, or whose result a shard with no leader
+    could not store, is replayed, so a stage may run more than once; what must
+    hold is that no result is committed twice."""
+    claimed = {
+        marker.read_text()
+        for definition in definitions
+        for marker in markers.glob(f"claimed.{definition}.*")
+    }
+    committed = 0
+    for task_id in claimed:
+        record = finished(cluster, task_id)
+        succeeded = states(record).count("SUCCEEDED")
+        assert succeeded <= 1, record
+        committed += succeeded
+    return committed
+
+
+def running_a_stage_besides(cluster, markers, kept):
+    """A worker not among `kept` that started a `shout` stage a moment ago, so
+    is still in it: a stage lasts a second."""
+    for marker in markers.glob("shout.*"):
+        if time.time() - marker.stat().st_mtime > STAGE_SECONDS * 0.9:
+            continue
+        worker = next(worker for worker in cluster.workers if worker.pid == int(marker.read_text()))
+        if worker not in kept:
+            return worker
+    return None
+
+
+def test_a_stage_running_on_a_killed_worker_is_replayed_once_and_the_pipeline_ends_as_it_would_have(tmp_path):
+    # The leader submits a body that awaits a flow, a group and a returned
+    # step, each a composite it runs. A worker besides the body's, running a
+    # stage, is killed mid-stage: the stage's run is lost and replayed once.
+    cluster = Cluster.start(
+        tmp_path, size=4, overrides={**LEADER_RUNS_NOTHING, **{n: BODY_HOST_RUNS_ONLY_IT for n in (1, 2, 3)}}
+    )
+    try:
+        leader = cluster.workers[0]
+        assert cluster.leader() is leader
+        piped = leader.submit("pipeline", text="a")
+        body = eventually("the body to run", lambda: running_on(cluster, piped))
+        victim = eventually(
+            "a stage to run on another worker",
+            lambda: running_a_stage_besides(cluster, tmp_path, {leader, body}),
+        )
+        victim.kill()
+        assert outcome(leader, piped) == PIPELINE_OF_A
+        assert states(cluster.record(piped)) == ["SUCCEEDED"], "the body never ran twice"
+        # Three stages, and at least the killed one's replay. No stage or
+        # planning task commits a result twice.
+        assert len(list(tmp_path.glob("shout.*"))) >= 4
+        assert committed_at_most_once(cluster, tmp_path, ["shout", "plan", "load"]) >= 8
+    finally:
+        cluster.close()
+
+
+def test_a_pipeline_whose_leader_is_killed_between_its_stages_ends_as_it_would_have_with_each_stage_run_at_least_once_and_committed_at_most_once(
+    tmp_path,
+):
+    cluster = Cluster.start(tmp_path, overrides=LEADER_RUNS_NOTHING)
+    try:
+        leader, client, _ = cluster.workers
+        assert cluster.leader() is leader
+        piped = client.submit("pipeline", text="a")
+        eventually("its first stage to start", lambda: first_stage_started_on(cluster, tmp_path))
+        leader.kill()
+        assert outcome(client, piped) == PIPELINE_OF_A
+        # A slow election (a second term) can outlast the body's worker's abort
+        # deadline, so the new leader replays the body.
+        runs = states(cluster.record(piped))
+        assert runs[-1] == "SUCCEEDED" and set(runs[:-1]) <= {"LOST"}, runs
+        # At least once each: a stage in flight when the leader died may be
+        # replayed. None commits a result twice.
+        assert len(list(tmp_path.glob("shout.*"))) >= 3
+        assert committed_at_most_once(cluster, tmp_path, ["shout", "plan", "load"]) >= 8
+    finally:
+        cluster.close()
+
+
 def test_a_client_too_small_to_hold_a_result_has_its_handle_fail_while_the_run_completes_elsewhere(tmp_path):
     leader, client = 0, 1
     cluster = Cluster.start(
@@ -304,6 +408,44 @@ def test_a_run_whose_result_no_store_has_room_for_is_lost_at_its_bound_and_its_r
         cluster.close()
 
 
+def test_a_worker_whose_run_is_cancelled_before_python_takes_it_offers_its_place_again(tmp_path):
+    # Only the last worker claims, with two places and an in-flight share of
+    # 6 MB: of two tasks queued together (the claimant is held still until both
+    # are), whichever its first claim reaches first runs, and the other's input does not fit beside it, so that run
+    # waits for room before Python can take it. The waiting run is cancelled,
+    # and the place it held must be offered again: a third task runs on that
+    # worker while the first still runs.
+    roomy = {"KABUDACHI_MEMORY_HARD_LIMIT": "40000000"}
+    claims_nothing = {**roomy, "KABUDACHI_TEST_CLAIMS_NOTHING": "1"}
+    claimant = {"KABUDACHI_MEMORY_HARD_LIMIT": "12000000", "KABUDACHI_CONCURRENCY": "2"}
+    cluster = Cluster.start(tmp_path, overrides={0: claims_nothing, 1: claims_nothing, 2: claimant})
+    try:
+        submitter = cluster.workers[0]
+        with stopped(cluster.workers[2]):
+            texts = {
+                submitter.submit("weigh", text="weighA01" + varied_text(2_500_000)): "weighA01",
+                submitter.submit("weigh", text="weighB01" + varied_text(3_800_000)): "weighB01",
+            }
+            for task in texts:
+                eventually("the task to be queued", lambda task=task: cluster.record(task) is not None)
+        [running] = eventually(
+            "one of them to run",
+            lambda: [task for task, key in texts.items() if (tmp_path / f"{key}.started").exists()],
+            timeout=30,
+        )
+        [waiting] = [task for task in texts if task != running]
+        eventually("the other to be claimed", lambda: states(cluster.record(waiting)) == ["CLAIMED"], timeout=30)
+        assert submitter.ask(cancel=waiting)["cancelled"]
+        eventually("its run to end", lambda: "CANCELLED" in states(cluster.record(waiting)))
+
+        next_in_line = submitter.submit("hold", text="after001")
+        certified_once(cluster, next_in_line, digest_of(hold, Greeting(text="after001")))
+        assert not cluster.record(running)["finished"]
+        (tmp_path / f"{texts[running]}.go").touch()
+    finally:
+        cluster.close()
+
+
 def test_a_cut_off_worker_stops_its_run_by_its_deadline_an_unreached_client_still_hears_its_tasks_ends_and_runs_certify_once_when_their_leader_is_killed(
     cluster, tmp_path
 ):
@@ -323,9 +465,13 @@ def cut_off_by_its_deadline(cluster, tmp_path):
                 return task, holder
 
     cut_off, holder = eventually("a follower to run one of them", on_a_follower)
-    for task in held:
-        if task != cut_off:
-            leader.ask(cancel=task)
+    others = [task for task in held if task != cut_off]
+    for task in others:
+        leader.ask(cancel=task)
+    # Decided before the other workers stop: a cancel in flight to a stopped
+    # worker would be neither heard nor decided.
+    for task in others:
+        finished(cluster, task)
     text = held[cut_off]
     # With the other two stopped, nobody can tell the holder to stop its run:
     # only its own abort deadline can.
@@ -370,13 +516,17 @@ def unreached_while_the_leader_is_killed(cluster, tmp_path):
     # worker, and is stopped once its own is cancelled. The other two runs
     # cannot deliver to it within their reconnect timeout: one certifies
     # with its result undelivered, the other is cancelled while it delivers.
-    # The leader is then killed while it and the other follower each run a
+    # The undelivered one must run on the leader, which is then killed with
+    # its buffered delivery: a surviving worker holding it would still
+    # deliver the buffered result once the client resumes, and a matching
+    # certified digest would settle the handle with that result instead of
+    # leaving it unavailable. The leader is then killed while it and the other follower each run a
     # task, so the client, resumed, learns how its tasks ended only by
     # asking the leader the two survivors elect, under which every run
     # certifies once.
     leader = cluster.leader()
     client, other = [worker for worker in cluster.workers if worker is not leader]
-    texts, holders, own, unreached, interrupted = one_on_each_worker(cluster, tmp_path, client)
+    texts, holders, own, unreached, interrupted = one_on_each_worker(cluster, tmp_path, client, leader)
     client.ask(cancel=own)
     eventually("its own body to stop", lambda: (tmp_path / f"{texts[own]}.stopped").exists())
 
@@ -396,17 +546,17 @@ def unreached_while_the_leader_is_killed(cluster, tmp_path):
     certified_once_and_settled(cluster, other, tasks)
 
 
-def one_on_each_worker(cluster, tmp_path, client):
+def one_on_each_worker(cluster, tmp_path, client, leader):
     """Three gated holds `client` submits, once one runs on each worker:
-    each task's text, each text's worker, the task `client` runs itself, and
-    the other two."""
+    each task's text, each text's worker, the task `client` runs itself, the
+    one `leader` runs, and the one the other follower runs."""
     texts = {client.submit("hold", text=f"unreached-{n}", times=GATED): f"unreached-{n}" for n in range(3)}
-    # Idle workers poll for work at growing intervals, up to 5 s, and a worker
-    # just resumed or rejoined starts from its longest: each of three claims
+    # Idle workers poll for work at growing intervals, up to 5 s, so a claim
     # can wait one.
     holders = eventually("all three to run", lambda: started_on(cluster, tmp_path, texts.values()), timeout=45)
     [own] = [task for task, text in texts.items() if holders[text] is client]
-    unreached, interrupted = [task for task in texts if task != own]
+    [unreached] = [task for task, text in texts.items() if holders[text] is leader]
+    [interrupted] = [task for task in texts if task not in (own, unreached)]
     return texts, holders, own, unreached, interrupted
 
 

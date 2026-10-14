@@ -27,6 +27,9 @@ pub struct Outcome {
     /// The run's result reached the task's client before the run was
     /// reported completed.
     pub delivered: bool,
+    /// The run returned a step instead of a result: `result_digest` names
+    /// the step, and the task is over when the step's composite is.
+    pub continued: bool,
 }
 
 /// A task that has a client ended: the client is to be told how, once
@@ -97,16 +100,19 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 .and_then(|link| link.superseded_by.clone())
                 .map(TaskId::from),
             delivered: run.delivered,
+            continued: run.continuation.is_some(),
         })
     }
 
     /// Leaves a conclusion for `task_id`'s client, if it has one: its
-    /// current run has just ended the task.
+    /// current run has just ended the task. A task whose run returned a step
+    /// concludes nothing: its client takes its end from the step's, and a
+    /// certification of the step's digest would match no result it holds.
     pub(super) fn conclude(&mut self, task_id: &TaskId) {
         let Some(client) = self.tasks.get(task_id).and_then(|task| task.client()) else {
             return;
         };
-        if let Some(outcome) = self.outcome_of(task_id) {
+        if let Some(outcome) = self.outcome_of(task_id).filter(|outcome| !outcome.continued) {
             self.conclusions.push(Conclusion { client, outcome });
         }
     }

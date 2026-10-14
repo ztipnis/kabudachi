@@ -351,7 +351,7 @@ fn steps(count: u64) -> Duration {
     Duration::from_ticks(STEP.as_ticks() * count)
 }
 
-fn run_until_settled(cluster: &mut Cluster) {
+pub(crate) fn run_until_settled(cluster: &mut Cluster) {
     while cluster.records().next_due().is_some() {
         cluster.advance(STEP);
     }

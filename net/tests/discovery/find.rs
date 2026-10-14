@@ -11,11 +11,11 @@ use std::time::Duration;
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::messages::Claim;
 use kabudachi_core::protocol::messages::prelude::*;
+use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::{RealClock, WallTime};
 use kabudachi_net::discovery::{Found, Stage};
 use kabudachi_net::messenger::{Net, PlacedWrite};
 use kabudachi_net::task_store::placement::{ReplicationFactor, placement};
-use kabudachi_net::task_store::record_key;
 use libp2p::PeerId;
 use libp2p::kad::{KBucketDistance, KBucketKey};
 
@@ -59,7 +59,7 @@ fn distance(worker: &WorkerId, peer: &WorkerId) -> KBucketDistance {
 fn nearest_first(worker: &WorkerId, tasks: &[TaskId]) -> Vec<TaskId> {
     let local = KBucketKey::from(PeerId::from_str(worker.as_str()).expect("a worker id is a peer id"));
     let mut tasks = tasks.to_vec();
-    tasks.sort_by_key(|task| KBucketKey::new(record_key(task)).distance(&local));
+    tasks.sort_by_key(|task| KBucketKey::new(RecordKey::Task(task.clone()).kad_bytes()).distance(&local));
     tasks
 }
 
@@ -114,7 +114,7 @@ fn laid_out(voters: &[WorkerId], worker: &WorkerId, targets: &[Vec<WorkerId>]) -
     let (mut mine, mut near, mut far) = (Vec::new(), None, None);
     for n in 0..IDS_TRIED {
         let task = TaskId::new(format!("task-{n:06}"));
-        let holder = placement(&task, voters, one_holder())?.holders.remove(0);
+        let holder = placement(&RecordKey::Task(task.clone()), voters, one_holder())?.holders.remove(0);
         if holder == *worker {
             if nearest_first(worker, &mine) == mine {
                 mine.push(task);
@@ -278,7 +278,7 @@ async fn a_claim_the_workers_stale_record_suggested_is_refused_and_discovery_mov
                 claimed(&nets[rival], &ids[leader], &task).await;
                 let mut lagging = waiting;
                 lagging.placement = vec![ids[worker].clone().into()];
-                client.write_records(vec![PlacedWrite::new(lagging, 1)]);
+                client.write_records(vec![PlacedWrite::new(lagging.into(), 1)]);
                 wait_until_held(nets[worker].clone(), vec![task]).await;
 
                 nets[worker].discover(ids[leader].clone(), 1, now(), &takes(false), None).await

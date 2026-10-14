@@ -41,6 +41,10 @@ message TaskRecord {
   // wrote this carries them into its own writes, so no placement the record
   // may still be known by is left behind by a change of leader.
   repeated PlacementHolders prior_placements = 10;
+  // The task is a member of a composite its leader still holds: its results
+  // are read through that composite until it is forgotten. Holders start the
+  // retention of a finished record only once a revision clears this.
+  bool retained_by_composite = 11;
 }
 
 // The holders of one placement.

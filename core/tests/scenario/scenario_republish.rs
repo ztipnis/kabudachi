@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 
+use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::Duration;
@@ -22,7 +23,7 @@ fn voter(index: usize) -> WorkerId {
 }
 
 fn holders(task: &TaskId, voters: &[WorkerId]) -> Vec<WorkerId> {
-    RecordSpace::placement(task, voters, REPLICATION_FACTOR).0
+    RecordSpace::placement(&RecordKey::Task(task.clone()), voters, REPLICATION_FACTOR).0
 }
 
 fn advance_for(cluster: &mut Cluster, span: Duration) {

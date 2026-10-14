@@ -89,6 +89,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             prior_placements: Vec::new(),
             published_at: None,
             finished: false,
+            retained_by_composite: false,
         };
         record.encoded_len() as u64
     }

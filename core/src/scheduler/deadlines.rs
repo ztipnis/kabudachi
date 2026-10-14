@@ -72,7 +72,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// An unbounded lease adds nothing. Also the next replay of a silent
     /// worker's run, only while this scheduler leads.
     pub fn next_deadline(&self) -> Option<Instant> {
-        let forgetting = self.retention.next_due();
+        let forgetting = [
+            self.retention.next_due(),
+            self.retention
+                .ttl()
+                .and_then(|ttl| self.composites.next_due(ttl)),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let lease_end = self.leadership.noticed_lease_end();
         let waiting = if self.is_leader() {
             self.waiting.next_deadline()

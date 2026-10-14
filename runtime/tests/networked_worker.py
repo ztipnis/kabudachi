@@ -33,8 +33,9 @@ def say(**message) -> None:
 
 async def settled(handle) -> None:
     try:
-        await handle
-        say(settled=handle.task_id, error=None)
+        result = await handle
+        results = result if isinstance(result, list) else [result]
+        say(settled=handle.task_id, error=None, texts=[item.text for item in results])
     except Exception as error:
         say(settled=handle.task_id, error=type(error).__name__)
 
@@ -54,17 +55,30 @@ class NotingClaims:
 
     def __init__(self, runtime) -> None:
         self._runtime = runtime
+        self._claimed_the_last = False
 
     def __getattr__(self, name: str):
         return getattr(self._runtime, name)
 
     async def claim_pending(self, limit: int):
-        if os.environ.get("KABUDACHI_TEST_CLAIMS_NOTHING"):
+        if os.environ.get("KABUDACHI_TEST_CLAIMS_NOTHING") or self._claimed_the_last:
             # Never asks the runtime for claims, so Python offers its driver
-            # no places and the worker runs nothing: a pure client.
+            # no places and the worker runs nothing more: a pure client.
             await asyncio.Event().wait()
         claims = await self._runtime.claim_pending(limit)
         CLIENTS.update((claim.task_id, claim.client) for claim in claims)
+        # Written for the test, which reads them after this worker may have
+        # been killed: the tasks a pipeline made, and so which records to read.
+        markers = os.environ.get("KABUDACHI_TEST_MARKERS")
+        for claim in claims:
+            if markers and claim.definition_id.startswith("cluster."):
+                name = f"claimed.{claim.definition_id.removeprefix('cluster.')}.{claim.task_run_id}"
+                with open(os.path.join(markers, name), "w") as written:
+                    written.write(claim.task_id)
+        # A worker that claimed the task named here runs nothing besides it,
+        # so what that task calls runs on the other workers.
+        last = os.environ.get("KABUDACHI_TEST_CLAIMS_NOTHING_AFTER")
+        self._claimed_the_last = bool(last) and any(claim.definition_id == last for claim in claims)
         return claims
 
 # How long the drain after stdin closes may take before the worker exits

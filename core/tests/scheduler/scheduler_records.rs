@@ -13,12 +13,11 @@ use kabudachi_core::scheduler::{
     Completion, Event, LeadershipGrant, LeaseEnd, MAX_SUBMISSION_BYTES, Submission, SubmitRejection,
     Submitted,
 };
-use kabudachi_core::task_record::{
-    HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion, VersionOrder,
-};
+use kabudachi_core::task_record::{HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordKey, RecordVersion, VersionOrder};
 use kabudachi_core::time::{Instant, WallTime};
 use prost::Message;
 
+use crate::support::composites::{continue_with_a_stage, end_continuation};
 use crate::support::grant::unbounded_grant;
 use crate::support::scheduler::{Fixture, ticks};
 
@@ -204,17 +203,14 @@ fn the_revision_that_ends_a_task_says_so_and_a_continuation_ends_it_later() {
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
     fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
 
-    fixture
-        .scheduler
-        .complete(&worker(), &claim.task_run_id, Digest::blake3(b"step"), Completion::Continues)
-        .unwrap();
-    let certified = fixture.spy.revisions().last().cloned().unwrap();
+    let continuation = continue_with_a_stage(&mut fixture, &claim.task_run_id);
+    let certified = fixture.spy.newest_revision_of(&task).unwrap();
     assert!(!certified.finished, "a continuing task is not over");
 
-    assert_eq!(fixture.scheduler.end_continuation(&task), Ok(true));
-    let ended = fixture.spy.revisions().last().cloned().unwrap();
+    end_continuation(&mut fixture, &continuation);
+    let ended = fixture.spy.newest_revision_of(&task).unwrap();
     assert!(ended.finished);
-    assert_eq!(version_of(&ended).revision, version_of(&certified).revision + 1);
+    assert!(version_of(&ended).revision > version_of(&certified).revision);
 }
 
 #[test]
@@ -373,7 +369,7 @@ fn a_republished_task_gets_a_newer_revision_with_the_same_contents() {
     let task = fixture.scheduler.submit(plain(b"a")).unwrap();
     let before = fixture.spy.newest_revision_of(&task).unwrap();
 
-    let republished = fixture.scheduler.republish(&[task.clone(), TaskId::new("unknown")]);
+    let republished = fixture.scheduler.republish(&[RecordKey::Task(task.clone()), RecordKey::Task(TaskId::new("unknown"))]);
 
     assert_eq!(republished, 1, "a task it does not hold is skipped");
     let after = fixture.spy.newest_revision_of(&task).unwrap();
@@ -391,7 +387,7 @@ fn a_scheduler_that_does_not_lead_republishes_nothing() {
     fixture.scheduler.set_leadership_grant(None);
     let mark = fixture.spy.mark();
 
-    assert_eq!(fixture.scheduler.republish(&[task]), 0);
+    assert_eq!(fixture.scheduler.republish(&[RecordKey::Task(task)]), 0);
 
     assert!(fixture.spy.revised_since(mark).is_empty());
     fixture.scheduler.set_leadership_grant(Some(unbounded_grant()));

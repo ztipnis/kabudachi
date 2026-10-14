@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 
+use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::Duration;
@@ -47,7 +48,7 @@ fn submitted_to_move(cluster: &mut Cluster, leader: &WorkerId) -> Move {
     let all: Vec<WorkerId> = (0..5).map(|n| worker(&format!("worker-{n}"))).collect();
     for _ in 0..200 {
         let task = submitted(cluster, leader);
-        let after = RecordSpace::placement(&task, &all, FACTOR).0;
+        let after = RecordSpace::placement(&RecordKey::Task(task.clone()), &all, FACTOR).0;
         let kept: Vec<&WorkerId> = after.iter().filter(|id| voters.contains(id) && *id != leader).collect();
         let gained: Vec<&WorkerId> = after.iter().filter(|id| !voters.contains(id)).collect();
         if after.contains(leader) && kept.len() == 1 && gained.len() == 1 {
@@ -176,7 +177,7 @@ fn submitted_to_three_joiners(cluster: &mut Cluster, leader: &WorkerId) -> (Task
     let all: Vec<WorkerId> = (0..11).map(|n| worker(&format!("worker-{n}"))).collect();
     for _ in 0..400 {
         let task = submitted(cluster, leader);
-        let after = RecordSpace::placement(&task, &all, FACTOR).0;
+        let after = RecordSpace::placement(&RecordKey::Task(task.clone()), &all, FACTOR).0;
         if after.iter().all(|id| all[3..].contains(id)) {
             return (task, after);
         }

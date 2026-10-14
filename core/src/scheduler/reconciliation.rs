@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::coalescing::{self, Key};
 use crate::protocol::generated::TaskRecord;
-use crate::protocol::ids::{TaskId, TaskRunId, WorkerId};
+use crate::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::Task;
 use crate::protocol::messages::prelude::*;
 use crate::protocol::records::TaskRunRecord;
@@ -35,6 +35,9 @@ pub(super) struct Reconciliation {
     /// The coalescing key of each task in `uncertain` that has one. While any
     /// generation of a key is in here, no generation of that key is installed.
     uncertain_keys: BTreeMap<TaskId, Key>,
+    /// Composites some worker holds whose newest record cannot be known yet:
+    /// cancels of them are answered `NotReady`.
+    uncertain_composites: BTreeSet<CompositeId>,
     /// Records known for certain that are held back with their key: a
     /// generation of the key has no record this leader can rely on yet.
     deferred: BTreeMap<TaskId, TaskRecord>,
@@ -60,6 +63,17 @@ impl Reconciliation {
     /// Whether `task`'s newest record cannot be known yet.
     pub(super) fn is_uncertain(&self, task: &TaskId) -> bool {
         self.uncertain.contains_key(task)
+    }
+
+    /// Whether `composite`'s newest record cannot be known yet.
+    pub(super) fn is_uncertain_composite(&self, composite: &CompositeId) -> bool {
+        self.uncertain_composites.contains(composite)
+    }
+
+    /// Whether any task or composite still waits for a record this leader
+    /// can rely on.
+    pub(super) fn has_unknown(&self) -> bool {
+        !self.uncertain.is_empty() || !self.uncertain_composites.is_empty()
     }
 
     /// Whether `run` is one of an uncertain task's known runs.
@@ -111,6 +125,23 @@ impl Reconciliation {
             .or_default()
             .extend(runs);
         self.deferred.insert(task_id, record);
+    }
+
+    /// Takes late knowledge of composites: those of `handed` had their
+    /// records or pages handed and are known now unless `uncertain` still
+    /// names them, and those of `uncertain` that `held` does not hold wait
+    /// for a record.
+    pub(super) fn learn_composites(
+        &mut self,
+        handed: &[CompositeId],
+        uncertain: BTreeSet<CompositeId>,
+        held: impl Fn(&CompositeId) -> bool,
+    ) {
+        for id in handed.iter().filter(|id| !uncertain.contains(*id)) {
+            self.uncertain_composites.remove(id);
+        }
+        self.uncertain_composites
+            .extend(uncertain.into_iter().filter(|id| !held(id)));
     }
 
     /// Takes late knowledge: returns the newest known record of every task
@@ -256,6 +287,7 @@ impl Reconciliation {
         answered: BTreeSet<WorkerId>,
         uncertain: BTreeMap<TaskId, BTreeSet<TaskRunId>>,
         uncertain_keys: BTreeMap<TaskId, CoalescingKey>,
+        uncertain_composites: BTreeSet<CompositeId>,
     ) -> ReconcileTerm {
         let office = self
             .office
@@ -266,6 +298,7 @@ impl Reconciliation {
         self.answered = answered;
         self.uncertain = uncertain;
         self.uncertain_keys = key_map(uncertain_keys);
+        self.uncertain_composites = uncertain_composites;
         self.deferred.clear();
         self.held_reports.clear();
         term

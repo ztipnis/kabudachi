@@ -1,344 +1,225 @@
-"""Flows and groups: what running one is, and what its handle is.
+"""Flows, groups and maps: the handles of the ones this process submitted.
 
-A flow runs its stages one after another, a group runs its members side by
-side, and both are orchestrated here, on the session's event loop, rather than
-by the leader: only the tasks they submit are the leader's business.
-Cancelling either cascades to what it started, which is why the handles
-live here too, next to the orchestration that is the only thing allowed to
-know their insides.
+The shard's leader runs a composite: it starts each stage or member, settles
+them as they end, and tells the process that submitted it when it is over.
+This only submits composites, cancels them, and settles each handle when its
+composite finishes.
 """
 
-import asyncio
-import contextlib
-import contextvars
-import functools
-import itertools
+import threading
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from kabudachi._native import CancelOutcome
 from kabudachi.errors import (
+    PayloadTooLargeError,
     RunStoppedError,
     RuntimeNotStartedError,
     TaskCancelledError,
-    TaskInterruptedError,
-    interrupted,
 )
-# TaskCancelledError, TaskInterruptedError, interrupted
-from kabudachi.handle import TaskHandle, run_callback_inline
-
+from kabudachi.handle import TaskHandle
 from kabudachi.hosted_work import LoopHostedWork
+from kabudachi.native_protocol import Event, Runtime
 from kabudachi.status import CompositeStatus
 
 if TYPE_CHECKING:
     from kabudachi.session import Session
 
-
-def _state_of(handle: TaskHandle) -> str:
-    """How a started stage, member, flow or group stands, by its handle."""
-    if not handle.done():
-        return "running"
-    error = handle._outcome.exception()
-    if error is None:
-        return "succeeded"
-    if isinstance(error, TaskCancelledError):
-        return "cancelled"
-    return "failed"
+_COUNTED = ("pending", "running", "succeeded", "failed", "cancelled")
 
 
-def _counts(states: list[str]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for state in states:
-        counts[state] = counts.get(state, 0) + 1
-    return counts
+class CompositeHandle(TaskHandle):
+    """A submitted flow, group or map, named by its composite id. Await it for
+    the results of its stages or members, in order. If a stage fails, or a
+    member does under `fail_fast`, awaiting raises that error.
 
-
-class FlowHandle(TaskHandle):
-    """A submitted flow. Await it for the results of its stages, in stage
-    order. If a stage fails, awaiting raises that stage's error and no later
-    stage starts.
-
-    `cancel()` cancels the stage that is running and starts no later one.
+    `cancel()` cancels the stage that is running, or every member that has not
+    finished, and starts nothing more.
     """
 
-    def __init__(
-        self,
-        flow_id: str,
-        stage_count: int,
-        callback_runner: Callable[[Callable[[Any], Any], Any], None] = run_callback_inline,
-    ) -> None:
-        super().__init__(flow_id, self._cancel_stage, callback_runner)
-        self._stage_count = stage_count
-        self._stages: list[TaskHandle] = []
-        # The stage now running and whether it is the last, published together
-        # so a cancel from another thread never pairs one with the other's.
-        self._current: tuple[TaskHandle, bool] | None = None
-        self._cancel_requested = False
-
-    @property
-    def cancel_requested(self) -> bool:
-        """Whether a cancel of this flow has been accepted, so no further
-        stage may start."""
-        return self._cancel_requested
-
-    def stage_started(self, stage: TaskHandle, is_last: bool) -> None:
-        """The stage now running, and whether it is the last one, so a cancel
-        knows what to cancel and whether anything would follow it."""
-        self._current = (stage, is_last)
-        self._stages.append(stage)
-
-    async def status(self) -> CompositeStatus:
-        """How the flow stands: its state, its stages by state, and the index
-        of the stage it is at or ended on."""
-        stages = list(self._stages)
-        states = [_state_of(stage) for stage in stages]
-        states += ["pending"] * (self._stage_count - len(stages))
-        return CompositeStatus(
-            self.task_id,
-            "flow",
-            _state_of(self),
-            MappingProxyType(_counts(states)),
-            max(len(stages) - 1, 0),
-        )
-
-    def _cancel_stage(self, _flow_id: str) -> bool:
-        # The flag first: a stage that is being submitted right now sees it.
-        self._cancel_requested = True
-        current = self._current
-        if current is None:
-            # Nothing has started, and nothing will.
-            return True
-        stage, is_last = current
-        stage_succeeded = stage.done() and stage._outcome.exception() is None
-        if stage.cancel() or (stage_succeeded and not is_last):
-            return True
-        # Nothing was cancelled, so the flow runs on.
-        self._cancel_requested = False
-        return False
-
-
-class GroupHandle(TaskHandle):
-    """A submitted group. Await it for the results of its members, in member
-    order. `cancel()` cancels every member that has not finished."""
+    kind = "group"
+    """What `status()` calls this composite."""
 
     def __init__(
         self,
-        group_id: str,
-        callback_runner: Callable[[Callable[[Any], Any], Any], None] = run_callback_inline,
+        composite_id: str,
+        runtime: Runtime,
+        callback_runner: Any,
     ) -> None:
-        super().__init__(group_id, self._cancel_members, callback_runner)
-        self._members: list[TaskHandle] = []
-        self._cancel_requested = False
-
-    @property
-    def cancel_requested(self) -> bool:
-        """Whether a cancel of this group has been accepted, so no further
-        member may start."""
-        return self._cancel_requested
-
-    @property
-    def members(self) -> list[TaskHandle]:
-        """The members started so far, as they were at this moment: a member
-        can be added while the list is being walked."""
-        return list(self._members)
-
-    def member_started(self, member: TaskHandle) -> None:
-        """One more member is running, so a cancel reaches it too."""
-        self._members.append(member)
+        super().__init__(
+            composite_id,
+            self._cancel_composite,
+            callback_runner,
+            shard_id=runtime.shard_id(),
+            replicable=not runtime.certifies_locally,
+        )
+        self._runtime = runtime
 
     async def status(self) -> CompositeStatus:
-        """How the group stands: its state and its members by state."""
+        """How the composite stands: its state, its stages or members by
+        state, and, for a flow, the index of the stage it is at or ended on."""
+        found = await self._runtime.composite_status(self.task_id)
+        if found is None:
+            # The leader no longer holds it: what this handle was settled with is all there is.
+            return CompositeStatus(self.task_id, self.kind, self._settled_state(), MappingProxyType({}))
+        state, stage, *counts = found
         return CompositeStatus(
             self.task_id,
-            "group",
-            _state_of(self),
-            MappingProxyType(_counts([_state_of(member) for member in self.members])),
+            self.kind,
+            state,
+            MappingProxyType({name: n for name, n in zip(_COUNTED, counts) if n}),
+            stage if self.kind == "flow" else None,
         )
 
-    def _cancel_members(self, _group_id: str) -> bool:
-        # The flag first: a member that is being submitted right now sees it.
-        self._cancel_requested = True
-        if not self._members:
-            # Nothing has started, and nothing will.
-            return True
-        cancelled = [member.cancel() for member in list(self._members)]
-        if any(cancelled):
-            return True
-        # Nothing was cancelled, so the group runs on.
-        self._cancel_requested = False
-        return False
+    def _settled_state(self) -> str:
+        if not self.done():
+            return "running"
+        error = self._outcome.exception()
+        if error is None:
+            return "succeeded"
+        return "cancelled" if isinstance(error, TaskCancelledError) else "failed"
+
+    def _cancel_composite(self, composite_id: str) -> bool:
+        outcome = self._runtime.cancel_composite(composite_id)
+        # `None`: sent to a leader elsewhere, which decides.
+        return outcome is None or outcome == CancelOutcome.CANCELLED
 
 
-@contextlib.asynccontextmanager
-async def _settling(handle: TaskHandle) -> AsyncIterator[None]:
-    """Settles `handle` with whatever ends the orchestration inside it: its own
-    error, or, for anything worse than an exception, a `TaskInterruptedError`
-    that is then re-raised, so the loop still sees what really happened. The
-    only way a flow or a group fails."""
-    try:
-        yield
-    except Exception as error:
-        handle._fail(error)
-    except BaseException as error:
-        handle._fail(interrupted(handle.task_id, error))
-        raise
+class FlowHandle(CompositeHandle):
+    """A submitted flow: its results are those of its stages, in stage order."""
+
+    kind = "flow"
+
+
+class GroupHandle(CompositeHandle):
+    """A submitted group or map: its results are those of its members, in
+    member order."""
+
+
+async def composite_is_running(runtime: Runtime, composite_id: str) -> bool:
+    """Whether the leader still has the composite running, or has lost track of it."""
+    found = await runtime.composite_status(composite_id)
+    return found is None or found[0] == "running"
+
+
+def _largest_value(tree: Any) -> int:
+    """The size of the largest value bound anywhere in the described `tree`."""
+    if tree[0] == "task":
+        value = tree[4]
+        return len(value) if isinstance(value, bytes) else 0
+    return max((_largest_value(stage) for stage in tree[2]), default=0)
+
+
+def refuse_oversized_values(runtime: Runtime, tree: Any) -> None:
+    """Raises `PayloadTooLargeError` if a value bound anywhere in the
+    described `tree` alone is past the hard limit this process can hold."""
+    limit = runtime.payload_limit
+    if limit is not None and (size := _largest_value(tree)) > limit:
+        raise PayloadTooLargeError(
+            f"a value bound in this step is {size} bytes, past the {limit} this process can hold",
+            size,
+            limit,
+        )
 
 
 class Composites:
-    """The flows and groups one session is running.
-
-    A flow's stages and a group's members are ordinary tasks, so this owns
-    only the sequencing, the bulk submission and what a cancel does to what
-    was started. It hosts its own orchestrations on the run's loop. For
-    everything else it reaches its session: submitting a stage (through the
-    step), room to submit, whether the run is stopping, and the callback
-    runner.
-    """
+    """The flows, groups and maps this session submitted, by composite id.
+    The leader runs them; this only submits them, cancels them, and settles
+    each handle when its composite finishes."""
 
     def __init__(self, session: "Session", hosted: LoopHostedWork) -> None:
         self._session = session
         self._hosted = hosted
-        self._numbers = itertools.count(1)
-        self._live: weakref.WeakValueDictionary[str, FlowHandle | GroupHandle] = (
+        self._lock = threading.Lock()
+        self._open: dict[str, CompositeHandle] = {}
+        # Every handle still alive, finished or not, for status reads.
+        self._known: weakref.WeakValueDictionary[str, CompositeHandle] = (
             weakref.WeakValueDictionary()
         )
 
-    def submit_flow(self, flow: Any, previous: Any) -> FlowHandle:
-        """Starts `flow`, whose stages run one after another, and returns its
-        handle."""
-        handle = FlowHandle(
-            self._identifier("flow"), len(flow.stages), self._session.callback_runner
-        )
-        self._live[handle.task_id] = handle
-        self._host(self._run_flow(flow, previous, handle), handle)
-        return handle
-
-    def submit_group(self, group: Any, previous: Any) -> GroupHandle:
-        """Starts every member of `group` on `previous`, and returns the
-        group's handle."""
-        handle = GroupHandle(self._identifier("group"), self._session.callback_runner)
-        self._live[handle.task_id] = handle
-        self._host(self._run_group(group, previous, handle), handle)
-        return handle
-
-    def status_of(self, task_id: str) -> Awaitable[CompositeStatus] | None:
-        """The status read of a flow or group this session is running; `None`
-        for any other id."""
-        handle = self._live.get(task_id)
-        return None if handle is None else handle.status()
-
-    def _identifier(self, kind: str) -> str:
-        return f"{kind}-{next(self._numbers)}"
-
-    def _host(self, coroutine: Any, handle: TaskHandle) -> None:
-        """Runs one orchestration on the run's loop. Raises, leaving the
-        handle to be dropped by the caller, if the run cannot take it."""
+    def submit(self, step: Any, previous: Any) -> Any:
+        """Submits `step`, its first stages bound to `previous` when they take
+        an input, and returns its handle, a `step.handle_type`. Raises as a
+        submit does: `BackpressureError` past the hard limit,
+        `PayloadTooLargeError` for a value bound in it that is past the hard
+        limit alone, and `RunStoppedError` once the run is stopping."""
         if not self._hosted.has_loop():
-            coroutine.close()
             raise RuntimeNotStartedError(
                 "flows and groups can only be started while kabudachi.run() is serving"
             )
         if self._session.stopping:
-            coroutine.close()
             raise RunStoppedError("the run is stopping, so no more flows are accepted")
-        # Its own context, so awaiting its steps is not counted as the calling
-        # task body waiting.
-        if not self._hosted.spawn(
-            coroutine,
-            context=contextvars.Context(),
-            when_done=functools.partial(self._ended, handle),
-        ):
-            raise RuntimeNotStartedError("the run's event loop has closed")
+        tree = step.describe(self._session, previous)
+        runtime = self._session.runtime
+        refuse_oversized_values(runtime, tree)
+        with self._lock:
+            # Registered under the lock the finish is looked up under, so a
+            # composite that ends at once is never missed.
+            composite_id = runtime.submit_composite(tree)
+            handle = step.handle_type(composite_id, runtime, self._session.callback_runner)
+            self._open[composite_id] = handle
+            self._known[composite_id] = handle
+        return handle
 
-    @staticmethod
-    def _ended(handle: TaskHandle) -> None:
-        """The orchestration ended without settling its handle (it was
-        cancelled before it started, as a closing loop does), so the handle
-        fails here and nobody waits on it for ever."""
-        if not handle.done():
-            handle._fail(TaskInterruptedError(f"{handle.task_id} was interrupted before it ran"))
+    def accepted(self, composite_id: str) -> bool:
+        """A networked leader stored the composite on a quorum of its shard:
+        its handle is `REPLICATED`. Whether `composite_id` is one submitted
+        here."""
+        # Under the lock the registration is made under, so a composite
+        # accepted at once is never missed.
+        with self._lock:
+            handle = self._known.get(composite_id)
+        if handle is None:
+            return False
+        handle._mark_stored()
+        return True
 
-    async def _run_flow(self, flow: Any, previous: Any, handle: FlowHandle) -> None:
-        results: list[Any] = []
-        async with _settling(handle):
-            for index, stage in enumerate(flow.stages):
-                if handle.cancel_requested:
-                    raise TaskCancelledError(f"{handle.task_id} was cancelled")
-                stage_handle = stage.start(self._session, previous)
-                handle.stage_started(stage_handle, index == len(flow.stages) - 1)
-                if handle.cancel_requested:
-                    # Cancelled while this stage was being submitted.
-                    stage_handle.cancel()
-                previous = await stage_handle
-                results.append(previous)
-            handle._resolve(results)
+    def refused(self, composite_id: str, error: BaseException) -> bool:
+        """The leader refused the composite for good: it was never stored, and
+        its handle fails with `error`. Whether `composite_id` is one
+        submitted here."""
+        with self._lock:
+            handle = self._open.pop(composite_id, None)
+            known = composite_id in self._known
+        if handle is not None:
+            handle._fail(error)
+        return known
 
-    async def _run_group(self, group: Any, previous: Any, handle: GroupHandle) -> None:
-        async with _settling(handle):
-            if handle.cancel_requested:
-                raise TaskCancelledError(f"{handle.task_id} was cancelled")
-            try:
-                for member in group.members:
-                    # Yield first, so the events the scheduler raised while the
-                    # last members were submitted (SlowDown) are seen, and a
-                    # cancel or stop that arrived is noticed, before the next.
-                    await asyncio.sleep(0)
-                    await self._wait_for_room(handle)
-                    if handle.cancel_requested:
-                        raise TaskCancelledError(f"{handle.task_id} was cancelled")
-                    if self._session.stopping:
-                        raise RunStoppedError("the run stopped while this group submitted")
-                    handle.member_started(member.start(self._session, previous))
-            except BaseException:
-                for started in handle.members:
-                    started.cancel()
-                raise
-            results = await _gather(handle.members, group.on_error)
-            if handle.cancel_requested:
-                raise TaskCancelledError(f"{handle.task_id} was cancelled")
-            handle._resolve(results)
+    def finished(self, event: Event) -> None:
+        """A composite is over (`COMPOSITE_FINISHED`): settles its handle, or,
+        for a task's continuation, the task's own."""
+        if event.parent_task_id is not None:
+            self._session.continuation_finished(event)
+            return
+        with self._lock:
+            handle = self._open.pop(event.composite_id, None)
+        if handle is not None:
+            self._session.settle_from_composite(handle, event)
 
-    async def _wait_for_room(self, handle: GroupHandle) -> None:
-        """Waits while the scheduler says memory use is past its soft limit
-        (`SlowDown`). Ends early, by failing, if the run is stopping or the
-        group is cancelled, so waiting never outlives either."""
-        while not self._session.has_room():
-            if self._session.stopping:
-                raise RunStoppedError("the run stopped while this group waited to submit")
-            if handle.cancel_requested:
-                raise TaskCancelledError(f"{handle.task_id} was cancelled")
-            await self._session.wait_for_room()
+    def status_of(self, composite_id: str) -> Awaitable[CompositeStatus] | None:
+        """The status read of a flow, group or map this session submitted;
+        `None` for any other id."""
+        handle = self._known.get(composite_id)
+        return None if handle is None else handle.status()
 
+    def pending(self) -> bool:
+        """Whether any composite submitted here has not finished."""
+        with self._lock:
+            return bool(self._open)
 
-async def _gather(members: list[TaskHandle], on_error: str) -> list[Any]:
-    """The members' results in order. `fail_fast` raises the first failure
-    and leaves the rest to finish, `collect_all` returns failures as
-    entries."""
-
-    async def outcome(member: TaskHandle) -> Any:
-        return await member
-
-    if not members:
-        return []
-    waiting = [asyncio.ensure_future(outcome(member)) for member in members]
-    if on_error == "collect_all":
-        return list(await asyncio.gather(*waiting, return_exceptions=True))
-    try:
-        done, pending = await asyncio.wait(waiting, return_when=asyncio.FIRST_EXCEPTION)
-    except BaseException:
-        for task in waiting:
-            task.cancel()
-        raise
-    for task in pending:
-        # Left running, so what they end with is not "never retrieved".
-        task.add_done_callback(lambda ended: ended.cancelled() or ended.exception())
-    # Every failure is looked at, so none is left "never retrieved".
-    failures = [
-        task.exception()
-        for task in waiting
-        if task in done and not task.cancelled() and task.exception() is not None
-    ]
-    if failures:
-        raise failures[0]
-    return [task.result() for task in waiting]
+    async def stopped(self) -> None:
+        """The run stopped and nothing runs here any more: a composite still
+        running can never go on, since nothing will claim what is left of it.
+        Its handle fails with `RunStoppedError`; one the leader has already
+        finished is left to its finish."""
+        with self._lock:
+            open_handles = list(self._open.items())
+        for composite_id, handle in open_handles:
+            if not await composite_is_running(self._session.runtime, composite_id):
+                continue
+            with self._lock:
+                if self._open.pop(composite_id, None) is None:
+                    continue
+            handle._fail(RunStoppedError("the run stopped before this could finish"))

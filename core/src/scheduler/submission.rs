@@ -7,7 +7,7 @@ use crate::coalescing;
 use crate::manifest::{self, Manifest};
 use crate::protocol::digest::Digest;
 use crate::protocol::generated;
-use crate::protocol::ids::{IdGenerator, TaskDefinitionId, TaskId, WorkerId, mint_task_id};
+use crate::protocol::ids::{CompositeId, IdGenerator, TaskDefinitionId, TaskId, WorkerId, mint_task_id};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task};
@@ -48,6 +48,26 @@ pub enum SubmitRejection {
     /// `Backpressure`, asking again is refused again.
     #[error("a task input of {size} bytes is past the hard memory limit of {limit}")]
     PayloadTooLarge { size: u64, limit: u64 },
+    /// A composite whose first stage, or any member, takes an input cannot be
+    /// submitted: nothing runs before it to give it one.
+    #[error("the composite takes an input, and nothing runs before it to give it one")]
+    StepTakesInput,
+}
+
+impl SubmitRejection {
+    /// The failure kind a member refused for this reason is recorded with.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SubmitRejection::TooLarge { .. } => "TaskTooLarge",
+            SubmitRejection::Backpressure { .. } => "BackpressureError",
+            SubmitRejection::NotLeader => "NotLeader",
+            SubmitRejection::RecordTooLarge { .. } => "RecordTooLarge",
+            SubmitRejection::KeyNotReady => "KeyNotReady",
+            SubmitRejection::KeyBackpressure { .. } => "KeyBackpressureError",
+            SubmitRejection::PayloadTooLarge { .. } => "PayloadTooLargeError",
+            SubmitRejection::StepTakesInput => "StepTakesInput",
+        }
+    }
 }
 
 /// A submission given its task id and its submission time: what its client
@@ -157,6 +177,8 @@ pub struct Submission {
     pub input_manifest: Option<Manifest>,
     /// The trace context to carry; empty for none.
     pub trace: TraceContext,
+    /// The composite the task is a stage or member of, and its index there.
+    pub member_of: Option<(CompositeId, u64)>,
 }
 
 impl Submission {
@@ -183,7 +205,15 @@ impl Submission {
             client: None,
             input_manifest: None,
             trace: TraceContext::default(),
+            member_of: None,
         }
+    }
+
+    /// The task is stage or member `index` of `composite`.
+    #[must_use]
+    pub fn as_member_of(mut self, composite: CompositeId, index: u64) -> Self {
+        self.member_of = Some((composite, index));
+        self
     }
 
     /// The task is ephemeral: a run lost with its worker
@@ -359,7 +389,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// task. A task it has forgotten (past its result's time to live) that is
     /// submitted again is recorded afresh.
     pub fn submit_minted(&mut self, submitted: Submitted) -> Result<TaskId, SubmitRejection> {
-        let outcome = self.record_submission(submitted);
+        let outcome = if self.check_leader() {
+            self.record_submission(submitted)
+        } else {
+            Err(SubmitRejection::NotLeader)
+        };
         self.end_call();
         outcome
     }
@@ -372,11 +406,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Records `submitted` as a new task with its first run, unless it is
-    /// already held (a retry after a refusal) or is refused.
-    fn record_submission(&mut self, submitted: Submitted) -> Result<TaskId, SubmitRejection> {
-        if !self.check_leader() {
-            return Err(SubmitRejection::NotLeader);
-        }
+    /// already held (a retry after a refusal) or is refused. It does not ask
+    /// whether this scheduler leads: a client's submission is checked by its
+    /// caller, and the Task a composite makes for a member is made by a
+    /// scheduler that is rebuilding too, before its grant arrives.
+    pub(super) fn record_submission(&mut self, submitted: Submitted) -> Result<TaskId, SubmitRejection> {
         if self.tasks.contains_key(&submitted.task_id) {
             return Ok(submitted.task_id);
         }
@@ -528,5 +562,6 @@ fn task_of(task_id: TaskId, submitted_at: WallTime, submission: Submission) -> T
         client: submission.client,
         input_manifest: submission.input_manifest,
         trace: submission.trace,
+        member_of: submission.member_of,
     })
 }

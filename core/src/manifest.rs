@@ -10,11 +10,16 @@ use prost::Message as _;
 use crate::blob::BlobKey;
 use crate::protocol::digest::{Digest, InvalidDigest};
 use crate::protocol::generated::{self, manifest_entry};
-use crate::protocol::ids::CompositeId;
+use crate::protocol::ids::{CompositeId, TaskId};
 use crate::scheduler::MAX_SUBMISSION_BYTES;
 
 /// How large each blob of a cut payload is; the last may be shorter.
 pub const BLOB_CHUNK_BYTES: usize = 256 * 1024;
+
+/// The largest result that stands in its manifest whole, as one inline entry.
+/// A larger one is cut into blobs. Half a blob, so the encoded manifest is
+/// always a blob itself.
+pub const INLINE_RESULT_BYTES: usize = BLOB_CHUNK_BYTES / 2;
 
 /// What a message keeps beside an inline payload: its queue, definition id,
 /// coalescing key and framing.
@@ -55,6 +60,38 @@ pub struct Failure {
     /// The error's type name.
     pub kind: String,
     pub message: String,
+    /// The Task whose run failed, when a Task's run did: the worker that ran
+    /// it keeps the error it raised under this id. A composite that ends on a
+    /// member's failure carries the member's on.
+    pub task: Option<TaskId>,
+}
+
+impl Failure {
+    /// A failure that no Task's run raised.
+    pub fn new(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Failure { kind: kind.into(), message: message.into(), task: None }
+    }
+
+    /// This failure as the failure of `task`'s run.
+    pub fn of_task(self, task: TaskId) -> Self {
+        Failure { task: Some(task), ..self }
+    }
+}
+
+impl From<Failure> for generated::Failure {
+    fn from(failure: Failure) -> Self {
+        generated::Failure { kind: failure.kind, message: failure.message, task: failure.task.map(Into::into) }
+    }
+}
+
+impl From<&generated::Failure> for Failure {
+    fn from(wire: &generated::Failure) -> Self {
+        Failure {
+            kind: wire.kind.clone(),
+            message: wire.message.clone(),
+            task: wire.task.clone().map(TaskId::from),
+        }
+    }
 }
 
 /// One part of a manifest: a blob of a cut payload, or one outcome of a list.
@@ -108,6 +145,8 @@ pub enum InvalidManifest {
     PageWithoutComposite,
     #[error("a manifest of {blobs} blobs names {total_bytes} bytes, which they cannot hold")]
     TotalBytesOutOfRange { blobs: usize, total_bytes: u64 },
+    #[error("the bytes are not an encoded manifest")]
+    Undecodable,
 }
 
 impl Manifest {
@@ -127,6 +166,34 @@ impl Manifest {
             },
             chunks,
         }
+    }
+
+    /// The manifest of a run's result: the result as one inline entry when it
+    /// is small, else cut into blobs as [`Self::chunk`] does, with the bytes
+    /// of the blobs to store (none when it is inline). Either way the encoded
+    /// manifest is a blob itself, which a reader fetches first.
+    pub fn of_result(payload: &[u8]) -> Chunked {
+        if payload.len() <= INLINE_RESULT_BYTES {
+            return Chunked {
+                manifest: Manifest {
+                    entries: vec![ManifestEntry::Inline(payload.to_vec())],
+                    total_bytes: payload.len() as u64,
+                },
+                chunks: Vec::new(),
+            };
+        }
+        Manifest::chunk(payload)
+    }
+
+    /// The manifest as the bytes a blob holds.
+    pub fn encode(&self) -> Vec<u8> {
+        generated::Manifest::from(self.clone()).encode_to_vec()
+    }
+
+    /// The manifest `bytes` encode.
+    pub fn decode(bytes: &[u8]) -> Result<Manifest, InvalidManifest> {
+        let wire = generated::Manifest::decode(bytes).map_err(|_| InvalidManifest::Undecodable)?;
+        Manifest::try_from(&wire)
     }
 
     pub fn entries(&self) -> &[ManifestEntry] {
@@ -168,7 +235,7 @@ impl Manifest {
     /// The BLAKE3 digest of the manifest's encoding: the same for every
     /// worker, since the encoding of a message with no maps is fixed.
     pub fn digest(&self) -> Digest {
-        Digest::blake3(&generated::Manifest::from(self.clone()).encode_to_vec())
+        Digest::blake3(&self.encode())
     }
 
     /// The payload, joined from its entries in order. `blob` looks each blob
@@ -203,9 +270,7 @@ impl From<ManifestEntry> for generated::ManifestEntry {
     fn from(entry: ManifestEntry) -> Self {
         let entry = match entry {
             ManifestEntry::Blob(key) => manifest_entry::Entry::Blob(key.digest().into()),
-            ManifestEntry::Failure(Failure { kind, message }) => {
-                manifest_entry::Entry::Failure(generated::Failure { kind, message })
-            }
+            ManifestEntry::Failure(failure) => manifest_entry::Entry::Failure(failure.into()),
             ManifestEntry::Inline(bytes) => manifest_entry::Entry::Inline(bytes),
             ManifestEntry::Page { composite, page } => manifest_entry::Entry::Page(generated::PageRef {
                 composite_id: Some(composite.into()),
@@ -234,10 +299,7 @@ impl TryFrom<&generated::ManifestEntry> for ManifestEntry {
             Some(manifest_entry::Entry::Blob(digest)) => {
                 Ok(ManifestEntry::Blob(BlobKey::from(&Digest::try_from(digest)?)))
             }
-            Some(manifest_entry::Entry::Failure(failure)) => Ok(ManifestEntry::Failure(Failure {
-                kind: failure.kind.clone(),
-                message: failure.message.clone(),
-            })),
+            Some(manifest_entry::Entry::Failure(failure)) => Ok(ManifestEntry::Failure(failure.into())),
             Some(manifest_entry::Entry::Inline(bytes)) => Ok(ManifestEntry::Inline(bytes.clone())),
             Some(manifest_entry::Entry::Page(page)) => Ok(ManifestEntry::Page {
                 composite: page

@@ -469,8 +469,6 @@ def test_submissions_made_before_the_node_leads_are_claimed_in_order_after_the_g
         second = submit(native, payload=b"c" * 30)
         with pytest.raises(_native.BackpressureError):
             submit(native, payload=b"d" * 50)
-        with pytest.raises(RuntimeError, match="not the leader"):
-            native.end_continuation("x")
         assert native.worker_state() != "Leader"
 
         async def claim_once_leading():
@@ -483,6 +481,33 @@ def test_submissions_made_before_the_node_leads_are_claimed_in_order_after_the_g
         later = submit(native, payload=b"e" * 40)
         [after] = asyncio.run(claim(native))
         assert after.task_id == later
+    finally:
+        native.shutdown()
+
+
+def one_stage_flow(definition_id):
+    return ("flow", "fail_fast", [("task", definition_id, 0, {"queue": "default"}, b"x", [])])
+
+
+def test_a_composite_cancelled_before_the_node_leads_reads_as_unknown_and_is_announced_cancelled():
+    native = new_runtime(suspect_timeout_ms=1000)
+    try:
+        dropped = native.submit_composite(one_stage_flow("tests.dropped"))
+
+        async def status_of(composite_id):
+            return await native.composite_status(composite_id)
+
+        assert asyncio.run(status_of(dropped)) == ("running", 0, 1, 0, 0, 0, 0)
+        assert native.cancel_composite(dropped) == CancelOutcome.CANCELLED
+        assert asyncio.run(status_of(dropped)) is None
+
+        async def after_the_grant():
+            await leader_within_limit(native)
+            return await asyncio.wait_for(native.next_events(), WAIT_LIMIT_SECONDS)
+
+        events = asyncio.run(after_the_grant())
+
+        assert [(event.composite_id, event.state) for event in events] == [(dropped, "cancelled")]
     finally:
         native.shutdown()
 
@@ -520,7 +545,9 @@ def test_shutdown_fails_a_claim_that_is_waiting_for_work():
         pytest.param(lambda native: native.complete("some-run", DIGEST), id="complete"),
         pytest.param(lambda native: native.report_failure("some-run", "ValueError"), id="report_failure"),
         pytest.param(lambda native: native.cancel("some-task"), id="cancel"),
-        pytest.param(lambda native: native.end_continuation("some-task"), id="end_continuation"),
+        pytest.param(
+            lambda native: native.submit_composite(one_stage_flow("tests.stage")), id="submit_composite"
+        ),
         pytest.param(lambda native: native.task_run_state("some-run"), id="task_run_state"),
         pytest.param(lambda native: native.task_run_ids("some-task"), id="task_run_ids"),
         pytest.param(lambda native: asyncio.run(_start_a_wait(native)), id="wait_until_leader"),
@@ -618,17 +645,20 @@ def generation(native, payload, key=""):
 
 
 def test_a_task_completed_with_a_continuation_holds_its_coalescing_key_until_it_ends(runtime):
-    first = generation(runtime, b"a")
+    generation(runtime, b"a")
 
     async def main():
         [claimed] = await claim(runtime)
         runtime.report_started(claimed.task_run_id)
         newer = generation(runtime, b"b")
-        runtime.complete(claimed.task_run_id, DIGEST, continues=True)
+        runtime.complete(claimed.task_run_id, continuation=one_stage_flow("tests.stage"))
+        # The newer generation waits behind the key: only the continuation's stage is handed out.
+        [stage] = await claim(runtime)
+        assert stage.composite_id == _native.continuation_of(claimed.task_run_id)
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(runtime.claim_pending(1), 0.3)
-        assert runtime.end_continuation(first) is True
-        assert runtime.end_continuation(first) is False
+        runtime.report_started(stage.task_run_id)
+        runtime.complete(stage.task_run_id, await runtime.store_result(stage.task_id, b"staged"))
         [second] = await claim(runtime)
         return newer, second
 

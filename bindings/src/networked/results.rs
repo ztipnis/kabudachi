@@ -1,23 +1,27 @@
 //! A task's result on its way to the worker that awaits it: delivered from
-//! here before its run is reported, and what arrives here for the tasks
-//! submitted here, asked of a new leader when the leader changes.
+//! here before its run is reported, and what arrives here for the tasks and
+//! composites submitted here, asked of a new leader when the leader changes.
+//! A run that returns a step delivers no result: its blobs are stored, and it
+//! is reported with the step.
 
 use std::sync::Arc;
 
 use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::manifest::{Manifest, fits_inline};
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     DeliverResult, OutcomeAnswer, TaskResponse, deliver_result, task_response,
 };
 use kabudachi_core::protocol::task::TaskRunState as DomainRunState;
+use kabudachi_core::scheduler::Event;
+use kabudachi_core::scheduler::composite::{CompositeFinished, Step};
 use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::executor::Report;
 use kabudachi_net::messenger::Net;
 use kabudachi_net::result_transport::ResultEvent;
-use kabudachi_net::task_exchange::NotStored;
 
+use super::composites::{ask_about_composites, stored_until};
 use super::seam::{HeldRun, Seam, Shared};
 use crate::work::PyEvent;
 
@@ -58,6 +62,7 @@ pub(super) async fn deliver_then_report(
         run,
         digest,
         delivered,
+        continuation: None,
     });
 }
 
@@ -86,17 +91,49 @@ async fn result_body(
         .take_anyway(payload.len() as u64)
         .ok();
     let bound = tokio::time::Instant::now() + held.reconnect_timeout;
-    loop {
-        let store = shared
+    let owner = BlobOwner::Task(held.task.clone());
+    // `None` once out of its shard, or past the bound.
+    let manifest = stored_until(shared, bound, || {
+        shared
             .net
-            .store_payload_at_leader(BlobRole::Result, &held.task, &payload, shared.retry);
-        match tokio::time::timeout_at(bound, store).await {
-            Ok(Ok(manifest)) => return Some(deliver_result::Body::Manifest(manifest.into())),
-            Ok(Err(NotStored::Refused)) => tokio::time::sleep(shared.retry.ask_again_after).await,
-            // Out of its shard, or past the bound.
-            Ok(Err(NotStored::LeftShard)) | Err(_) => return None,
+            .store_payload_at_leader(BlobRole::Result, &owner, &payload, shared.retry)
+    })
+    .await?;
+    Some(deliver_result::Body::Manifest(manifest.into()))
+}
+
+/// Stores the blobs a returned `step` names under the continuation it
+/// becomes, then reports `run` completed with the step. A run whose values
+/// cannot be stored by its reconnect timeout is reported lost, so a task that
+/// retries is replayed. Each value counts in flight while it is stored: it is
+/// in this process's memory already, so it is counted, not waited for.
+pub(super) async fn store_then_report_step(
+    shared: Arc<Shared>,
+    held: HeldRun,
+    run: TaskRunId,
+    step: Step,
+    values: Vec<Vec<u8>>,
+) {
+    let owner = BlobOwner::Composite(CompositeId::continuation_of(&run));
+    let bound = tokio::time::Instant::now() + held.reconnect_timeout;
+    for value in &values {
+        let _in_flight = shared.net.payload_memory().take_anyway(value.len() as u64).ok();
+        let stored = stored_until(&shared, bound, || {
+            shared
+                .net
+                .store_payload_at_leader(BlobRole::Input, &owner, value, shared.retry)
+        })
+        .await;
+        if stored.is_none() {
+            return shared.report(Report::Lost(run));
         }
     }
+    shared.report(Report::Completed {
+        run,
+        digest: step.digest(),
+        delivered: false,
+        continuation: Some(step),
+    });
 }
 
 /// What the result reader makes of one result event before the session sees
@@ -209,6 +246,14 @@ impl Seam {
                 self.awaiting.remove(&task);
                 Some(event)
             }
+            ResultEvent::CompositeFinished(wire) => {
+                let finished = CompositeFinished::try_from(&wire).ok()?;
+                self.awaiting_composites.remove(&finished.composite_id);
+                if let Some(task) = &finished.parent_task {
+                    self.awaiting.remove(task);
+                }
+                Some(PyEvent::from(Event::CompositeFinished(finished)))
+            }
         }
     }
 }
@@ -226,7 +271,9 @@ fn outcome_event(task: &TaskId, answer: &OutcomeAnswer) -> Option<PyEvent> {
             None,
         ));
     }
-    if !answer.finished {
+    // A run that returned a step has no result to certify: the task is over
+    // when the step's composite is, which is told on its own.
+    if !answer.finished || answer.continued {
         return None;
     }
     let run = answer
@@ -317,9 +364,25 @@ async fn ask_about_awaited(shared: &Shared) {
             result: Some(task_response::Result::Outcome(outcome)),
         }) = answer
         {
+            if let Some(run) = continuing_run(&outcome) {
+                // Certified as the step it returned, which runs as a
+                // composite: the task is over when that is.
+                shared
+                    .seam()
+                    .awaiting_composites
+                    .insert(CompositeId::continuation_of(&run));
+            }
             shared
                 .net
                 .queue_result_event(ResultEvent::Concluded { task, outcome });
         }
     }
+    ask_about_composites(shared).await;
+}
+
+/// The run that returned a step, if `answer` says a run did, whether the step
+/// is still running or has ended: its composite's record says how it ended.
+fn continuing_run(answer: &OutcomeAnswer) -> Option<TaskRunId> {
+    let continuing = answer.known && answer.continued;
+    continuing.then(|| answer.task_run_id.clone().map(TaskRunId::from)).flatten()
 }

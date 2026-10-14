@@ -169,6 +169,7 @@ async fn a_gpu_worker_takes_only_gpu_tasks_a_cpu_worker_takes_none_and_a_full_qu
             run,
             digest: Digest::blake3(b"done"),
             delivered: false,
+            continuation: None,
         });
         let (_, claim) = shard.drive_until(executors[gpu].next_claim()).await;
         assert_eq!(

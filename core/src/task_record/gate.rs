@@ -1,18 +1,17 @@
-use crate::protocol::generated::TaskRecord;
-use crate::protocol::ids::{TaskId, WorkerId};
-use crate::task_record::store::identify;
+use crate::protocol::ids::WorkerId;
+use crate::task_record::key::{RecordKey, ShardRecord};
 use crate::task_record::version::RecordVersion;
 
-/// One revision write: the task and the version written.
+/// One revision write: the record and the version written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Write {
-    pub task_id: TaskId,
+    pub key: RecordKey,
     pub version: RecordVersion,
 }
 
 impl Write {
     /// Whether storing `self` stores what `earlier` wrote: a revision of
-    /// the same task by the same office (recovery epoch and leader term), at
+    /// the same record by the same office (recovery epoch and leader term), at
     /// `earlier`'s revision or later. Within one office the leader's
     /// revisions carry the whole record as that leader holds it, so a later
     /// one stored where it must be stands for every decision an earlier one
@@ -20,21 +19,22 @@ impl Write {
     /// stored, which need not include a write that never reached its quorum,
     /// so its revisions stand for nothing an earlier office wrote.
     fn covers(&self, earlier: &Write) -> bool {
-        self.task_id == earlier.task_id
+        self.key == earlier.key
             && self.version.recovery_epoch == earlier.version.recovery_epoch
             && self.version.leader_term == earlier.version.leader_term
             && self.version.revision >= earlier.version.revision
     }
 
-    /// The write of `record`, which the scheduler built, so it names its task
+    /// The write of `record`, which the scheduler built, so it names its key
     /// and version.
     ///
     /// # Panics
-    /// If `record` lacks its version, its task or its task id.
-    pub fn of(record: &TaskRecord) -> Write {
-        let (task_id, version) =
-            identify(record).expect("the scheduler builds every record with its task and version");
-        Write { task_id, version }
+    /// If `record` lacks its version or the id its kind is keyed by.
+    pub fn of(record: &ShardRecord) -> Write {
+        let (key, version) = record
+            .identify()
+            .expect("the scheduler builds every record with its key and version");
+        Write { key, version }
     }
 }
 
@@ -48,7 +48,7 @@ impl Write {
 /// revision, and cannot take the task for older than it is.
 #[derive(Debug, Clone)]
 pub struct PlacedWrite {
-    pub record: TaskRecord,
+    pub record: ShardRecord,
     pub quorum: usize,
     /// The other placements the revision must reach, each a placement some
     /// earlier revision of the task may still be known by.
@@ -79,7 +79,7 @@ impl PriorPlacement {
 
 impl PlacedWrite {
     /// `record`, already placed, written with no placement before it.
-    pub fn new(record: TaskRecord, quorum: usize) -> Self {
+    pub fn new(record: ShardRecord, quorum: usize) -> Self {
         PlacedWrite {
             record,
             quorum,
@@ -89,7 +89,7 @@ impl PlacedWrite {
 
     /// The holders of the record's placement.
     pub fn holders(&self) -> Vec<WorkerId> {
-        self.record.placement.iter().cloned().map(WorkerId::from).collect()
+        self.record.placement().iter().cloned().map(WorkerId::from).collect()
     }
 
     /// Every holder the revision goes to: its placement, then each prior

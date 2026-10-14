@@ -72,6 +72,7 @@ async fn events_about(client: &Net, task: &TaskId, count: usize) -> Vec<ResultEv
                     ResultEvent::Delivered { task: of, .. }
                     | ResultEvent::Certified { task: of, .. }
                     | ResultEvent::Concluded { task: of, .. } => of == task,
+                    ResultEvent::CompositeFinished(_) => false,
                 }),
         );
     }
@@ -168,6 +169,7 @@ impl Delivering {
             run: run.clone(),
             digest: digest(),
             delivered,
+            continuation: None,
         });
     }
 

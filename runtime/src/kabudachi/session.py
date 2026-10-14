@@ -7,6 +7,11 @@ digest. The handle is settled when the leader's certification arrives and
 matches the bytes the client holds; a result the leader refuses is never
 delivered.
 
+A flow, group or map is run by the shard's leader, which starts each of its
+stages or members as an ordinary task; this process submits it, runs the
+members it claims on what the leader reads out for them, and settles its
+handle when the leader says it is over.
+
 A coalescing key whose waiting payloads pile up past the soft memory limit
 while one generation runs is compacted on a free worker place: the claim names
 the payloads to fold, the executor folds them with the task's merge and hands the
@@ -21,10 +26,8 @@ its handle settles as a one-node handle does.
 """
 
 import asyncio
-import concurrent.futures
 import functools
 import inspect
-import json
 import logging
 import math
 import threading
@@ -33,9 +36,10 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
+from kabudachi import _native
 from kabudachi._native import MAX_FAILURE_MESSAGE_BYTES, EventKind, RunState
-from kabudachi.body import RunningBody
-from kabudachi.composites import Composites
+from kabudachi.body import Given, RunningBody, decode_resolved
+from kabudachi.composites import Composites, composite_is_running, refuse_oversized_values
 from kabudachi.config import Configuration
 from kabudachi.errors import (
     BackpressureError,
@@ -44,11 +48,13 @@ from kabudachi.errors import (
     PayloadTooLargeError,
     ResultTooLargeError,
     ResultUnavailableError,
+    RunStoppedError,
     RuntimeNotStartedError,
     TaskBodyError,
     TaskCancelledError,
     TaskDefinitionError,
     TaskExpiredError,
+    TaskFailure,
     TaskLostError,
     TaskOrphanedError,
     TaskRecordFullError,
@@ -57,7 +63,7 @@ from kabudachi.errors import (
     UnknownTaskError,
     interrupted,
 )
-from kabudachi.config import UNSET, Unset
+from kabudachi.config import Unset
 from kabudachi.execution import (
     CompactJob,
     Executor,
@@ -71,13 +77,12 @@ from kabudachi.handle import TaskHandle, run_callback_inline
 from kabudachi.lifecycle import default_hooks
 from kabudachi.native_protocol import Runtime
 from kabudachi.options import SubmissionOptions, SubmissionSettings
-from kabudachi.registry import TaskDefinition, TaskRegistry
+from kabudachi.registry import TaskDefinition, TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.status import CompositeStatus, TaskStatus
 from kabudachi.task_table import Run, TaskTable, result_digest
 
 WAIT_POLL_SECONDS = 0.005
-SLOW_DOWN_POLL_SECONDS = 0.05
 
 _logger = logging.getLogger("kabudachi")
 
@@ -149,8 +154,12 @@ class Session:
         # Set while memory use is below the soft limit, when bulk submission may go on.
         self._below_soft_limit = asyncio.Event()
         self._below_soft_limit.set()
-        # Every flow and group started here, and what runs them.
+        # Every flow, group and map started here.
         self._composites = Composites(self, self._hosted)
+        # Runs of composites' members, and expansions, under way here.
+        self._members_running = 0
+        # Finished composites whose results are being read to settle a handle.
+        self._deliveries = 0
         # What this does with each kind of event the runtime decides on its own.
         self._event_handlers: dict[EventKind, Callable[[Any], None]] = {
             EventKind.EXPIRED: self._on_expired,
@@ -166,6 +175,7 @@ class Session:
             EventKind.RESULT: self._on_result,
             EventKind.CERTIFIED: self._on_certified,
             EventKind.OUTCOME: self._on_outcome,
+            EventKind.COMPOSITE_FINISHED: self._on_composite_finished,
         }
 
     def submit(
@@ -236,6 +246,22 @@ class Session:
                 return None
         return max(1, math.ceil(timeout / timedelta(milliseconds=1)))
 
+    def submission_settings(self, definition: TaskDefinition) -> dict[str, Any]:
+        """What a member of a composite carries to the leader for `definition`,
+        resolved here as a submit resolves it. The queue is the task's own,
+        else `queue`: a router picks by an argument that a composite's member
+        does not have yet."""
+        queue = definition.queue
+        if isinstance(queue, Unset):
+            queue = self._configuration.resolve("queue")
+        return {
+            "queue": queue,
+            "retries": definition.retries,
+            "ephemeral": definition.kind is TaskKind.EPHEMERAL,
+            "non_retriable": not definition.retriable,
+            "reconnect_timeout_ms": self._reconnect_timeout_ms(definition, queue),
+        }
+
     def submit_serialized(
         self, definition_id: str, payload: bytes, options: SubmissionOptions
     ) -> TaskHandle:
@@ -250,11 +276,9 @@ class Session:
             definition, payload, options, lambda: serializer.decode(payload, definition.input_type)
         )
 
-    def submit_composite(self, kind: str, composite: Any, previous: Any) -> TaskHandle:
-        """Starts a flow (`kind` "flow") or group a body in a task process called."""
-        if kind == "flow":
-            return self._composites.submit_flow(composite, previous)
-        return self._composites.submit_group(composite, previous)
+    def submit_composite(self, step: Any, previous: Any) -> TaskHandle:
+        """Submits a flow, group or map a body in a task process called."""
+        return self._composites.submit(step, previous)
 
     def cancel_task(self, task_id: str) -> bool:
         """Cancels a task a body in a task process called, by its id, as its
@@ -289,13 +313,18 @@ class Session:
         return self._runtime
 
     @property
+    def serializers(self) -> SerializerRegistry:
+        """The serializers this session encodes and decodes tasks' values with."""
+        return self._serializers
+
+    @property
     def stopping(self) -> bool:
         """Whether the run is stopping, so nothing new may be submitted."""
         return self._tasks.stopping
 
     @property
     def composites(self) -> Composites:
-        """Every flow and group started here, and what runs them."""
+        """Every flow, group and map started here."""
         return self._composites
 
     @property
@@ -309,8 +338,8 @@ class Session:
         return self._run_callback
 
     async def task_status(self, task_id: str) -> TaskStatus | CompositeStatus:
-        """How a task, flow or group submitted here stands: a flow or group
-        from its handle, a task from its shard's record."""
+        """How a task, flow, group or map submitted here stands: a composite
+        from its leader's record of it, a task from its shard's."""
         composite = self._composites.status_of(task_id)
         if composite is not None:
             return await composite
@@ -320,15 +349,6 @@ class Session:
         """Whether there is room to submit in bulk now: the scheduler has not
         said memory use is past its soft limit."""
         return self._below_soft_limit.is_set()
-
-    async def wait_for_room(self) -> None:
-        """Waits for room to submit in bulk, for one polling interval at most,
-        so a caller submitting many tasks can look at its own reasons to give
-        up between waits."""
-        try:
-            await asyncio.wait_for(self._below_soft_limit.wait(), SLOW_DOWN_POLL_SECONDS)
-        except TimeoutError:
-            pass
 
     async def watch_events(self) -> None:
         """Acts on what the runtime decides on its own: a task that expired
@@ -393,7 +413,8 @@ class Session:
 
     def _on_accepted(self, event: Any) -> None:
         # Stored on a quorum: its handle is `REPLICATED`.
-        self._tasks.replicated(event.task_id)
+        if not self._composites.accepted(event.task_id):
+            self._tasks.replicated(event.task_id)
 
     def _on_refused(self, event: Any) -> None:
         error: Exception = BackpressureError(
@@ -403,7 +424,8 @@ class Session:
             error = PayloadTooLargeError(
                 "the input is past the hard memory limit of the shard's leader"
             )
-        self._tasks.refused(event.task_id, error)
+        if not self._composites.refused(event.task_id, error):
+            self._tasks.refused(event.task_id, error)
 
     def _on_abort(self, event: Any) -> None:
         self._abort_at(event.task_run_id, event.seconds_left)
@@ -416,6 +438,96 @@ class Session:
 
     def _on_certified(self, event: Any) -> None:
         self._tasks.certified(event)
+
+    def _on_composite_finished(self, event: Any) -> None:
+        self._composites.finished(event)
+
+    def continuation_finished(self, event: Any) -> None:
+        """The composite a task's run returned as its step is over: settles
+        the task's handle as the composite's would be."""
+        handle = self._tasks.continuation_over(event.parent_task_id)
+        if handle is not None:
+            self.settle_from_composite(handle, event)
+
+    def settle_from_composite(self, handle: TaskHandle, event: Any) -> None:
+        """Settles `handle`, of a composite or of the task that returned it as
+        its step, by how the composite `event` names ended: with its results,
+        with the failure that ended it, or as cancelled."""
+        match event.state:
+            case "succeeded":
+                self._deliveries += 1
+                if not self._hosted.spawn(self._deliver(handle, event.composite_id)):
+                    self._deliveries -= 1
+                    handle._fail(RunStoppedError("the run ended before the results could be read"))
+            case "failed":
+                handle._fail(self._failure_of(handle.task_id, event))
+            case _:
+                handle._fail(TaskCancelledError(f"{handle.task_id} was cancelled"))
+        self._release_member_errors()
+
+    def _awaits_composites(self) -> bool:
+        """Whether anything here still waits for a composite, so may be given
+        the error a member of it failed with."""
+        return bool(
+            self._composites.pending() or self._tasks.continuations() or self._deliveries > 0
+        )
+
+    def _release_member_errors(self) -> None:
+        """Drops the errors kept for members once nothing here awaits a
+        composite: those that were not taken, such as a failed sibling of the
+        member that ended its composite, will not be asked for."""
+        if not self._awaits_composites():
+            self._tasks.drop_member_errors()
+
+    async def _deliver(self, handle: TaskHandle, composite_id: str) -> None:
+        """Resolves `handle` with the results of the finished composite."""
+        try:
+            await self._resolve_with_results(handle, composite_id)
+        finally:
+            self._deliveries -= 1
+            self._release_member_errors()
+
+    async def _resolve_with_results(self, handle: TaskHandle, composite_id: str) -> None:
+        try:
+            resolved = await self._runtime.composite_results(composite_id)
+        except Exception as error:
+            handle._fail(
+                ResultUnavailableError(
+                    f"{handle.task_id} succeeded, but its results can no longer be read: {error}",
+                    handle.task_id,
+                )
+            )
+            return
+        try:
+            value = self.decode_resolved(resolved, own_errors=True)
+        except Exception as error:
+            handle._fail(error)
+            return
+        handle._resolve(value)
+
+    def _failure_of(self, subject: str, event: Any) -> BaseException:
+        """What a handle fails with when the composite `event` names failed:
+        the error of the member that ended it if this process ran that member,
+        else an error of the kind and message the leader gives."""
+        kind, message = event.failure_kind, event.failure_message
+        held = self._tasks.member_error(event.failure_task_id)
+        if held is not None:
+            return held
+        known = _KNOWN_FAILURES.get(kind)
+        if known is not None:
+            return known(message or f"{subject} failed with {kind}")
+        return TaskBodyError(message or f"{subject} failed with {kind}", kind)
+
+    def decode_resolved(self, resolved: Any, *, own_errors: bool = False) -> Any:
+        """The value a stage's `resolved` result stands for, each value decoded
+        by the serializer of the task that produced it. A failure is a
+        `TaskFailure`, or, with `own_errors`, the error this process's run of
+        that member failed with, when it still has it."""
+        failure = self._own_failure if own_errors else TaskFailure
+        return decode_resolved(self._registry, self._serializers, resolved, failure)
+
+    def _own_failure(self, kind: str, message: str, task_id: str | None) -> BaseException:
+        return self._tasks.member_error(task_id) or TaskFailure(kind, message)
 
     def _on_outcome(self, event: Any) -> None:
         if event.state is None:
@@ -505,13 +617,15 @@ class Session:
                 loop.cancel()
             await asyncio.gather(*loops, return_exceptions=True)
 
-    def stop_claiming(self) -> None:
+    async def stop_claiming(self) -> None:
         """Stops the run: no more tasks start or are accepted, and every task
         that has not started fails with `RunStoppedError`, which also frees
         any running task that was waiting for one of them. Tasks already
         running are not interrupted."""
         self._tasks.stop_unstarted()
         self._executor.wake()
+        if self._members_running == 0:
+            await self._fail_stalled()
 
     async def wait_until_running_finish(self) -> None:
         """Waits for every task that is running now to finish."""
@@ -525,7 +639,25 @@ class Session:
             await asyncio.sleep(WAIT_POLL_SECONDS)
 
     def _has_pending(self) -> bool:
-        return self._tasks.pending() or self._hosted.outstanding > 0
+        return (
+            self._tasks.pending()
+            or self._composites.pending()
+            or self._members_running > 0
+            or self._hosted.outstanding > 0
+        )
+
+    async def _fail_stalled(self) -> None:
+        """The run is stopping and no member runs here: a composite still
+        running can never go on, and neither can a task waiting for the one it
+        returned. They fail with `RunStoppedError`, unless the leader has just
+        finished them, when their own finish settles them."""
+        await self._composites.stopped()
+        for task_id, composite_id in self._tasks.continuations():
+            if await composite_is_running(self._runtime, composite_id):
+                self._tasks.failed(
+                    task_id, RunStoppedError("the run stopped before this task's step could finish")
+                )
+        self._release_member_errors()
 
     def _run_callback(self, function: Any, value: Any) -> None:
         """Runs a task callback on the event loop, from whichever thread the
@@ -549,7 +681,11 @@ class Session:
             self._track(self._compact(claim, self._executor.compact(job)))
             self._apply_early(claim.task_run_id)
             return
-        if self._runtime.certifies_locally:
+        if claim.expansion:
+            self._members_running += 1
+            self._track(self._expand(claim))
+            return
+        if self._runtime.certifies_locally and claim.composite_id is None:
             run = self._tasks.claimed(claim.task_id)
             if run is None:
                 # Already settled and forgotten (by `stop_claiming`, or any other
@@ -558,9 +694,12 @@ class Session:
                 return
         else:
             # The shard's leader handed this worker the run, whoever
-            # submitted the task: it runs, and settles no handle here.
+            # submitted the task, or the leader made it a member of a
+            # composite: it runs, and settles no handle here.
             run = self._tasks.detached(claim.task_id)
             self._here[claim.task_run_id] = _HeldHere(run, self._configuration.resolve("cancel_grace"))
+        if claim.composite_id is not None:
+            self._members_running += 1
         handed = self._hand_over(claim, run)
         if not isinstance(handed, BaseException) and claim.task_run_id in self._here:
             self._here[claim.task_run_id].cancel_grace = self._cancel_grace(handed[0])
@@ -582,6 +721,7 @@ class Session:
                 raise UnknownTaskError(f"this process has no task named {claim.definition_id!r}")
             self._runtime.report_started(claim.task_run_id)
             shard, worker_id = self._shard_and_worker()
+            given = self._read_out(claim)
             body = self._executor.run(
                 RunJob(
                     run_id=claim.task_run_id,
@@ -597,12 +737,28 @@ class Session:
                     cancel_grace=self._cancel_grace(definition),
                     # A retry does not run beside the abandoned body it replaces.
                     after=after,
+                    given=given,
                 )
             )
         except BaseException as error:
             return error
         run.body_started(body)
         return definition, body, after
+
+    def _read_out(self, claim: Any) -> "asyncio.Future[Given] | None":
+        """Starts reading what the leader holds for the member `claim` is a run
+        of, if it is one: its bound fields and the results it takes. The body
+        starts once they are read, and fails if they cannot be."""
+        if claim.composite_id is None:
+            return None
+        reading = asyncio.get_running_loop().create_task(self._given(claim))
+        # A run cancelled before it needed them leaves a failure nobody reads.
+        reading.add_done_callback(lambda done: done.cancelled() or done.exception())
+        return reading
+
+    async def _given(self, claim: Any) -> Given:
+        fields, resolved = await self._runtime.resolve_input(claim.task_run_id)
+        return Given(tuple(fields), resolved)
 
     def _shard_and_worker(self) -> tuple[str, str]:
         if self._identity is None:
@@ -674,14 +830,26 @@ class Session:
         if definition.continues:
             self._continue(claim, run, outcome)
             return
-        self._complete(claim, run, outcome)
+        await self._complete(claim, run, outcome)
 
-    def _complete(self, claim: Any, run: Run, outcome: Any) -> None:
+    async def _complete(self, claim: Any, run: Run, outcome: Any) -> None:
         limit = self._runtime.payload_limit
         if limit is not None and len(outcome) > limit:
             raise ResultTooLargeError(
                 f"task {claim.definition_id} returned {len(outcome)} bytes, past the {limit} this process can hold"
             )
+        if claim.composite_id is not None:
+            # A member's result goes to the shard as a blob, stored before the
+            # run is reported, so the stage after it can always read it.
+            digest = await self._runtime.store_result(claim.task_id, outcome)
+            if digest is None:
+                # The shard could not take the result in time (it has no
+                # leader, say): the run is lost, not failed, so the leader
+                # replays it as it replays a run lost with its worker.
+                self._lost(claim, run)
+                return
+            self._runtime.complete(claim.task_run_id, digest)
+            return
         if run.holds_handle:
             self._tasks.result_held(claim.task_id, claim.task_run_id, outcome)
             certification = self._runtime.complete(claim.task_run_id, result_digest(outcome))
@@ -739,7 +907,12 @@ class Session:
             run.body_abandoned(body)
             if not run.holds_handle:
                 self._tasks.held_body_abandoned(claim.task_id, body.exited)
-        retried = self._report_failure(claim, kind, _message_of(error))
+        message = _message_of(error)
+        retried = self._report_failure(claim, kind, message)
+        if claim.composite_id is not None and not retried and self._awaits_composites():
+            # Kept before anything else is heard of the member, for whoever
+            # awaits its composite.
+            self._tasks.member_failed(claim.task_id, error)
         if run.holds_handle:
             if retried:
                 self._tasks.retry_queued(claim.task_id)
@@ -755,6 +928,8 @@ class Session:
             self._interrupted(claim.task_id, error)
 
     def _run_ended(self, claim: Any, run: Run) -> None:
+        if claim.composite_id is not None:
+            self._member_ended()
         if run.holds_handle:
             # On the abandoned-body retry path a newer run of this task can
             # begin while this one still awaits `body.exited`; the table
@@ -763,20 +938,19 @@ class Session:
         else:
             self._forget_held(claim.task_run_id)
 
+    def _member_ended(self) -> None:
+        self._members_running -= 1
+        if self._members_running == 0 and self._tasks.stopping:
+            # Their state is read on the run's loop, counted as work until done.
+            self._hosted.spawn(self._fail_stalled())
+
     def _interrupted(self, task_id: str, error: BaseException) -> None:
         self._tasks.failed(task_id, interrupted(f"task {task_id}", error))
 
     def _continue(self, claim: Any, run: Run, step: Any) -> None:
-        """The task returned `step`: certify the run, by the digest of the step,
-        and only then start the step as the task's continuation, so a run the
-        leader does not certify leaves no continuation behind.
-        The task is over, and its handle settled, when the continuation is."""
-        if not self._runtime.certifies_locally:
-            raise TaskDefinitionError(
-                f"task {claim.definition_id} returned a flow, group or bound task, which a "
-                "networked worker cannot run as a continuation: its stages would be orchestrated "
-                "in this process"
-            )
+        """The task returned `step`: certify the run, by the digest of the
+        step, which the leader then runs as the task's continuation. The task
+        is over, and its handle settled, when the continuation is."""
         if not getattr(step, "is_step", False):
             raise TaskDefinitionError(
                 f"task {claim.definition_id} is declared to return a flow, group or bound task, "
@@ -790,25 +964,51 @@ class Session:
         for definition in step.definitions():
             if self._registry.get(definition.name) is None:
                 raise UnknownTaskError(f"this process has no task named {definition.name!r}")
-        description = json.dumps(step.describe(self._serializers), sort_keys=True)
-        digest = result_digest(description.encode())
-        self._tasks.complete_with_continuation(run, claim.task_run_id, digest)
-        # Certified: from here on nothing may fail the run, only the continuation.
+        tree = step.describe(self)
+        if step.is_task:
+            tree = ("flow", "fail_fast", [tree])
+        refuse_oversized_values(self._runtime, tree)
+        self._runtime.complete(claim.task_run_id, continuation=tree)
+        if run.holds_handle:
+            self._tasks.continuing(claim.task_id, _native.continuation_of(claim.task_run_id))
+
+    async def _expand(self, claim: Any) -> None:
+        """Splits the list an expansion run names into one blob per item, each
+        encoded as the map's task takes it, and returns the map over them as
+        the run's continuation. The leader never decodes the list."""
         try:
-            handle = step.start(self, UNSET)
+            request = _native.read_expansion(claim.serialized_input)
+            items = self.decode_resolved(await self._runtime.resolve_expansion(claim.task_run_id))
+            template = self._registry.get(request.definition_id)
+            if template is None:
+                raise UnknownTaskError(f"this process has no task named {request.definition_id!r}")
+            serializer = self._serializers.get(template.serializer)
+            # The items belong to the map this run returns, so they live as long
+            # as it does and move with its record.
+            owner = _native.continuation_of(claim.task_run_id)
+            members = []
+            for item in items:
+                manifest = await self._runtime.store_composite_payload(
+                    owner, serializer.encode(item, template.input_type)
+                )
+                members.append(
+                    (
+                        "task",
+                        request.definition_id,
+                        request.version,
+                        request.settings,
+                        ("manifest", manifest),
+                        [],
+                    )
+                )
+            self._runtime.report_started(claim.task_run_id)
+            self._runtime.complete(claim.task_run_id, continuation=("map", request.on_error, members))
         except Exception as error:
-            self._tasks.continuation_over(claim.task_id, error, None)
-            return
-        self._tasks.continuation_started(run, handle)
-
-        def settled(outcome: "concurrent.futures.Future[Any]") -> None:
-            error = outcome.exception()
-            value = None if error is not None else outcome.result()
-            self._tasks.continuation_over(
-                claim.task_id, error, [value] if step.is_task else value
-            )
-
-        handle._outcome.add_done_callback(settled)
+            kind, message = _kind_of(error), _message_of(error)
+            if not self._report_failure(claim, kind, message) and self._awaits_composites():
+                self._tasks.member_failed(claim.task_id, error)
+        finally:
+            self._member_ended()
 
     def _forget_held(self, run_id: str) -> None:
         self._clear_abort(run_id)
@@ -876,7 +1076,8 @@ class Session:
             )
 
     def _lost(self, claim: Any, run: Run) -> None:
-        """The process running the body died. The leader decides, as for a
+        """The run cannot be seen through: the process running the body died,
+        or the shard could not take its result. The leader decides, as for a
         lost worker: a new attempt (the handle waits for it), or the task is
         over (an ephemeral one, or a non-retriable one that may have had its
         effects). A refused report ends the task here too; failing a handle
@@ -885,7 +1086,7 @@ class Session:
             # Cancelled first, the leader's `cancelled` event settles the
             # handle, as for a cancelled body that failed.
             return
-        _logger.warning("task %s was lost with the process that ran it", claim.task_id)
+        _logger.warning("task %s was reported lost", claim.task_id)
         try:
             replayed = self._runtime.report_lost(claim.task_run_id)
         except Exception as refusal:

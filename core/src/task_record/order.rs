@@ -1,5 +1,5 @@
-use crate::protocol::generated::TaskRecord;
 use crate::task_record::gate::Write;
+use crate::task_record::key::{RecordKey, ShardRecord};
 
 /// Holds back the revision that marks a coalescing generation superseded
 /// until the revision of the generation that superseded it, published by
@@ -7,16 +7,18 @@ use crate::task_record::gate::Write;
 /// superseded can then always find its successor; and if the successor's
 /// write fails, the older generation is never marked superseded at all, so
 /// a new leader finds the key as it was before the submission.
+///
+/// Only Task records have successors: the other kinds pass straight through.
 #[derive(Debug, Default)]
 pub struct WriteOrder {
-    waiting: Vec<(Write, Vec<TaskRecord>)>,
+    waiting: Vec<(Write, Vec<ShardRecord>)>,
 }
 
 /// What a write's end means for the revisions held back behind it.
 #[derive(Debug, PartialEq)]
 pub enum Settlement {
     /// Write these now.
-    Release(Vec<TaskRecord>),
+    Release(Vec<ShardRecord>),
     /// These were never written: count each as refused.
     Refuse(Vec<Write>),
 }
@@ -29,18 +31,21 @@ impl WriteOrder {
     /// One publication call carries at most one supersession per key. A
     /// successor is looked for only among the revisions already admitted to be
     /// written now, not among those held.
-    pub fn admit(&mut self, revisions: Vec<TaskRecord>) -> Vec<TaskRecord> {
-        let mut now: Vec<TaskRecord> = Vec::with_capacity(revisions.len());
+    pub fn admit(&mut self, revisions: Vec<ShardRecord>) -> Vec<ShardRecord> {
+        let mut now: Vec<ShardRecord> = Vec::with_capacity(revisions.len());
         for record in revisions {
-            let successor = record
-                .link
-                .as_ref()
-                .and_then(|link| link.superseded_by.as_ref())
-                .and_then(|newer| {
-                    now.iter()
-                        .map(Write::of)
-                        .find(|write| write.task_id.as_str() == newer.value)
-                });
+            let successor = match &record {
+                ShardRecord::Task(task) => task
+                    .link
+                    .as_ref()
+                    .and_then(|link| link.superseded_by.as_ref())
+                    .and_then(|newer| {
+                        now.iter()
+                            .map(Write::of)
+                            .find(|write| matches!(&write.key, RecordKey::Task(id) if id.as_str() == newer.value))
+                    }),
+                ShardRecord::Composite(_) | ShardRecord::Page(_) => None,
+            };
             match successor {
                 Some(write) => match self.waiting.iter_mut().find(|(key, _)| *key == write) {
                     Some((_, held)) => held.push(record),

@@ -4,15 +4,14 @@
 //! is the newest for its key. An ephemeral task's lost run is not replayed, and a
 //! non-retriable task's running run is orphaned instead.
 
+use crate::support::composites::continue_with_a_stage;
 use crate::support::scheduler::Fixture;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::{
-    ClaimRejection, Completion, ReportRejection, Submission,
-};
+use kabudachi_core::scheduler::{ClaimRejection, Completion, ReportRejection, Submission};
 
 fn worker(name: &str) -> WorkerId {
     WorkerId::new(name)
@@ -217,10 +216,7 @@ fn a_task_whose_continuation_is_running_is_not_lost_with_its_worker() {
     let mut fixture = Fixture::leading();
     let task = fixture.scheduler.submit(generation("a")).unwrap();
     let run = running(&mut fixture, &worker("w1"), &task);
-    fixture
-        .scheduler
-        .complete(&worker("w1"), &run, Digest::blake3(b"d"), Completion::Continues)
-        .unwrap();
+    continue_with_a_stage(&mut fixture, &run);
 
     let lost = fixture.lose_silent(&worker("w1"));
 

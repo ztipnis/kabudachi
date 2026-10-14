@@ -42,6 +42,12 @@ pub use generated::{
     ResultMessage, deliver_result, result_message,
 };
 pub use generated::{StealRequest, StealResponse};
+pub use generated::{
+    BoundField, BoundTaskStep, CompositeAccepted, CompositeEntry, CompositeFinished, CompositePage,
+    CompositeRecord, Expansion, InputShape, MemberCounts, StageDescription, StepDescription,
+    SubmitComposite, bound_field, bound_task_step, composite_entry, composite_record, expansion,
+    input_shape, stage_description,
+};
 
 /// Whether every required ID field of a raw message is present. Nested
 /// messages are not checked; [`checked::decode`] covers them.
@@ -155,7 +161,7 @@ id_accessors!(TransferLeadershipIds for Checked<TransferLeadership>, of Transfer
 });
 id_accessors!(TaskIds for Task, of Task {
     required: [task_id: TaskId, task_definition_id: TaskDefinitionId],
-    optional: [client: WorkerId],
+    optional: [client: WorkerId, composite_id: CompositeId],
     repeated: [],
 });
 id_accessors!(TaskRunIdentityIds for TaskRunIdentity, of TaskRunIdentity {

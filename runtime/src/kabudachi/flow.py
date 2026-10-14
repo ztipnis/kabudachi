@@ -1,8 +1,9 @@
 """Fixed inputs and sequential composition: `.bind()` and `flow`.
 
-Only the sequencing lives here: each stage is an ordinary task submitted when
-its predecessor has finished, so retries, timeouts and queues stay per stage
-and nothing is inherited between stages.
+A step describes itself as a tree the shard's leader runs: each stage is an
+ordinary task the leader submits when its predecessor has finished, so
+retries, timeouts and queues stay per stage and nothing is inherited between
+stages.
 """
 
 from typing import Any
@@ -11,7 +12,7 @@ from kabudachi.composites import FlowHandle, GroupHandle
 from kabudachi.config import UNSET
 from kabudachi.errors import TaskDefinitionError
 from kabudachi.handle import TaskHandle
-from kabudachi.registry import TaskDefinition
+from kabudachi.registry import TaskDefinition, TaskKind
 from kabudachi.session import Session, current_session
 
 
@@ -25,6 +26,28 @@ def _message_fields(input_type: Any) -> dict[str, Any]:
             f"not {input_type!r}"
         )
     return descriptor.fields_by_name
+
+
+def _field_kind(input_type: Any, name: str) -> str:
+    """The kind a description gives the bound field `name` of `input_type`."""
+    field = _message_fields(input_type)[name]
+    if field.cpp_type in (field.CPPTYPE_INT32, field.CPPTYPE_INT64, field.CPPTYPE_ENUM):
+        return "int"
+    if field.cpp_type in (field.CPPTYPE_UINT32, field.CPPTYPE_UINT64):
+        return "uint"
+    if field.cpp_type in (field.CPPTYPE_FLOAT, field.CPPTYPE_DOUBLE):
+        return "double"
+    if field.cpp_type == field.CPPTYPE_BOOL:
+        return "bool"
+    return "bytes" if field.type == field.TYPE_BYTES else "string"
+
+
+def _refuse_coalescing(definition: TaskDefinition) -> None:
+    if definition.kind is TaskKind.COALESCING:
+        raise TypeError(
+            "a coalescing task cannot be a stage of a flow, group or map: "
+            "its generations would replace each other across them"
+        )
 
 
 def _check_arguments(name: str, needs_input: bool, arguments: tuple[Any, ...]) -> None:
@@ -75,15 +98,26 @@ class BoundTask:
         """Every task this step runs."""
         return [self.definition]
 
-    def describe(self, serializers: Any) -> Any:
-        """This step as plain data, the same every time it is built the same
-        way, so the leader can certify it by digest."""
+    def describe(self, session: Session, previous: Any = UNSET) -> tuple:
+        """This step as the tree `_native.describe_step` encodes: built from
+        values and field values only, never from `repr`, so the same step
+        always encodes to the same bytes. `previous`, when given, is the
+        input this step takes, encoded here as its whole input."""
+        definition = self.definition
+        serializer = session.serializers.get(definition.serializer)
+        value: bytes | None = None
         if not self.needs_input:
-            serializer = serializers.get(self.definition.serializer)
-            payload = serializer.encode(self._value, self.definition.input_type).hex()
-            return {"task": self.definition.name, "value": payload}
-        fields = {name: repr(value) for name, value in sorted(self._fields.items())}
-        return {"task": self.definition.name, "fields": fields}
+            value = serializer.encode(self._value, definition.input_type)
+        elif previous is not UNSET:
+            value = serializer.encode(self._input(previous), definition.input_type)
+        fields = []
+        if value is None:
+            fields = [
+                (name, _field_kind(definition.input_type, name), field_value)
+                for name, field_value in sorted(self._fields.items())
+            ]
+        settings = session.submission_settings(definition)
+        return ("task", definition.name, definition.version, settings, value, fields)
 
     def __call__(self, *arguments: Any) -> TaskHandle:
         self.check_arguments(arguments)
@@ -155,6 +189,7 @@ class Flow:
 
     is_step = True
     is_task = False
+    handle_type = FlowHandle
     output_type = None
     """Unknown: a flow resolves to the list of its stages' results."""
 
@@ -175,9 +210,13 @@ class Flow:
     def definitions(self) -> list[TaskDefinition]:
         return [definition for stage in self.stages for definition in stage.definitions()]
 
-    def describe(self, serializers: Any) -> Any:
-        """The flow as plain data, the same every time it is built the same way."""
-        return {"flow": [stage.describe(serializers) for stage in self.stages]}
+    def describe(self, session: Session, previous: Any = UNSET) -> tuple:
+        """The flow as a tree, as `BoundTask.describe` has a task; only its
+        first stage is bound to `previous`."""
+        first, *rest = self.stages
+        stages = [first.describe(session, previous)]
+        stages.extend(stage.describe(session) for stage in rest)
+        return ("flow", "fail_fast", stages)
 
     def check_arguments(self, arguments: tuple[Any, ...]) -> None:
         """Raises `TypeError` unless `arguments` is what the flow takes."""
@@ -188,7 +227,7 @@ class Flow:
         return self.start(current_session(), arguments[0] if arguments else UNSET)
 
     def start(self, session: Session, previous: Any) -> FlowHandle:
-        return session.composites.submit_flow(self, previous if self.needs_input else UNSET)
+        return session.composites.submit(self, previous if self.needs_input else UNSET)
 
 
 ON_ERROR_POLICIES = ("fail_fast", "collect_all")
@@ -208,6 +247,7 @@ class Group:
 
     is_step = True
     is_task = False
+    handle_type = GroupHandle
     output_type = None
     """Unknown: a group resolves to the list of its members' results."""
 
@@ -226,10 +266,11 @@ class Group:
     def definitions(self) -> list[TaskDefinition]:
         return [definition for member in self.members for definition in member.definitions()]
 
-    def describe(self, serializers: Any) -> Any:
-        """The group as plain data, the same every time it is built the same way."""
-        members = [member.describe(serializers) for member in self.members]
-        return {"group": members, "on_error": self.on_error}
+    def describe(self, session: Session, previous: Any = UNSET) -> tuple:
+        """The group as a tree, as `BoundTask.describe` has a task; every
+        member that takes an input is bound to `previous`."""
+        members = [member.describe(session, previous) for member in self.members]
+        return ("group", self.on_error, members)
 
     def check_arguments(self, arguments: tuple[Any, ...]) -> None:
         """Raises `TypeError` unless `arguments` is what the group takes."""
@@ -240,7 +281,7 @@ class Group:
         return self.start(current_session(), arguments[0] if arguments else UNSET)
 
     def start(self, session: Session, previous: Any) -> GroupHandle:
-        return session.composites.submit_group(self, previous)
+        return session.composites.submit(self, previous)
 
 
 class MapStep:
@@ -250,12 +291,15 @@ class MapStep:
 
     is_step = True
     is_task = False
+    handle_type = GroupHandle
     needs_input = True
     output_type = None
 
-    def __init__(self, definition: TaskDefinition, serializers: Any) -> None:
+    def __init__(self, definition: TaskDefinition, serializers: Any, on_error: str = "fail_fast") -> None:
+        _refuse_coalescing(definition)
         self.definition = definition
         self._serializers = serializers
+        self._on_error = on_error
 
     def input_requirements(self) -> list[tuple[str, Any]]:
         """The (name, type) of the task, whose input must be a list of what it takes."""
@@ -264,29 +308,36 @@ class MapStep:
     def definitions(self) -> list[TaskDefinition]:
         return [self.definition]
 
-    def describe(self, serializers: Any) -> Any:
-        """The map as plain data, the same every time it is built the same way."""
-        return {"map": self.definition.name}
+    def describe(self, session: Session, previous: Any = UNSET) -> tuple:
+        """The map as a tree, as `BoundTask.describe` has a task: one bound
+        member per item of `previous`, or, with none, the one unbound member
+        that is expanded once the stage before it has produced its list."""
+        if previous is UNSET:
+            members = [BoundTask(self.definition)]
+        else:
+            members = self._members(previous)
+        return ("map", self._on_error, [member.describe(session) for member in members])
 
     def check_arguments(self, arguments: tuple[Any, ...]) -> None:
         """Raises `TypeError` unless `arguments` is the one list map takes."""
         _check_arguments(f"{self.definition.name}.map", True, arguments)
 
     def __call__(self, inputs: Any, *, on_error: str = "fail_fast") -> GroupHandle:
-        return current_session().composites.submit_group(self._group(inputs, on_error), UNSET)
+        step = MapStep(self.definition, self._serializers, _policy(on_error))
+        return current_session().composites.submit(step, inputs)
 
     def start(self, session: Session, previous: Any) -> GroupHandle:
-        return session.composites.submit_group(self._group(previous, "fail_fast"), UNSET)
+        return session.composites.submit(self, previous)
 
-    def _group(self, inputs: Any, on_error: str) -> "Group":
-        """A group with one fully bound task per item. Every item is checked
-        before any is submitted, so a bad one leaves nothing half done."""
+    def _members(self, inputs: Any) -> list[BoundTask]:
+        """One fully bound task per item. Every item is checked before any is
+        submitted, so a bad one leaves nothing half done."""
         if not isinstance(inputs, (list, tuple)):
             raise TypeError(f"map takes a list of inputs, not {inputs!r}")
         serializer = self._serializers.get(self.definition.serializer)
         for item in inputs:
             serializer.encode(item, self.definition.input_type)
-        return Group([BoundTask(self.definition, value=item) for item in inputs], _policy(on_error))
+        return [BoundTask(self.definition, value=item) for item in inputs]
 
 
 def _steps(kind: str, steps: tuple[Any, ...]) -> list[Any]:
@@ -299,6 +350,8 @@ def _steps(kind: str, steps: tuple[Any, ...]) -> list[Any]:
             step = BoundTask(step.definition)  # a plain task is an unbound stage
         else:
             raise TypeError(f"a {kind} takes tasks, bound tasks, flows and groups, not {step!r}")
+        if isinstance(step, BoundTask):
+            _refuse_coalescing(step.definition)
         converted.append(step)
     return converted
 

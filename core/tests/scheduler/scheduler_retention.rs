@@ -8,6 +8,7 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerI
 use kabudachi_core::scheduler::{Completion, Submission};
 use kabudachi_core::time::Duration;
 
+use crate::support::composites::{continue_with_a_stage, end_continuation};
 use crate::support::scheduler::Fixture;
 
 const TTL: u64 = 100;
@@ -160,13 +161,14 @@ fn a_task_with_a_continuation_is_not_forgotten_until_it_ends() {
         .scheduler
         .set_result_ttl(Some(Duration::from_ticks(100)));
     let (task, run) = running_task(&mut fixture);
-    complete(&mut fixture, &run, Completion::Continues);
+    let continuation = continue_with_a_stage(&mut fixture, &run);
 
     fixture.clock.advance(Duration::from_ticks(10_000));
     assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
 
-    fixture.scheduler.end_continuation(&task).unwrap();
+    end_continuation(&mut fixture, &continuation);
     fixture.clock.advance(Duration::from_ticks(100));
-    assert_eq!(fixture.scheduler.catch_up().forgotten, 1);
+    // The task and the one stage member of the step it returned.
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 2);
     assert!(fixture.forgotten(&task));
 }

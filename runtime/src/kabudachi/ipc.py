@@ -16,6 +16,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any
 
+from kabudachi.body import Given
 from kabudachi.errors import TaskBodyError
 from kabudachi.options import SubmissionOptions
 
@@ -41,6 +42,8 @@ class Run:
     shard: str
     """The name of the shard the worker serves."""
     worker_id: str
+    given: Given | None = None
+    """For a member of a composite: what it is given besides the input."""
 
 
 @dataclass(frozen=True)
@@ -170,14 +173,14 @@ class Resumed:
 @dataclass(frozen=True)
 class Submit:
     """Submit a task for a body here (`definition_id`, `payload`, `options`),
-    or a flow or group (`composite` is "flow" or "group"; `step` and
-    `previous` are pickled)."""
+    or a flow, group or map (`composite` is set; `step` and `previous` are
+    pickled)."""
 
     request: int
     definition_id: str | None = None
     payload: bytes | None = None
     options: SubmissionOptions | None = None
-    composite: str | None = None
+    composite: bool = False
     step: bytes | None = None
     previous: bytes | None = None
 

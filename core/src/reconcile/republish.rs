@@ -2,8 +2,7 @@
 
 use std::collections::VecDeque;
 
-use crate::protocol::generated::TaskRecord;
-use crate::task_record::{PlacedWrite, Settlement, Write, WriteOrder, WriteOutcome};
+use crate::task_record::{PlacedWrite, Settlement, ShardRecord, Write, WriteOrder, WriteOutcome};
 use crate::time::{Duration, Instant};
 
 /// The most republished records written at once.
@@ -90,7 +89,7 @@ impl Republish {
             Settlement::Refuse(refused) => {
                 // The records held behind the refused write still wait for it:
                 // it is written again, and they follow once it is stored.
-                let held: Vec<TaskRecord> = self
+                let held: Vec<ShardRecord> = self
                     .behind
                     .iter()
                     .filter(|held| refused.iter().any(|write| is_write_of(held, write)))
@@ -107,7 +106,7 @@ impl Republish {
         }
         if !outcome.stored {
             tracing::error!(
-                task = outcome.write.task_id.as_str(),
+                key = ?outcome.write.key,
                 "a republished record was not stored: writing it again"
             );
             self.retries.push((now + self.retry_after, placed));
@@ -128,7 +127,7 @@ impl Republish {
         }
     }
 
-    fn release(&mut self, record: &TaskRecord) {
+    fn release(&mut self, record: &ShardRecord) {
         let write = Write::of(record);
         if let Some(at) = self.behind.iter().position(|held| is_write_of(held, &write)) {
             self.queued.push_back(self.behind.remove(at));

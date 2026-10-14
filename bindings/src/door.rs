@@ -18,18 +18,24 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use kabudachi_core::blob::{BlobKey, BlobOwner};
 use kabudachi_core::election::{DropMessages, Input, NoAuthority, Step, WorkerNode, carry_out};
 use kabudachi_core::manifest::{Chunked, Manifest, fits_inline};
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids, WorkerId};
-use kabudachi_core::protocol::messages::TaskRecord;
+use kabudachi_core::protocol::generated::{CompositePage, CompositeRecord};
+use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, Uuid7Ids, WorkerId};
+use kabudachi_core::protocol::messages::prelude::*;
+use kabudachi_core::protocol::messages::{Task, TaskRecord};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
+use kabudachi_core::scheduler::composite::{
+    CompositeSource, CompositeStatus, Step as CompositeStep, Unresolved,
+};
 use kabudachi_core::scheduler::{
     Backlog, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted,
-    Completion, ContinuationRejection, Event, Failure, LostRun, ReportRejection, Scheduler,
-    Submission, SubmitRejection, Submitted,
+    Completion, Event, Failure, LostRun, ReportRejection, Scheduler, Submission, SubmitRejection,
+    Submitted,
 };
 use kabudachi_core::task_record::{LocalRecords, office_to_reconcile};
 use kabudachi_core::time::{Clock, Instant};
@@ -200,9 +206,71 @@ impl<C: Clock> SchedulerDoor<C> {
                 let task = submitted.task_id.clone();
                 backlog
                     .submit_minted(scheduler, submitted)
-                    .inspect_err(|_| scheduler.observer_mut().forget_blobs_of(&task))
+                    .inspect_err(|_| scheduler.observer_mut().forget_blobs_of(&BlobOwner::Task(task.clone())))
             })
         }))
+    }
+
+    /// Mints a composite for `step` with this door's worker as its client and
+    /// submits it: the backlog records it now, or holds it until the node
+    /// leads. `values` are the bound inputs too large to inline that `step`
+    /// names by manifest (see `take_large_values`): they are kept in this
+    /// node's own store, as blobs the composite owns, before it is submitted,
+    /// and dropped again if it is refused. Wakes claims and timers.
+    pub fn submit_composite(
+        &self,
+        step: CompositeStep,
+        values: Vec<Vec<u8>>,
+    ) -> Result<CompositeId, Refusal<SubmitRejection>> {
+        refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
+            settled_backlog(inside, |backlog, scheduler| {
+                let minted = scheduler.mint_composite(step, Some(self.worker.clone()));
+                let owner = BlobOwner::Composite(minted.composite_id.clone());
+                for value in values {
+                    scheduler.observer_mut().put_blobs(&owner, Manifest::chunk(&value).chunks);
+                }
+                backlog
+                    .submit_composite(scheduler, minted)
+                    .inspect_err(|_| scheduler.observer_mut().forget_blobs_of(&owner))
+            })
+        }))
+    }
+
+    /// Cancels the composite `id`, with every member it has started. One
+    /// still waiting in the backlog is dropped, so it never runs, and its
+    /// blobs go with it.
+    pub fn cancel_composite(&self, id: &CompositeId) -> Result<Cancellation, Refusal<CancelRejection>> {
+        refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
+            settled_backlog(inside, |backlog, scheduler| {
+                let cancelled = backlog.cancel_composite(scheduler, id);
+                if cancelled == Ok(Cancellation::Cancelled { was_running: false })
+                    && scheduler.composite_status(id).is_none()
+                {
+                    scheduler.observer_mut().forget_blobs_of(&BlobOwner::Composite(id.clone()));
+                }
+                cancelled
+            })
+        }))
+    }
+
+    /// Keeps `chunks` as blobs `owner` owns, and drops them with it. The
+    /// blobs of an owner that is over go at once, unlike a result's.
+    pub fn store_input_blobs(&self, owner: &BlobOwner, chunks: Vec<Vec<u8>>) -> Result<(), Closed> {
+        self.change(Concerned::Nobody, |scheduler| scheduler.observer_mut().put_blobs(owner, chunks))
+    }
+
+    /// Keeps `chunks` as blobs of a result `owner` produced, which stay as
+    /// long as its record does.
+    pub fn store_result_blobs(&self, owner: &BlobOwner, chunks: Vec<Vec<u8>>) -> Result<(), Closed> {
+        self.change(Concerned::Nobody, |scheduler| {
+            scheduler.observer_mut().put_result_blobs(owner, chunks);
+        })
+    }
+
+    /// Counts `bytes` the worker read as the input of the member run `run`
+    /// against the memory limits, until the run is decided.
+    pub fn hold_member_input(&self, run: &TaskRunId, bytes: u64) -> Result<(), Closed> {
+        self.change(Concerned::Nobody, |scheduler| scheduler.hold_member_input(run, bytes))
     }
 
     pub fn report_started(&self, run: &TaskRunId) -> Result<(), Refusal<ReportRejection>> {
@@ -225,6 +293,38 @@ impl<C: Clock> SchedulerDoor<C> {
                     scheduler.complete(&self.worker, run, result_digest, completion)?;
                 forget_blobs_if_finished(scheduler, &certification.task_id);
                 Ok(certification)
+            })
+        }))
+    }
+
+    /// Reports that a running run succeeded and returned `step`, which runs as
+    /// a composite: the run is certified under the step's digest. `values` are
+    /// the step's bound inputs too large to inline (see `take_large_values`),
+    /// kept as blobs the composite owns before the report, and dropped again if
+    /// the report is refused.
+    pub fn complete_with_step(
+        &self,
+        run: &TaskRunId,
+        step: CompositeStep,
+        values: Vec<Vec<u8>>,
+    ) -> Result<Certification, Refusal<ReportRejection>> {
+        let digest = step.digest();
+        refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
+            settled_change(scheduler, |scheduler| {
+                let owner = BlobOwner::Composite(CompositeId::continuation_of(run));
+                for value in values {
+                    scheduler.observer_mut().put_blobs(&owner, Manifest::chunk(&value).chunks);
+                }
+                scheduler
+                    .complete(&self.worker, run, digest, Completion::Continues(step))
+                    .inspect_err(|_| {
+                        // A repeated report of a run that did return its step
+                        // finds the blobs the first one stored in use.
+                        let returned = scheduler.task_run(run).is_some_and(|run| run.continuation.is_some());
+                        if !returned {
+                            scheduler.observer_mut().forget_blobs_of(&owner);
+                        }
+                    })
             })
         }))
     }
@@ -293,7 +393,7 @@ impl<C: Clock> SchedulerDoor<C> {
                 let cancelled = backlog.cancel(scheduler, task);
                 match cancelled {
                     Ok(Cancellation::Cancelled { was_running: false }) => {
-                        scheduler.observer_mut().forget_blobs_of(task);
+                        scheduler.observer_mut().forget_blobs_of(&BlobOwner::Task(task.clone()));
                     }
                     Ok(Cancellation::Cancelled { was_running: true }) => {
                         forget_blobs_if_finished(scheduler, task);
@@ -301,20 +401,6 @@ impl<C: Clock> SchedulerDoor<C> {
                     _ => {}
                 }
                 cancelled
-            })
-        }))
-    }
-
-    /// Ends the continuation of `task`. Refused for want of leadership, it
-    /// is kept by the backlog and ended once this node leads; the caller is
-    /// still told it was refused.
-    pub fn end_continuation(
-        &self,
-        task: &TaskId,
-    ) -> Result<bool, Refusal<ContinuationRejection>> {
-        refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
-            settled_backlog(inside, |backlog, scheduler| {
-                backlog.end_continuation(scheduler, task)
             })
         }))
     }
@@ -500,6 +586,20 @@ impl<C: Clock> SchedulerDoor<C> {
         self.read(|scheduler| scheduler.observer().records().get(task).cloned())
     }
 
+    /// The Task `run` is a run of, if the scheduler holds it.
+    pub fn task_of_run(&self, run: &TaskRunId) -> Result<Option<Task>, Closed> {
+        self.read(|scheduler| scheduler.task_of_run(run).cloned())
+    }
+
+    /// Where the composite `id` stands, if the scheduler holds it.
+    pub fn composite_status(&self, id: &CompositeId) -> Result<Option<CompositeStatus>, Closed> {
+        let inside = self.lock();
+        if inside.closed {
+            return Err(Closed);
+        }
+        Ok(inside.backlog.composite_status(&inside.scheduler, id))
+    }
+
     /// Reads the scheduler under its lock, unless the door is closed.
     fn read<T>(&self, read: impl FnOnce(&DoorScheduler<C>) -> T) -> Result<T, Closed> {
         let inside = self.lock();
@@ -610,13 +710,18 @@ fn as_blobs<C: Clock>(scheduler: &mut DoorScheduler<C>, mut submitted: Submitted
         return submitted;
     }
     let Chunked { manifest, chunks } = Manifest::chunk(input);
-    scheduler.observer_mut().put_blobs(&submitted.task_id, chunks);
+    scheduler.observer_mut().put_blobs(&BlobOwner::Task(submitted.task_id.clone()), chunks);
     submitted.submission = submitted.submission.with_input_manifest(manifest);
     submitted
 }
 
-/// `claim` with its input back in it, joined from this node's own store.
+/// `claim` with its input back in it, joined from this node's own store. A
+/// member of a composite is left as it is: the manifest it carries names the
+/// results it takes, which its worker resolves through the composite.
 fn with_local_input<C: Clock>(scheduler: &mut DoorScheduler<C>, mut claim: Claim) -> Claim {
+    if claim.task.composite_id().is_some() {
+        return claim;
+    }
     let records = scheduler.observer_mut();
     claim
         .resolve_input(|key| records.blob(key))
@@ -626,14 +731,41 @@ fn with_local_input<C: Clock>(scheduler: &mut DoorScheduler<C>, mut claim: Claim
     claim
 }
 
-/// Drops the blobs of `task` if the scheduler says it is over. A one-node
-/// task's blobs are all input, since its results never travel as blobs, so
-/// nothing is kept for retention.
+/// Drops the input blobs of `task` if the scheduler says it is over. The
+/// blobs of the result of a member of a composite stay as long as its record.
 fn forget_blobs_if_finished<C: Clock>(scheduler: &mut DoorScheduler<C>, task: &TaskId) {
     if let Ok(Some(outcome)) = scheduler.outcome(task)
         && outcome.finished
     {
-        scheduler.observer_mut().forget_blobs_of(task);
+        scheduler.observer_mut().forget_input_blobs_of(&BlobOwner::Task(task.clone()));
+    }
+}
+
+/// A composite's records and blobs as this node's own scheduler holds them.
+pub struct DoorSource<'door, C: Clock>(pub &'door SchedulerDoor<C>);
+
+impl<C: Clock + Send + 'static> CompositeSource for DoorSource<'_, C> {
+    async fn composite(&self, id: &CompositeId) -> Option<CompositeRecord> {
+        self.0.read(|scheduler| scheduler.composite_record(id)).ok().flatten()
+    }
+
+    async fn page(&self, id: &CompositeId, page: u32) -> Option<CompositePage> {
+        self.0.read(|scheduler| scheduler.composite_page(id, page)).ok().flatten()
+    }
+
+    async fn blob(&self, _owner: &BlobOwner, key: &BlobKey) -> Option<Vec<u8>> {
+        self.0.read(|scheduler| scheduler.observer().blob(key)).ok().flatten()
+    }
+
+    async fn payload(&self, _owner: &BlobOwner, manifest: &Manifest) -> Result<Vec<u8>, Unresolved> {
+        let joined = self
+            .0
+            .read(|scheduler| manifest.join(|key| scheduler.observer().blob(key)))
+            .map_err(|Closed| Unresolved::Malformed)?;
+        joined.map_err(|error| match error {
+            kabudachi_core::manifest::Unresolved::Missing(key) => Unresolved::MissingBlob(key),
+            _ => Unresolved::Malformed,
+        })
     }
 }
 

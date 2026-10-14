@@ -7,13 +7,13 @@ pub use reconciliation::OfficeReconciliation;
 use std::collections::BTreeSet;
 
 use crate::election::{Input, WorkerNode};
-use crate::protocol::generated::TaskRecord;
-use crate::protocol::ids::{IdGenerator, TaskId, WorkerId};
+use crate::protocol::ids::{IdGenerator, WorkerId};
 use crate::protocol::worker_state::WorkerState;
 use crate::reconcile::{Rebuild, ReconcileTerm};
 use crate::scheduler::{Observer, ReconcileRefused, Scheduler};
 use crate::time::{Clock, Duration, Instant};
 
+use super::key::{RecordKey, ShardRecord};
 use super::{
     EffectGate, PlacedWrite, Repair, Settled, Settlement, Waits, Write, WriteLedger, WriteOrder,
     WriteOutcome,
@@ -30,13 +30,13 @@ pub struct Placement {
     pub quorum: usize,
 }
 
-/// How a leader's records reach its shard: where a record of a task is
+/// How a leader's records reach its shard: where a record is
 /// held, and the writes that carry a revision there. Every worker of a shard
 /// must place records the same way.
 pub trait RecordPorts {
-    /// The holders of a record of `task` among `voters`, and how many of
+    /// The holders of the record `key` names among `voters`, and how many of
     /// them must store a revision; `None` when it cannot be placed there.
-    fn place(&self, task: &TaskId, voters: &[WorkerId]) -> Option<Placement>;
+    fn place(&self, key: &RecordKey, voters: &[WorkerId]) -> Option<Placement>;
     /// Starts each write. Each outcome comes back later, as a
     /// [`WriteOutcome`] for [`LeaderRecords::settle`].
     fn write(&mut self, writes: Vec<PlacedWrite>);
@@ -49,7 +49,7 @@ pub trait RecordPorts {
 /// leader's record path takes them to write.
 pub trait PublishedRevisions {
     /// Every revision published since the last call, oldest first.
-    fn take_published(&mut self) -> Vec<TaskRecord>;
+    fn take_published(&mut self) -> Vec<ShardRecord>;
 }
 
 /// What a leader office does with its scheduler's revisions, without I/O:
@@ -155,23 +155,34 @@ impl<E> LeaderRecords<E> {
     }
 
     /// Holds `answer` until `made`, the writes its call made, are stored while
-    /// the scheduler leads. A call about `task` that made no write waits for
-    /// that task's writes still unsettled instead, since it tells of what an
+    /// the scheduler leads. A call about `key` that made no write waits for
+    /// that record's writes still unsettled instead, since it tells of what an
     /// earlier answer decided. Returns it settled at once when nothing need
     /// wait: released when there is nothing to wait for, `NotLeader` when one
-    /// of the task's writes was refused.
+    /// of the record's writes was refused.
     #[must_use]
     pub fn hold(
         &mut self,
         answer: E,
         made: Vec<Write>,
-        task: Option<&TaskId>,
+        key: Option<&RecordKey>,
+    ) -> Option<Settled<E>> {
+        self.hold_on(answer, made, key.map_or(&[], std::slice::from_ref))
+    }
+
+    /// Like [`Self::hold`] for an answer about several records at once: one
+    /// that made no write waits for the writes of all of `keys` still
+    /// unsettled, and is answered `NotLeader` at once if any was refused.
+    #[must_use]
+    pub fn hold_on(
+        &mut self,
+        answer: E,
+        made: Vec<Write>,
+        keys: &[RecordKey],
     ) -> Option<Settled<E>> {
         let mut writes = made;
-        if writes.is_empty()
-            && let Some(task) = task
-        {
-            match self.ledger.waits_on(task) {
+        if writes.is_empty() && !keys.is_empty() {
+            match self.ledger.waits_on_all(keys) {
                 Waits::Refused => return Some(Settled::NotLeader(answer)),
                 Waits::Writes(pending) => writes.extend(pending),
             }
@@ -228,7 +239,7 @@ impl<E> LeaderRecords<E> {
             settled.extend(self.held.acknowledged(&outcome.write, leading));
         } else {
             tracing::debug!(
-                task = outcome.write.task_id.as_str(),
+                key = ?outcome.write.key,
                 "a record revision was not stored at its quorum"
             );
             refused.push(outcome.write);
@@ -310,18 +321,18 @@ impl<E> LeaderRecords<E> {
         } else {
             Vec::new()
         };
-        let tasks = {
+        let keys = {
             let (scheduler, ports) = (&*scheduler, &*ports);
             self.repair.check(
                 in_office,
                 scheduler.is_leader(),
                 &placeable,
-                |task| scheduler.holds(task),
-                |task| ports.place(task, &placeable).map(|placed| placed.holders),
+                |key| scheduler.holds(key),
+                |key| ports.place(key, &placeable).map(|placed| placed.holders),
                 now,
             )
         };
-        if !tasks.is_empty() && scheduler.republish(&tasks) > 0 {
+        if !keys.is_empty() && scheduler.republish(&keys) > 0 {
             self.write(node, scheduler, ports);
         }
     }
@@ -352,7 +363,7 @@ impl<E> LeaderRecords<E> {
     fn place_and_write<C: Clock>(
         &mut self,
         node: &WorkerNode<C>,
-        records: Vec<TaskRecord>,
+        records: Vec<ShardRecord>,
         ports: &mut impl RecordPorts,
     ) {
         let (mut placed, unplaced) = place(node, records, &*ports);
@@ -417,7 +428,7 @@ impl<E> LeaderRecords<E> {
         if node.office_term() != Some(reconciliation.office()) {
             return Some(Turn::Ended);
         }
-        let found = learnt.records.clone();
+        let found = learnt.found();
         match scheduler.adopt(learnt) {
             Ok(adopted) => {
                 self.repair.found(&found);
@@ -488,7 +499,7 @@ impl<E> LeaderRecords<E> {
     ) -> Option<Turn> {
         // Where the rebuild's records were held is noted first, so a revision
         // that moves one is written to the holders it left too.
-        self.repair.found(&rebuild.records);
+        self.repair.found(&rebuild.found());
         match scheduler.reconcile(rebuild) {
             Ok(rebuilt) => {
                 tracing::info!(
@@ -522,14 +533,14 @@ impl<E> LeaderRecords<E> {
         let voters = node.placeable_voters();
         let repair = &mut self.repair;
         reconciliation.re_place(
-            |write| match ports.place(&Write::of(&write.record).task_id, &voters) {
+            |write| match ports.place(&Write::of(&write.record).key, &voters) {
                 Some(Placement { holders, quorum }) => {
-                    write.record.placement = holders.into_iter().map(Into::into).collect();
+                    write.record.place_on(holders);
                     write.quorum = quorum;
                     repair.written(write, |holder| node.is_member(holder));
                 }
                 None => tracing::error!(
-                    task = Write::of(&write.record).task_id.as_str(),
+                    key = ?Write::of(&write.record).key,
                     "a republished record could not be placed on the new voters"
                 ),
             },
@@ -545,7 +556,7 @@ impl<E> LeaderRecords<E> {
         &mut self,
         reconciliation: &mut OfficeReconciliation,
         node: &WorkerNode<C>,
-        records: Vec<TaskRecord>,
+        records: Vec<ShardRecord>,
         ports: &impl RecordPorts,
     ) {
         let (mut writes, unplaced) = place(node, records, ports);
@@ -576,15 +587,15 @@ impl<E> LeaderRecords<E> {
 /// `records` placed on the node's voters, and those that could not be.
 fn place<C: Clock>(
     node: &WorkerNode<C>,
-    records: Vec<TaskRecord>,
+    records: Vec<ShardRecord>,
     ports: &impl RecordPorts,
-) -> (Vec<PlacedWrite>, Vec<TaskRecord>) {
+) -> (Vec<PlacedWrite>, Vec<ShardRecord>) {
     let voters = node.placeable_voters();
     let (mut placed, mut unplaced) = (Vec::new(), Vec::new());
     for mut record in records {
-        match ports.place(&Write::of(&record).task_id, &voters) {
+        match ports.place(&Write::of(&record).key, &voters) {
             Some(Placement { holders, quorum }) => {
-                record.placement = holders.into_iter().map(Into::into).collect();
+                record.place_on(holders);
                 placed.push(PlacedWrite::new(record, quorum));
             }
             None => unplaced.push(record),
