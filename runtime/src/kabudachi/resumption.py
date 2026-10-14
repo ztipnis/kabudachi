@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from kabudachi.session import current_session
+from kabudachi.client import current_session
 
 
 async def resume(result_id: str) -> Any:
@@ -23,7 +23,7 @@ async def resume(result_id: str) -> Any:
             not match the record.
         UnknownTaskError: This process does not declare the task, so it cannot
             decode the value.
-        RuntimeNotStartedError: Outside `kabudachi.run()`, or in a task
-            process.
+        RuntimeNotStartedError: No worker is active and no caller seeds or
+            authority are configured. Caller connections initialize lazily.
     """
     return await current_session().resume(result_id)

@@ -71,6 +71,31 @@ current_body: contextvars.ContextVar[WaitObserver | None] = contextvars.ContextV
 )
 
 
+def call_sync(task: Callable[..., "TaskHandle"], *arguments: Any, **options: Any) -> Any:
+    """Submits work and blocks for its certified result or remote error.
+
+    A synchronous task body gives its execution place back while waiting
+    for children. Raises RuntimeError on an event-loop thread, where a
+    blocking wait would prevent asynchronous work from progressing; await
+    the ordinary task call there instead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("use await task(...) on an event-loop thread instead of task.s(...)")
+    handle = task(*arguments, **options)
+    body = current_body.get()
+    if body is not None:
+        body.waiting_started()
+    try:
+        return handle._outcome.result()
+    finally:
+        if body is not None:
+            body.waiting_finished()
+
+
 class TaskHandle:
     """A submitted task. Await it for the task's result.
 
