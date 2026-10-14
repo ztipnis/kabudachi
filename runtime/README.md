@@ -82,7 +82,7 @@ imports your script again, which is why the call to `kabudachi.run(...)` needs i
 `if __name__ == "__main__":` guard.
 
 - A task process imports every module that declared a task or a lifecycle hook, or the modules
-  `imports` names instead, and must find every task at the same version. It has
+  `imports` names instead, and must find the same tasks as the worker. It has
   `process_start_timeout` to do so. Otherwise `kabudachi.run()` raises `StartupError`.
 - Tasks and hooks must be declared in modules a task process can import, not in the script you run:
   `kabudachi.run()` refuses one declared there with `TaskDefinitionError`, unless `processes=0`.
@@ -156,6 +156,13 @@ Set `listen` and the worker joins a networked shard instead of running one of it
 | `authority` | the shard's Redis or Valkey, as a `redis://` or `rediss://` (TLS) URL: the database as the path, `?key_prefix=` (default `kabudachi:`), and `?ttl=`, the seconds a registration outlives its last renewal (default 30) |
 | `shard` | the shard's name (default `"default"`) |
 | `heartbeat_interval`, `heartbeat_timeout`, `reconnect_timeout` | the shard's timings (1 s, 10 s, 30 s), the same on every worker; tasks and queues may set their own `reconnect_timeout` |
+| `roll_call_deadline` | how long a roll call runs before the worker decides on it; a positive `timedelta` below `heartbeat_timeout`; by default a quarter second, or a quarter of `heartbeat_timeout` if that is shorter |
+| `replication_factor` | how many voters store each task's record (default 3); an even factor tolerates no more lost holders than the odd one below it (with 2, writes stall while a holder is dead), so use odd ones |
+| `seed_rounds` | how many rounds a worker with seeds and no `authority` asks its silent seeds before it founds the shard alone (default 3) |
+| `routing_refresh` | how often a worker re-crawls its peers' routing when nothing else prompts it; by default ten heartbeat timeouts |
+| `health_listen` | an `ip:port` to serve `/healthz` and `/readyz` on (see "Health") |
+| `queues`, `queue_options`, `router` | which queues the worker takes and how they are ordered (see "Queues") |
+| `drain_grace`, `drain_wait_limit` | how long a leaving worker waits (see "Shutdown") |
 
 - `kabudachi.run()` starts once the worker has joined and knows its leader. It runs whatever the
   leader hands it, whoever submitted it, and submits through the leader.
@@ -167,15 +174,50 @@ Set `listen` and the worker joins a networked shard instead of running one of it
   If the result cannot reach the submitter, the await raises `ResultUnavailableError`. Flows, groups,
   maps and tasks that return a flow, group or bound task run on a networked shard as on one worker:
   the leader drives them, and the worker that submitted one hears when it is over (and re-reads its
-  record when the leader changes). A result larger than the worker
-  can hold (`memory_hard_limit`, or half of it on a networked worker) fails the run with
+  record when the leader changes). The flows, groups and maps survive a lost worker, a lost leader and a
+  lost submitter (see "Large groups and maps" for a submitter that dies mid-stream). A result larger than the
+  worker can hold (`memory_hard_limit`, or half of it on a networked worker) fails the run with
   `ResultTooLargeError`; it is retried per `retries`.
+- A worker passes over a task whose input it cannot hold or whose input version it cannot run, and
+  another worker may take it.
+- Workers of one shard must give the same `queue_options`; the leader's decide, and a difference is not
+  detected.
 - `handle.cancel()` sends the cancel to the leader without waiting and returns `True`; the worker
   running the task hears of it from the leader and stops it.
 - When `main` returns, or at the first signal when serving without `main`, `run()` waits until every
   task called here has settled; then the worker lets the runs it holds finish and waits until the
-  leader has taken their reports.
+  leader has taken their reports. See "Shutdown" for how it then leaves its shard.
 - The memory limits apply while this worker leads.
+
+## Shutdown
+
+The first SIGINT or SIGTERM to a serving worker, or the return of `main`, starts a drain. `drain_grace`
+bounds how long tasks still running have to finish, after which they are stopped as a second signal
+would stop them; the default `None` waits however long they take.
+
+A networked worker then leaves its shard in order, and each wait is bounded by `drain_wait_limit` (by
+default ten `heartbeat_timeout`s):
+
+- A leader waits for its voters to be ready to take over, then hands leadership to one. A worker with no
+  leader waits for one to appear.
+- A leader that is the shard's only voter waits for another voter to hand over to.
+- Every worker waits for the task records it holds to be stored by others. Records still held when the
+  wait ends leave with it, and are logged.
+
+The worker gives up on leaving after four such waits plus one `heartbeat_timeout`, then shuts down.
+A worker that is fenced, still bootstrapping or joining holds its drain until it leaves that state.
+A shard of one leaves at once. Both settings can also be given as `KABUDACHI_DRAIN_GRACE` and
+`KABUDACHI_DRAIN_WAIT_LIMIT`, in seconds.
+
+## Health
+
+Set `health_listen` to an IP address and port, such as `0.0.0.0:8081` (port 0 picks a free one), and the
+worker serves two endpoints from its start. A port already in use fails `kabudachi.run()` at start.
+
+- `/healthz` answers 200 while the worker's native loops run, and 503 otherwise.
+- `/readyz` answers 200 once the worker can take work, and 503 otherwise. A leader is ready once it has
+  finished reconciling its records after winning. A follower is ready once a leader holding a grant has
+  answered one of its heartbeats.
 
 ## Declaring tasks
 
@@ -203,8 +245,9 @@ serializer as a worker would.
 
 ## Calling tasks
 
-Calling a task returns a handle to await. Awaiting it gives the result once the leader has
-certified it, or raises what the task raised.
+Calling a task returns a `TaskHandle` to await. Awaiting it gives the result once the leader has
+certified it, or raises what the task raised. A flow gives a `FlowHandle` and a group or map a
+`GroupHandle`, which are awaited the same way.
 
 - `handle.cancel()` cancels the task whatever it is doing and says whether it did; awaiting then
   raises `TaskCancelledError`. An awaiter giving up never cancels the task.
@@ -230,6 +273,8 @@ certified it, or raises what the task raised.
   `"cancelled"`), `counts` of its stages or members by state, and, for a flow, `stage`.
 - A task whose run ended and whose record had no room for another attempt raises
   `TaskRecordFullError`.
+- `await kabudachi.resume(id)` gets the result of a task, flow or group by its id in a later process
+  (see "Results after a restart").
 
 ## Composition
 
@@ -248,9 +293,6 @@ certified it, or raises what the task raised.
 Flows, groups, `.map` and returned steps run on a networked worker as on one node. A `collect_all`
 failure is a `TaskFailure` with its `kind` and `message`. A coalescing task cannot be a stage, and
 `kabudachi.` is a reserved task-name prefix.
-
-A stage that consumes the array of a `collect_all` group receives failures in it, so it needs a
-serializer that can encode them; the protobuf serializer cannot.
 
 Building a `flow()`, `group()`, `.map` or `.reduce` checks, where it is written, that what each step
 gives fits what the step after it takes, and raises `TypeError` if it cannot. See "Schemas and
@@ -292,9 +334,10 @@ worker that splits the prior stage's list sends the items in batches.
 `@reducer` declares a durable task of two parameters, `(item, previous) -> previous`: it folds one
 item into the result so far. A plain `@task` of two parameters is the same as a bare `@reducer`.
 Both parameters and the return value are annotated, and the return type must be the type of
-`previous`. It takes the options of `@task` except `version`, plus `associative`, `tree` and `merge`
-below. It must be durable, so it cannot be an `@ephemeral_task` or a `@coalescing_task`, and it cannot
-return a step. Calling it, or using `.bind`, `.map` or `task.options(...)` on it, raises `TypeError`;
+`previous`. It takes the options of `@task` except `result_ttl` (a reduce takes its retention from its
+queue, then the process), plus `associative`, `tree` and `merge` below. It must be durable, so it cannot
+be an `@ephemeral_task` or a `@coalescing_task`, and it cannot return a step. Calling it, or using
+`.bind`, `.map` or `.options(...)` on it, raises `TypeError`;
 `reducer.local(item, previous)` runs the function here, like `task.local`.
 
 ```python
@@ -352,7 +395,14 @@ A list of any size is sent to the shard in batches, as a map's items are, so it 
 record or one message: an item or an `initial` too long to be stored inline is stored as blobs that
 the root of the reduce's tree owns, and the reducer reads it back whole. Memory limits apply as
 they do to maps (see "Large groups and maps"). A step must return a value: a reducer that returns a
-step fails the reduce with `ReducerContinuedError`.
+step fails the reduce with `ReducerContinuedError`. A reduce whose stored items fall short of the count
+its record names fails with `ReduceItemsLostError` rather than fold fewer items. Both are in
+`kabudachi.errors`.
+
+The leader plans a reduce from counts and digests alone and never runs the reducer or `merge`. So a
+tree gives one answer only if every worker that runs a step imports the same reducer and `merge`; the
+leader cannot check that. A reduce fails on its first failed step whatever a group's `on_error` would
+say, and its steps start only once all its items are sent.
 
 ## Schemas and migrations
 
@@ -460,6 +510,18 @@ run of the task that returns it completes. What fits:
 
 Types of different families do not compose, even across serializers.
 
+Limits while workers run different versions:
+
+- A value of an older class of a family that reaches a stage taking a newer class is handed over as
+  the producer's class, not converted.
+- The protobuf serializer carries no version in its payload, so a protobuf stage's input is migrated
+  from the version of the member task that takes it, not the producer's. A JSON payload with a
+  `version_path` is exact.
+- A steal or an oldest-first claim can hand a worker a task newer than itself. The worker reports the
+  task blocked and runs nothing, which costs one round trip.
+- The leader remembers which tasks are blocked only in memory. After a leader change the new leader
+  may hand a blocked task to the same worker once more, and the worker blocks it again.
+
 ## Serializers
 
 A task's `serializer` names the backend that encodes its input and output. `protobuf` is the default.
@@ -474,6 +536,12 @@ A task's `serializer` names the backend that encodes its input and output. `prot
 
 Either serializer finds a payload's version at the family's `version_path`, and writes it there when
 encoding.
+
+`kabudachi.register_serializer(backend)` adds a custom serializer to this process, to be named with
+`serializer=`. It raises `DuplicateSerializerError` if the name is taken. Asking for a name nobody
+registered raises `UnknownSerializerError`, and for a registered backend that cannot run here (its
+library is missing) `SerializerUnavailableError`. Every worker of a shard must register the same
+backend under the same name, since one worker encodes what another decodes.
 
 A custom serializer needs `name`, `available`, `supports`, `encode` and `decode`. It may add the members
 below; one it lacks takes its default, so existing backends keep working:
@@ -492,8 +560,36 @@ A newer pending submission of a `@coalescing_task` with the same key supersedes 
 handle raises `TaskSupersededError`. A running generation is never cancelled, and only one generation
 of a key runs at a time.
 
-The scheduler counts the bytes of task input that has not finished. Past `memory_soft_limit`, `group`
-and `map` pause; past `memory_hard_limit`, submitting raises `BackpressureError`. A `@coalescing_task` declared with `drop_oldest=True` instead drops the key's oldest retained payloads until the submission fits, but still raises `BackpressureError` when dropping every retained payload for the key would not free enough bytes (for example an oversized payload). Independent of the limits, a task whose input, queue and key together exceed about 1 MiB (the size of one message to a worker) also raises `BackpressureError`, because no worker could ever be sent it. `drop_oldest` does not relax this bound: a key whose claim would pass one message raises `BackpressureError` even with `drop_oldest`.
+The scheduler counts the bytes of task input that has not finished, and a networked process also counts
+the large payloads moving through it. Past `memory_soft_limit`, `group` and `map` pause; past
+`memory_hard_limit`, submitting raises `BackpressureError`. Unless set, the soft limit is a quarter and
+the hard limit half of the memory this process may use (its cgroup limit when that is below physical
+memory), read once at start.
+
+There is no fixed cap on a payload. An input or result too large for one message (a little under 1 MiB,
+956 KiB) is cut into 256 KiB blobs that the shard stores; the task's record and every claim carry only a
+list of them. The one permanent refusal is a payload that alone cannot fit under the hard limit of the
+process that must hold it whole: an input raises `PayloadTooLargeError` (it has `size` and `limit` in
+bytes; `limit` is `None` where the leader refused), and a result fails its run with `ResultTooLargeError`,
+which is retried per `retries` like any failure, though it normally fails the same way. Awaiting a result
+past your own hard limit raises `ResultTooLargeError` on that handle only. A result that the shard cannot
+store in time is treated as lost, so a task that may run twice is run again.
+
+A networked process splits its hard limit in half: one half for blob payloads in flight, the other for the
+blobs it stores for its shard. Inputs fill at most half of the store, so results always have room. A worker
+claims a blob input only when it has room for it.
+
+Derived limits differ by host, so give every worker of a networked shard the same explicit
+`memory_soft_limit` and `memory_hard_limit`. Otherwise a task too large for some workers is passed over
+until one that can hold it asks; it waits until it expires, or fails after its retries, when no worker can.
+A very large input can also starve while smaller work keeps arriving.
+
+A `@coalescing_task` declared with `drop_oldest=True` drops the key's oldest retained payloads until the
+submission fits under the limits, but still raises `BackpressureError` when dropping every retained
+payload for the key would not free enough bytes, and `PayloadTooLargeError` when its payload alone is
+past the hard limit. A key's waiting claim carries its retained payloads, and must fit one message:
+`drop_oldest` does not relax that, so a submission that would make it larger raises
+`BackpressureError` even with `drop_oldest`.
 
 A coalescing key's superseded payloads are kept as a chain until the newest generation runs. When a
 key's chain holds more than about half of one message to a worker (or memory is past
@@ -529,6 +625,22 @@ base of the next two), `TaskLostError` (a task's process died and the task is no
 task), `ResultTooLargeError` (a result larger than the hard memory limit of the worker that ran it or of its awaiter) and
 `DurabilityUnavailableError` (the durability asked for cannot be reached), all in `kabudachi.errors`.
 
+The rest of `kabudachi.errors`, for what is asked wrongly or cannot run:
+
+- `ConfigurationError`: a setting is unknown or its value is unacceptable.
+- `TaskDefinitionError`, and its subclass `DuplicateTaskError` (two tasks of one name): a function cannot
+  be a task, or a decorator option is invalid.
+- `UnknownTaskError`: a worker was given a task that no task in its process is named for.
+- `CertificationError`: the leader certified a result that is not the one this process holds, so the
+  result is not delivered.
+- `TaskInterruptedError`: a task, flow or group was interrupted (a cancellation or an interrupt) before
+  it finished. Only the type of the interrupting error is repeated, never its message.
+- `TaskTimeoutError`: a run went past its timeout, so it failed. A body that does not stop within
+  `cancel_grace` of being asked is abandoned.
+- `UnknownSerializerError`, `DuplicateSerializerError` and `SerializerUnavailableError`: see
+  "Serializers".
+- `ReducerContinuedError` and `ReduceItemsLostError`: see "Reducing".
+
 ## Results after a restart
 
 Set `result_backend` and a result outlives the process that asked for it: a new process can get it back by
@@ -543,8 +655,8 @@ value = await kabudachi.resume(result_id)  # in any process of the run, later
 ```
 
 `result_backend` is a Redis or Valkey URL (`redis://` or `rediss://`, the database as the path, and
-`?key_prefix=`, as for `authority`, but no `ttl`: each entry carries its own expiry), or an object with
-async `store` and `load` (a custom backend, below).
+`?key_prefix=`, as for `authority`; a `ttl` is refused, since each entry carries its own expiry), or an
+object with async `store` and `load` (a custom backend, below).
 
 - After the leader certifies a run, the worker that ran it mirrors the result to the backend. A client
   mirrors the resolved results of a flow, group or map when they finish, in bounded pages and chunks.
@@ -582,6 +694,13 @@ was stored with.
   the shard has dropped them too, it raises `ResultUnavailableError`.
 - `resume` runs only in the process that runs `kabudachi.run()`: elsewhere, and in a task process, it
   raises `RuntimeNotStartedError`.
+- A worker that dies after the leader certified a run but before it mirrored the result leaves the run
+  `pending` for good. `resume` waits one `reconnect_timeout`, then reads what the shard holds. A small
+  result is then lost if the client that received it is gone too.
+- A draining worker waits a bounded time for its mirrors to finish, so a slow backend can cut one short.
+- A mirror of a large flow, group or map costs one backend call per part. A call that fails is logged
+  and a mirror written in part is not repaired.
+- An entry's expiry is a time set by the writer, so clock skew between hosts moves it.
 
 ### A custom backend
 
@@ -626,14 +745,17 @@ many more times a failed run is tried, 0 by default) and `timeout` (how long a r
 default), both for the tasks that set no `retries` or `timeout` of their own, `result_backend` (where
 results are mirrored; see "Results after a restart"), `cancel_grace`, `queues`, `queue_options` and `router` (see "Queues" below), `memory_soft_limit` and
 `memory_hard_limit` (bytes), `version_block_ttl` (how long a task left for another worker waits before
-it fails with `MigrationError`, one hour by default; see "Schemas and migrations"), and the networked settings `listen`, `seeds`, `external_address`,
-`authority`, `shard`, `heartbeat_interval`, `heartbeat_timeout` and `reconnect_timeout` (see
-"Networked workers"). In the environment a duration is a number of seconds, and `seeds`, `imports`
+it fails with `MigrationError`, one hour by default; see "Schemas and migrations"), `drain_grace` and
+`drain_wait_limit` (see "Shutdown"), `health_listen` (see "Health"), and the networked settings `listen`,
+`seeds`, `external_address`, `authority`, `shard`, `replication_factor`, `seed_rounds`, `routing_refresh`,
+`heartbeat_interval`, `heartbeat_timeout`, `roll_call_deadline` and `reconnect_timeout` (see
+"Networked workers"). `memory_soft_limit` and `memory_hard_limit` default to a quarter and a half of the
+memory this process may use (see "Coalescing and backpressure"). In the environment a duration is a number of seconds, and `seeds`, `imports`
 and `queues` are comma-separated lists. `KABUDACHI_RESULT_BACKEND` can give a backend URL, and
 `KABUDACHI_TIMEOUT` is seconds (empty is none); an object `result_backend` can only be configured in code.
 
 `result_ttl` is the process's retention. A task keeps its result for its own `result_ttl`, else its
-queue's (`QueueOptions.result_ttl`), else the process's; a task or queue that sets nothing (`UNSET`)
+queue's (`QueueOptions.result_ttl`), else the process's; a task or queue that leaves it out
 inherits, and one that sets `None` keeps no result: nothing is mirrored to the result backend, and its
 record stays in the shard only the minute the shard needs. The shard keeps a finished record at least a
 minute whatever the value. Every worker of a shard should give the same `result_ttl`, as the leader's
@@ -686,6 +808,22 @@ A task that fails is logged at WARNING by the type of its error only, never its 
 full traceback and message are logged, which can include task input, so leave DEBUG off where that
 matters.
 
+A failed run's message (not its traceback) is also stored in the task's record, cut to 1 KiB and to the
+room the record has left, with the error's type cut to 128 bytes. Every holder of the record can read
+it, so keep secrets out of exception messages. A failure message mirrored to a result backend is cut to
+a quarter of its page.
+
+Inside a task body, `kabudachi.current_context()` gives the `RunInfo` of the run, or `None` outside
+one: `task_id`, `run_id`, `task_name`, `attempt` (1 for the first run), `shard` (`local` for a shard of
+one), `worker_id`, and `trace_id` and `span_id`, which are empty because no trace is recorded yet. To
+put them on log records, add `kabudachi.logging.ContextFilter()` to a handler; each becomes an
+attribute for a formatter (`%(task_id)s`), an empty string outside a body and `0` for `attempt`.
+
+The native core logs through Python's `logging` under `kabudachi.native.<crate>.<module>`; set the
+level of `kabudachi.native` to see it. The native side never waits for Python: it queues up to 4,096
+records, drops the rest and logs how many it dropped, and stops forwarding when the interpreter exits.
+A backend failure is logged on `kabudachi.result_backend` (see "Results after a restart").
+
 ## Limits
 
 - A worker running a shard of one keeps everything in memory, lost when it ends.
@@ -697,3 +835,10 @@ matters.
   full, or memory is past its limit) is not queued to try again: it fails, and so does the flow if
   its policy fails on a failed member. The failure is a `BackpressureError`, which can pass once the
   shard has room.
+- A networked client reading a task's record, which `status()` does, waits out a five-second lookup
+  timeout when a shard peer is connected but not answering.
+- A group or map whose submitter dies keeps running until cancelled (see "Large groups and maps").
+- A worker that is killed after a run is certified but before its result is mirrored leaves that run
+  `pending` in the result backend (see "Results after a restart").
+- Workers of a shard must give the same `queue_options`, `result_ttl` and memory limits; nothing checks
+  that they do.
