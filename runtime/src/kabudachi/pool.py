@@ -287,11 +287,11 @@ class ProcessPool:
             self._serving = False
         deadline = time.monotonic() + _EXIT_GRACE_SECONDS
         while True:
-            processes = [
-                child.process
-                for child in (*self._children, *self._condemned)
-                if child.process.is_alive()
-            ]
+            # The loop's thread may still add or bury a child: each tuple() is
+            # one step under the interpreter lock, so what is iterated below
+            # cannot change size under this thread.
+            listed = (*tuple(self._children), *tuple(self._condemned))
+            processes = [child.process for child in listed if child.process.is_alive()]
             if not processes:
                 return
             for process in processes:

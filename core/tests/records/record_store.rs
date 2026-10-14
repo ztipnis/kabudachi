@@ -341,4 +341,17 @@ fn a_revision_that_changes_what_the_first_revision_fixed_is_refused_from_any_sen
     let mut filled = page(&id, 0, 0, 2);
     filled.finished = true;
     assert_eq!(composites.put(filled, NOW), Ok(Put::Stored), "a page is not fixed by its first revision");
+
+    // A first revision without a description fixed that too.
+    let bare = CompositeId::new("c2");
+    let mut undescribed = composite_record(&bare, 0, 1);
+    undescribed.description = None;
+    composites.put(undescribed.clone(), NOW).unwrap();
+    assert_eq!(
+        composites.put(composite_record(&bare, 0, 2), NOW),
+        Err(PutRefusal::SubmissionChanged),
+        "a description added after a first revision without one"
+    );
+    undescribed.version = composite_record(&bare, 0, 2).version;
+    assert_eq!(composites.put(undescribed, NOW), Ok(Put::Stored), "a later revision still without one");
 }

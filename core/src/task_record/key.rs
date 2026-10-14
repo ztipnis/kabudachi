@@ -169,17 +169,16 @@ impl ShardRecord {
 
     /// A digest of what this record's first revision fixed for good: a Task
     /// record's task (its submission), a composite record's step
-    /// description. A page has none: its member outcomes fill in revision by
-    /// revision. Every holder compares digests made from records decoded by
-    /// the same protobuf schema, so every worker of a shard must run the same
-    /// version of it.
+    /// description, where a missing description is fixed as missing. A page
+    /// has none: its member outcomes fill in revision by revision. Every
+    /// holder compares digests made from records decoded by the same protobuf
+    /// schema, so every worker of a shard must run the same version of it.
     pub fn submission_digest(&self) -> Option<Digest> {
         match self {
             ShardRecord::Task(record) => record.task.as_ref().map(|task| Digest::blake3(&task.encode_to_vec())),
-            ShardRecord::Composite(record) => record
-                .description
-                .as_ref()
-                .map(|description| Digest::blake3(&description.encode_to_vec())),
+            ShardRecord::Composite(record) => Some(Digest::blake3(
+                &record.description.as_ref().map(|description| description.encode_to_vec()).unwrap_or_default(),
+            )),
             ShardRecord::Page(_) => None,
         }
     }
