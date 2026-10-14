@@ -84,6 +84,7 @@ class Worker:
             env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), **environment},
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             # Its own process group, so the test can kill its task processes with it.
             start_new_session=True,
@@ -91,8 +92,12 @@ class Worker:
         self.pid = self.process.pid
         self._lines: queue.Queue = queue.Queue()
         self.notices: list[dict] = []
+        # The lines it printed on standard error (its log), kept as they come.
+        self.errors: list[str] = []
+        self._errors_lock = threading.Lock()
         self._ids = itertools.count()
         threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._read_errors, daemon=True).start()
         if not wait_until_ready:
             self.id = self.address = self.shard = self.health = None
             self.certifies_locally = None
@@ -111,6 +116,21 @@ class Worker:
             if line.startswith("{"):
                 self._lines.put(json.loads(line))
         self._lines.put(None)
+
+    def _read_errors(self) -> None:
+        for line in self.process.stderr:
+            with self._errors_lock:
+                self.errors.append(line.rstrip("\n"))
+
+    def error_lines(self) -> list[str]:
+        with self._errors_lock:
+            return list(self.errors)
+
+    def wait_for(self, predicate, timeout: float = 20.0) -> dict:
+        """The first line the worker printed that `predicate` accepts, among
+        those already read and then as they come."""
+        found = next((line for line in self.notices if predicate(line)), None)
+        return found if found is not None else self._next(predicate, timeout)
 
     def _next(self, wanted, timeout: float) -> dict:
         deadline = time.monotonic() + timeout

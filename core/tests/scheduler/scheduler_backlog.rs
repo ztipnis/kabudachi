@@ -102,7 +102,7 @@ fn a_submission_its_record_cannot_hold_yet_waits_with_only_its_own_key() {
     assert_eq!(claimed, expected);
 
     let run = fixture.scheduler.runs_of(&first).pop().unwrap();
-    fixture.scheduler.report_started(&worker(), &run).unwrap();
+    fixture.scheduler.report_started(&worker(), &run, None).unwrap();
     fixture
         .scheduler
         .complete(&worker(), &run, Digest::blake3(b"done"), Completion::Final)

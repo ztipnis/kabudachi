@@ -164,7 +164,7 @@ async fn a_gpu_worker_takes_only_gpu_tasks_a_cpu_worker_takes_none_and_a_full_qu
 
         // One GPU run ends: the queue has room, and the GPU worker takes the third.
         let run = gpu_runs.remove(0);
-        executors[gpu].report(Report::Started(run.clone()));
+        executors[gpu].report(Report::Started { run: run.clone(), execution_version: None });
         executors[gpu].report(Report::Completed {
             run,
             digest: Digest::blake3(b"done"),

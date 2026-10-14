@@ -17,6 +17,9 @@ pub struct CaughtUp {
     pub expired: usize,
     /// Finished tasks forgotten because their result TTL had passed.
     pub forgotten: usize,
+    /// Blocked tasks that failed because they waited past the block TTL
+    /// (only while leading).
+    pub migration_failed: usize,
 }
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
@@ -51,6 +54,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.expire(&task_id, now);
             advanced.expired += 1;
         }
+        advanced.migration_failed = self.fail_blocked_past_ttl(now);
         for task_id in self.waiting.release_due(now) {
             let run_id = self.current_run[&task_id].clone();
             self.runs
@@ -92,7 +96,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         } else {
             None
         };
-        [waiting, forgetting, lease_end, replays]
+        let block_ttl = if self.is_leader() {
+            self.next_block_deadline()
+        } else {
+            None
+        };
+        [waiting, forgetting, lease_end, replays, block_ttl]
             .into_iter()
             .flatten()
             .min()

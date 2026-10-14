@@ -85,9 +85,10 @@ use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::TaskRunRecord;
 use crate::queues::{QueuePolicy, Subscription};
 use crate::task_record::{RecordKey, RecordVersion};
-use crate::time::{Clock, Instant};
+use crate::time::{Clock, Duration, Instant};
 
 mod backlog;
+mod blocked;
 mod cancel;
 mod claims;
 mod compaction;
@@ -112,6 +113,8 @@ mod submission;
 mod waiting_room;
 
 pub use backlog::Backlog;
+use blocked::BlockedTask;
+pub use blocked::{BlockRejection, Blocked, DEFAULT_VERSION_BLOCK_TTL};
 pub use cancel::{CancelRejection, Cancellation, HeldCancel};
 pub use claims::{Claim, ClaimRejection};
 use composite::Composites;
@@ -177,6 +180,9 @@ pub const COALESCED_PAYLOAD_TOO_LARGE: &str = "CoalescedPayloadTooLarge";
 /// record.
 pub const CONTINUATION_TOO_LARGE: &str = "ContinuationTooLarge";
 
+/// The failure kind of a task that cannot run at its input version.
+pub const MIGRATION_ERROR: &str = "MigrationError";
+
 /// A version for measuring a record's size, which does not depend on it.
 const UNVERSIONED: RecordVersion = RecordVersion {
     recovery_epoch: RecoveryEpoch::new(0, 0),
@@ -225,6 +231,14 @@ pub enum Event {
     /// A composite is over: its client, or the handle of the task it
     /// continues, is to be told.
     CompositeFinished(composite::CompositeFinished),
+    /// A task ended FAILED (`MigrationError`) because no worker could run its
+    /// input version: one reported it incompatible, or it waited past the
+    /// block TTL. `reason` is what the worker wrote.
+    MigrationFailed {
+        task_id: TaskId,
+        task_run_id: TaskRunId,
+        reason: String,
+    },
 }
 
 /// Owns all Tasks and TaskRuns and decides every claim and report. Drive it
@@ -299,6 +313,14 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     running: BTreeMap<String, BTreeSet<TaskRunId>>,
     /// The composites it drives, and keeps until their retention ends.
     composites: Composites,
+    /// Tasks some worker could not run at their input version and left for
+    /// another: since when, why, and (not stored; a successor starts it
+    /// empty) which workers this leader must not hand them to.
+    blocked: BTreeMap<TaskId, BlockedTask>,
+    /// Why each task that ended for want of a runnable input version did.
+    ended_reasons: BTreeMap<TaskId, String>,
+    /// How long a task may wait blocked before it fails.
+    version_block_ttl: Duration,
 }
 
 impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
@@ -346,6 +368,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             subscriptions: BTreeMap::new(),
             running: BTreeMap::new(),
             composites: Composites::default(),
+            blocked: BTreeMap::new(),
+            ended_reasons: BTreeMap::new(),
+            version_block_ttl: DEFAULT_VERSION_BLOCK_TTL,
         }
     }
 

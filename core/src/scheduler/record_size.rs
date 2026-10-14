@@ -90,6 +90,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             published_at: None,
             finished: false,
             retained_by_composite: false,
+            blocked_since: None,
+            blocked_reason: String::new(),
         };
         record.encoded_len() as u64
     }

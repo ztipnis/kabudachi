@@ -10,6 +10,8 @@ from kabudachi.composites import FlowHandle, GroupHandle
 from kabudachi.config import QueueOptions, configure
 from kabudachi.errors import (
     DurabilityUnavailableError,
+    MigrateRejectError,
+    MigrationError,
     PayloadTooLargeError,
     ReduceEmptyError,
     ResultTooLargeError,
@@ -23,6 +25,7 @@ from kabudachi.handle import TaskHandle
 from kabudachi.lifecycle import RunContext, after_run, before_run, process_init
 from kabudachi.run_info import RunInfo, current_context
 from kabudachi.runner import run
+from kabudachi.schemas import migration, schema
 from kabudachi.serializers import register_serializer
 from kabudachi.status import CompositeStatus, Durability, TaskStatus
 from kabudachi.tasks import coalescing_task, ephemeral_task, reducer, task
@@ -47,6 +50,9 @@ __all__ = [
     "group",
     "Group",
     "GroupHandle",
+    "MigrateRejectError",
+    "migration",
+    "MigrationError",
     "PayloadTooLargeError",
     "process_init",
     "QueueOptions",
@@ -58,6 +64,7 @@ __all__ = [
     "run",
     "RunContext",
     "RunInfo",
+    "schema",
     "task",
     "TaskFailure",
     "TaskHandle",

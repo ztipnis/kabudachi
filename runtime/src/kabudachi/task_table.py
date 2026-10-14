@@ -183,17 +183,19 @@ class TaskTable:
         payload: bytes,
         options: SubmissionOptions,
         settings: SubmissionSettings,
+        source_version: int,
     ) -> TaskHandle:
         """Refuses with `RunStoppedError` once stopping; otherwise submits to
         the native runtime and registers the handle under one lock, so a
-        worker that claims the task at once finds it."""
+        worker that claims the task at once finds it. `source_version` is the
+        version of the schema `payload` is at."""
         with self._lock:
             if self._stopping:
                 raise RunStoppedError("the run is stopping, so no more tasks are accepted")
             task_id = self._runtime.submit(
                 SubmitArguments(
                     definition.name,
-                    definition.version,
+                    source_version,
                     payload,
                     definition.kind.value,
                     # A coalescing task always has a key: the default is "".
@@ -307,6 +309,20 @@ class TaskTable:
             record.active = True
             record.generation += 1
             return Run(task_id, record, record.generation)
+
+    def released(self, run: Run) -> None:
+        """The claim was given back to the leader without running: the task
+        is queued again, not started, and its handle waits for whatever the
+        leader decides (another worker's run, or the end of the task).
+
+        A task the leader already ended is left as it is. Giving a claim back
+        reports it to the leader before this is called, and a dropped task's
+        event can settle the handle in that same call, so the task may be
+        settled by the time its run is released."""
+        with self._lock:
+            record = run._record
+            if not record.settled and run._generation == record.generation:
+                record.started = False
 
     def run_ended(self, run: Run) -> None:
         """The run ended, however it did. A stale run (a retry began after it)

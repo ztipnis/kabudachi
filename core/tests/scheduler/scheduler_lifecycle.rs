@@ -51,7 +51,7 @@ fn running_task(fixture: &mut Fixture) -> (TaskId, TaskRunId) {
         .unwrap();
     fixture
         .scheduler
-        .report_started(&worker("w1"), &claim.task_run_id)
+        .report_started(&worker("w1"), &claim.task_run_id, None)
         .unwrap();
     (task_id, claim.task_run_id)
 }
@@ -114,7 +114,7 @@ fn every_decision_needs_a_live_grant_and_changes_nothing_without_one() {
         ),
         (
             "start",
-            s.report_started(&worker("w1"), &claimed).err() == not_leader,
+            s.report_started(&worker("w1"), &claimed, None).err() == not_leader,
         ),
         (
             "complete",
@@ -182,7 +182,7 @@ fn only_the_claiming_worker_may_report_and_only_in_order() {
         .task_run_id;
     fixture
         .scheduler
-        .report_started(&worker("w3"), &lost)
+        .report_started(&worker("w3"), &lost, None)
         .unwrap();
     fixture.lose_silent(&worker("w3"));
     let other = Digest::blake3(b"different");
@@ -207,15 +207,15 @@ fn only_the_claiming_worker_may_report_and_only_in_order() {
         ),
         (
             "a start by a worker that did not claim the run",
-            s.report_started(&worker("w2"), &claimed).err(),
+            s.report_started(&worker("w2"), &claimed, None).err(),
         ),
         (
             "a start by a worker that did not claim the running run",
-            s.report_started(&worker("w2"), &running).err(),
+            s.report_started(&worker("w2"), &running, None).err(),
         ),
         (
             "a start after a completion",
-            s.report_started(&worker("w1"), &succeeded).err(),
+            s.report_started(&worker("w1"), &succeeded, None).err(),
         ),
         (
             "a completion of a run that never started",
@@ -255,7 +255,7 @@ fn only_the_claiming_worker_may_report_and_only_in_order() {
     // nothing.
     fixture
         .scheduler
-        .report_started(&worker("w1"), &running)
+        .report_started(&worker("w1"), &running, None)
         .unwrap();
     assert_eq!(fixture.run_state(&running), TaskRunState::Running);
     assert_eq!(fixture.run_state(&claimed), TaskRunState::Claimed);
@@ -355,7 +355,7 @@ fn a_run_records_when_it_was_claimed_and_started_and_why_it_failed_in_at_most_a_
 
     fixture
         .scheduler
-        .report_started(&worker("w1"), &claim.task_run_id)
+        .report_started(&worker("w1"), &claim.task_run_id, None)
         .unwrap();
     // Three-byte characters, so a cut at a fixed byte count would split one.
     let message = "\u{20ac}".repeat(1000);
@@ -411,7 +411,7 @@ fn failure_messages_never_push_a_record_past_its_limit() {
             .unwrap();
         fixture
             .scheduler
-            .report_started(&worker("w1"), &claim.task_run_id)
+            .report_started(&worker("w1"), &claim.task_run_id, None)
             .unwrap();
         let failure = fixture
             .scheduler

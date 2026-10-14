@@ -254,6 +254,26 @@ impl Occupancy {
         self.holders.insert(key.clone(), task.clone());
     }
 
+    /// `task`, claimed and given back before it ran, no longer holds `key`:
+    /// it is the key's waiting generation again, with everything it
+    /// absorbed. If a newer generation waits meanwhile, that one absorbs it
+    /// and its chain instead, in order, and is returned.
+    pub fn release(&mut self, key: &Key, task: &TaskId) -> Option<TaskId> {
+        if self.holders.get(key) != Some(task) {
+            return None;
+        }
+        self.holders.remove(key);
+        let Some(newer) = self.waiting.get(key).cloned() else {
+            self.waiting.insert(key.clone(), task.clone());
+            return None;
+        };
+        let mut chain = self.chains.remove(task).unwrap_or_default();
+        chain.push(ChainItem::Absorbed(task.clone()));
+        chain.extend(self.chains.remove(&newer).unwrap_or_default());
+        self.chains.insert(newer.clone(), chain);
+        Some(newer)
+    }
+
     /// `task` is over, however it ended: it frees `key`, and what it absorbed
     /// is no longer needed. Returns those entries, to be forgotten in their
     /// turn.

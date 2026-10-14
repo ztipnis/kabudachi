@@ -80,6 +80,7 @@ where
             runs_compaction: true,
             queues: config.queues.clone(),
             policy: config.queue_policy.clone(),
+            runnable: config.runnable.clone(),
         };
         let timings = node.timings();
         let retry_after = Duration::from_millis(timings.heartbeat_interval.as_ticks());

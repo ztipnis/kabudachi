@@ -29,8 +29,8 @@ pub use generated::{
     claim_request, claim_response, election_message,
 };
 pub use generated::{
-    CancelAnswer, CancelOutcome, CancelTask, CompactionApplied, PlaceRecords, PlacedKey,
-    PlacedWithAsker, RecordPlacements, ReportCompacted, ReportCompleted, ReportFailed, ReportLost,
+    BlockNoted, CancelAnswer, CancelOutcome, CancelTask, CompactionApplied, PlaceRecords, PlacedKey,
+    PlacedWithAsker, RecordPlacements, ReportBlocked, ReportCompacted, ReportCompleted, ReportFailed, ReportLost,
     ReportStarted, RunCertified, RunFailed, RunLost, StartAccepted, SubmitAccepted, SubmitTask, TaskReject,
     TaskRejectReason, TaskRequest, TaskResponse, task_request, task_response,
 };

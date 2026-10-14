@@ -8,12 +8,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kabudachi_core::protocol::ids::{TaskId, WorkerId};
-use kabudachi_core::protocol::messages::Claim;
+use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::protocol::messages::{Claim, ClaimResponse, claim_response};
 use kabudachi_core::protocol::messages::prelude::*;
+use kabudachi_core::queues::Subscription;
 use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::{RealClock, WallTime};
-use kabudachi_net::discovery::{Found, Stage};
+use kabudachi_core::versions::RunnableVersions;
+use kabudachi_net::discovery::{Found, Stage, Takes};
 use kabudachi_net::messenger::{Net, PlacedWrite};
 use kabudachi_net::task_store::placement::{ReplicationFactor, placement};
 use libp2p::PeerId;
@@ -288,6 +290,84 @@ async fn a_claim_the_workers_stale_record_suggested_is_refused_and_discovery_mov
         assert_eq!(found.stale, 1, "its record showed the task waiting; the leader said otherwise");
         assert!(found.claims.is_empty(), "{found:?}");
         assert_eq!(found.stopped, None);
+    })
+    .await
+}
+
+/// The tasks a batch of claims from the leader's oldest pending tasks holds.
+fn claims_in(response: &ClaimResponse) -> Vec<TaskId> {
+    match &response.result {
+        Some(claim_response::Result::Batch(batch)) => batch
+            .claims
+            .iter()
+            .map(|claim| claim.task.as_ref().expect("a claim carries its task").task_id())
+            .collect(),
+        other => panic!("expected a batch of claims, got {other:?}"),
+    }
+}
+
+/// A task whose input is newer than a worker runs is not claimed from its
+/// own records: the worker tells the leader, which records the block and
+/// never hands that worker the task, and another worker claims it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_skips_and_reports_a_task_newer_than_it_runs_and_another_claims_it() {
+    within_deadline(async {
+        let (mut shard, _client) = Voters::start_with(3, one_holder()).await;
+        let leader = shard.drive_until_a_leader().await;
+        let voters = placing_among_every_voter(&mut shard, leader).await;
+        let (nets, ids) = (shard.nets.clone(), ids(&shard));
+        // A follower must hold the record: its report crosses the network. (A
+        // leader-held record is reported in process, not by `discover`.)
+        let (name, holder) = (0..)
+            .find_map(|n| {
+                let name = format!("task-{n:06}");
+                let key = RecordKey::Task(TaskId::new(name.clone()));
+                let holder = placement(&key, &voters, one_holder())?.holders.remove(0);
+                (holder != ids[leader]).then_some((name, holder))
+            })
+            .expect("some task id lands on a follower");
+        let holder = ids.iter().position(|id| *id == holder).expect("a voter");
+        let other = (0..nets.len()).find(|voter| *voter != leader && *voter != holder).expect("three voters");
+        let runs_three = Takes {
+            runnable: RunnableVersions::default().with(TaskDefinitionId::new("demo.task"), 3),
+            ..takes(false)
+        };
+
+        let (found, record, oldest, elsewhere) = shard
+            .drive_until(async {
+                let mut submission = plain_with(b"input");
+                submission.source_version = 5;
+                let task = submitted_with(&nets[holder], &ids[leader], (name.as_str(), now()), submission).await;
+                wait_until_held(nets[holder].clone(), vec![task.clone()]).await;
+
+                let found = nets[holder].discover(ids[leader].clone(), 4, now(), &runs_three, None).await;
+                let record = loop {
+                    match nets[holder].held_records().get(&task) {
+                        Some(record) if record.blocked_since.is_some() => break record,
+                        _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                    }
+                };
+                let oldest = nets[holder]
+                    .claim_oldest(ids[leader].clone(), 4, &Subscription::Every, None)
+                    .await
+                    .expect("the leader answers");
+                let elsewhere = nets[other].discover(ids[leader].clone(), 4, now(), &takes(false), None).await;
+                (found, record, oldest, elsewhere)
+            })
+            .await;
+        let task = TaskId::new(name);
+
+        assert!(!tasks_of(&found).contains(&task), "the holder does not claim a record it cannot run: {found:?}");
+        assert!(
+            record.blocked_reason.contains("newer than this worker's 3"),
+            "the leader kept the worker's reason: {}",
+            record.blocked_reason
+        );
+        assert!(
+            !claims_in(&oldest).contains(&task),
+            "the leader does not hand the holder the task it blocked"
+        );
+        assert!(tasks_of(&elsewhere).contains(&task), "a worker that runs version 5 claims it: {elsewhere:?}");
     })
     .await
 }

@@ -47,7 +47,7 @@ async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certi
             .drive_until(submitted_through(&nets[runner], &leader_id, plain_with(b"handed over")))
             .await;
         let (run, _) = shard.drive_until(executors[runner].next_claim()).await;
-        executors[runner].report(Report::Started(run.clone()));
+        executors[runner].report(Report::Started { run: run.clone(), execution_version: None });
         shard
             .drive_until(poll_until("the old leader stored the run running", || {
                 holding(&nets, &task, &[TaskRunState::Running]) >= QUORUM

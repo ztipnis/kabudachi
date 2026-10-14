@@ -64,6 +64,7 @@ fn a_report_with_a_succeeded_run_but_no_usable_result_digest_is_refused() {
                 delivered: false,
             },
             continuation: None,
+            execution_version: None,
         }],
         keys: vec![],
         last: true,
@@ -93,6 +94,7 @@ fn a_report_with_a_run_that_has_no_claim_is_refused() {
             claim: claim("r1"),
             state: ReportedState::Running,
             continuation: None,
+            execution_version: None,
         }],
         keys: vec![],
         last: true,
@@ -104,7 +106,7 @@ fn a_report_with_a_run_that_has_no_claim_is_refused() {
 }
 
 #[test]
-fn composite_keys_and_a_run_that_returned_a_step_cross_the_wire_whole() {
+fn composite_keys_and_a_run_that_returned_a_step_and_migrated_its_input_cross_the_wire_whole() {
     let id = CompositeId::new("c1");
     let sent = ReportPage {
         runs: vec![ReportedRun {
@@ -114,6 +116,7 @@ fn composite_keys_and_a_run_that_returned_a_step_cross_the_wire_whole() {
                 delivered: false,
             },
             continuation: Some(one_stage_flow()),
+            execution_version: Some(2),
         }],
         keys: vec![
             held(RecordKey::Task(TaskId::new("t1")), 4),
@@ -152,6 +155,7 @@ fn a_continuation_that_is_not_a_drivable_step_is_refused() {
                 delivered: false,
             },
             continuation: Some(one_stage_flow()),
+            execution_version: None,
         }],
         last: true,
         ..ReportPage::default()
@@ -172,6 +176,7 @@ fn a_continuation_whose_first_stage_waits_for_an_input_is_refused() {
                 delivered: false,
             },
             continuation: Some(flow_of(vec![task_stage("shout", None)])),
+            execution_version: None,
         }],
         last: true,
         ..ReportPage::default()

@@ -37,7 +37,7 @@ fn start_attempt(fixture: &mut Fixture, task_id: &TaskId) -> TaskRunId {
     let claim = fixture.scheduler.request_claim(&worker(), task_id).unwrap();
     fixture
         .scheduler
-        .report_started(&worker(), &claim.task_run_id)
+        .report_started(&worker(), &claim.task_run_id, None)
         .unwrap();
     claim.task_run_id
 }

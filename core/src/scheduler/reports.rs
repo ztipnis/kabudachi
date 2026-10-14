@@ -56,22 +56,29 @@ pub enum ReportRejection {
 }
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
-    /// The worker that claimed `run_id` reports that it began executing. The
-    /// same report again, while the run still runs, is taken and changes
-    /// nothing.
+    /// The worker that claimed `run_id` reports that it began executing, at
+    /// `execution_version` of its input if it migrated it (`None` leaves the
+    /// run's own). The same report again, while the run still runs, is taken
+    /// and changes nothing.
     pub fn report_started(
         &mut self,
         worker: &WorkerId,
         run_id: &TaskRunId,
+        execution_version: Option<u32>,
     ) -> Result<(), ReportRejection> {
-        let outcome = self.start_run(worker, run_id);
+        let outcome = self.start_run(worker, run_id, execution_version);
         self.end_call();
         outcome
     }
 
-    fn start_run(&mut self, worker: &WorkerId, run_id: &TaskRunId) -> Result<(), ReportRejection> {
+    fn start_run(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+        execution_version: Option<u32>,
+    ) -> Result<(), ReportRejection> {
         self.require_leader()?;
-        self.start_owned(worker, run_id)
+        self.start_owned(worker, run_id, execution_version)
     }
 
     /// Starts `worker`'s claimed run. A start repeated by the worker of a run
@@ -82,6 +89,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         &mut self,
         worker: &WorkerId,
         run_id: &TaskRunId,
+        execution_version: Option<u32>,
     ) -> Result<(), ReportRejection> {
         let already_running = self.runs.get(run_id).is_some_and(|run| {
             run.current_state() == TaskRunState::Running
@@ -95,6 +103,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run.transition_to(TaskRunState::Running, stamped_at)
             .expect("a Claimed run can always start");
         run.started_at = Some(stamped_at.into());
+        if let Some(version) = execution_version {
+            run.execution_version = version;
+        }
+        let task_id = run.task_id();
+        // A task some worker could run is no longer waiting on one.
+        self.blocked.remove(&task_id);
         self.mark_decided(run_id);
         Ok(())
     }

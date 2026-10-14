@@ -84,6 +84,7 @@ fn running(task: &str, run: &str) -> ReportedRun {
         },
         state: ReportedState::Running,
         continuation: None,
+        execution_version: None,
     }
 }
 

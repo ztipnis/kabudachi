@@ -124,6 +124,27 @@ impl Shared {
         let _ = self.reports.report(report);
     }
 
+    /// Hands the driver a report that this worker cannot run `task` at its
+    /// input version. The run Python held for it, if any, is over: it ends
+    /// here and gives back the room its input held.
+    pub(super) fn report_blocked(&self, task: TaskId, reason: String, incompatible: bool) {
+        let freed = {
+            let mut seam = self.seam();
+            // The leader has one current run of a task, and this worker holds
+            // at most that one, so the first match is the only one.
+            let run = seam
+                .held
+                .iter()
+                .find_map(|(run, held)| (held.task == task).then(|| run.clone()));
+            run.and_then(|run| {
+                seam.held.remove(&run);
+                seam.inputs_in_flight.remove(&run)
+            })
+        };
+        drop(freed);
+        let _ = self.reports.report(Report::Blocked { task, reason, incompatible });
+    }
+
     /// Counts `taken`, the payloads a member run `run` read as its input, in
     /// flight until the run ends. A run that ended meanwhile counts nothing.
     pub(super) fn hold_inputs(&self, run: &TaskRunId, taken: Vec<Taken>) {

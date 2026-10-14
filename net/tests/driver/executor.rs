@@ -141,7 +141,7 @@ async fn a_leader_that_loses_its_quorum_mid_run_aborts_each_run_by_its_own_deadl
         let mut runs = BTreeMap::new();
         for _ in 0..2 {
             let (run, claim) = shard.drive_until(executors[leader].next_claim()).await;
-            executors[leader].report(Report::Started(run.clone()));
+            executors[leader].report(Report::Started { run: run.clone(), execution_version: None });
             let claimed = claim
                 .task
                 .as_ref()
@@ -239,7 +239,7 @@ async fn a_follower_that_regains_its_leader_before_the_abort_deadline_keeps_its_
             ))
             .await;
         let (run, _) = shard.drive_until(executor.next_claim()).await;
-        executor.report(Report::Started(run.clone()));
+        executor.report(Report::Started { run: run.clone(), execution_version: None });
         shard
             .drive_until(poll_until("a majority stored the run running", || {
                 holding(&nets, &task, &[TaskRunState::Running]) >= 2

@@ -12,6 +12,7 @@ pub mod reconcile;
 pub mod scheduler;
 pub mod task_record;
 pub mod time;
+pub mod versions;
 
 pub fn version() -> &'static str {
     "0.1.0"

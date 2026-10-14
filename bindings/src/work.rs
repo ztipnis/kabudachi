@@ -351,6 +351,16 @@ impl From<Event> for PyEvent {
                 task_run_id: task_run_id.as_str().to_owned(),
                 ..nothing
             },
+            Event::MigrationFailed {
+                task_id,
+                task_run_id,
+                reason,
+            } => PyEvent {
+                task_id: task_id.as_str().to_owned(),
+                task_run_id: task_run_id.as_str().to_owned(),
+                reason: Some(reason),
+                ..nothing
+            },
             Event::Superseded {
                 task_id,
                 task_run_id,
@@ -397,6 +407,16 @@ pub struct PyTaskRecord {
     /// start with a fold a compaction run made.
     #[pyo3(get)]
     folded: bool,
+    /// Why a worker could not run the task's input version, as the worker
+    /// wrote it; empty if none reported it. It stays on a task that ended for
+    /// that reason.
+    #[pyo3(get)]
+    blocked_reason: String,
+    /// When the first such report came, in milliseconds since the Unix epoch
+    /// by the leader's wall clock; `None` while none has, or once a worker
+    /// started the task.
+    #[pyo3(get)]
+    blocked_since_ms: Option<u64>,
 }
 
 /// One run in a Task record.
@@ -438,6 +458,13 @@ pub struct PyRunRecord {
     /// was reported completed.
     #[pyo3(get)]
     delivered: bool,
+    /// The version of the task's input the run was submitted with.
+    #[pyo3(get)]
+    source_version: u32,
+    /// The version of the input the run executed at, as its worker reported
+    /// it when the run started.
+    #[pyo3(get)]
+    execution_version: u32,
 }
 
 #[pymethods]
@@ -468,6 +495,8 @@ impl From<TaskRecord> for PyTaskRecord {
                 .retained_chain
                 .iter()
                 .any(|entry| matches!(entry.entry, Some(chain_entry::Entry::Folded(_)))),
+            blocked_reason: record.blocked_reason.clone(),
+            blocked_since_ms: record.blocked_since.as_ref().map(|time| time.unix_millis),
         }
     }
 }
@@ -504,6 +533,8 @@ impl PyRunRecord {
             created_at_ms: run.created_at.as_ref().map_or(0, |time| time.unix_millis),
             updated_at_ms: run.updated_at.as_ref().map_or(0, |time| time.unix_millis),
             delivered: run.delivered,
+            source_version: run.source_version,
+            execution_version: run.execution_version,
         })
     }
 }

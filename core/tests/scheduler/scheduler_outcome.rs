@@ -35,7 +35,7 @@ fn running(fixture: &mut Fixture, task: &TaskId) -> TaskRunId {
     let claim = fixture.scheduler.request_claim(&runner(), task).unwrap();
     fixture
         .scheduler
-        .report_started(&runner(), &claim.task_run_id)
+        .report_started(&runner(), &claim.task_run_id, None)
         .unwrap();
     claim.task_run_id
 }

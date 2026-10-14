@@ -101,7 +101,7 @@ class WaitDone:
 
 @dataclass(frozen=True)
 class Ready:
-    """The tasks (name to version) and serializers this process found, or
+    """The tasks (name to the version of its input) and serializers this process found, or
     why it could not import its modules."""
 
     definitions: dict[str, int]

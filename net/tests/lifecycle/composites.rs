@@ -291,7 +291,7 @@ async fn a_run_that_returns_a_step_is_certified_with_it_and_its_task_ends_only_w
         executors[follower].grant(1);
         let task = shard.drive_until(submitted_through(&client, &leader_id, plain_with(b"in"))).await;
         let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
-        executors[follower].report(Report::Started(run.clone()));
+        executors[follower].report(Report::Started { run: run.clone(), execution_version: None });
         let step = flow_of_bound(&["after"]);
         executors[follower].report(Report::Completed {
             run: run.clone(),

@@ -73,6 +73,9 @@ pub struct ReportedRun {
     /// The step a succeeded run returned, which the leader that certifies
     /// the run commits with it.
     pub continuation: Option<Step>,
+    /// The version of its input the run executes, if it migrated the input
+    /// from the version it was submitted at; `None` for a run that did not.
+    pub execution_version: Option<u32>,
 }
 
 /// The coalescing key a task belongs to: the generations of one key replace

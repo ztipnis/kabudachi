@@ -49,7 +49,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             .await;
         let (run, _) = shard.drive_until(executors[leader].next_claim()).await;
         assert!(holding(&nets, &own, &[TaskRunState::Claimed]) >= QUORUM);
-        executors[leader].report(Report::Started(run.clone()));
+        executors[leader].report(Report::Started { run: run.clone(), execution_version: None });
         executors[leader].report(Report::Completed {
             run: run.clone(),
             digest: Digest::blake3(RESULT),
@@ -72,7 +72,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             .drive_until(submitted_through(&leader_net, &leader_id, plain_with(b"cancelled")))
             .await;
         let (run, _) = shard.drive_until(executors[leader].next_claim()).await;
-        executors[leader].report(Report::Started(run.clone()));
+        executors[leader].report(Report::Started { run: run.clone(), execution_version: None });
         shard
             .drive_until(poll_until("the leader stored its run running", || {
                 holding(&nets, &cancelled, &[TaskRunState::Running]) >= QUORUM
@@ -92,7 +92,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             .drive_until(submitted_through(&client, &leader_id, plain_with(b"remote")))
             .await;
         let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
-        executors[follower].report(Report::Started(run.clone()));
+        executors[follower].report(Report::Started { run: run.clone(), execution_version: None });
         shard
             .drive_until(poll_until("the leader stored the follower's run running", || {
                 holding(&nets, &remote, &[TaskRunState::Running]) >= QUORUM
@@ -119,7 +119,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             .drive_until(submitted_through(&client, &leader_id, plain_with(b"lost")))
             .await;
         let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
-        executors[follower].report(Report::Started(run.clone()));
+        executors[follower].report(Report::Started { run: run.clone(), execution_version: None });
         executors[follower].report(Report::Lost(run));
         shard
             .drive_until(poll_until("the leader decided the lost run and queued its replay", || {
@@ -132,7 +132,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
         // lost and replayed again.
         executors[follower].grant(1);
         let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
-        executors[follower].report(Report::Started(run));
+        executors[follower].report(Report::Started { run, execution_version: None });
         drop(executors.remove(follower));
         shard
             .drive_until(poll_until("the leader replays the run its executor abandoned", || {
@@ -146,7 +146,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
         let own_executor = if follower < leader { leader - 1 } else { leader };
         executors[own_executor].grant(1);
         let (run, _) = shard.drive_until(executors[own_executor].next_claim()).await;
-        executors[own_executor].report(Report::Started(run.clone()));
+        executors[own_executor].report(Report::Started { run: run.clone(), execution_version: None });
         executors[own_executor].stop_taking_work();
         shard
             .drive_until(poll_until("the leader replays the run its executor no longer reads", || {
@@ -197,6 +197,75 @@ async fn a_run_that_fails_before_its_body_starts_ends_failed_at_the_leader() {
         shard
             .drive_until(poll_until("the leader recorded the failure", || {
                 holding(&nets, &task, &[TaskRunState::Failed]) >= QUORUM
+                    && follower_net.claimed_runs().get(&run).is_none()
+            }))
+            .await;
+    })
+    .await
+}
+
+/// A follower's executor reports the execution version a run started at, and
+/// the leader's record keeps it. A follower whose executor cannot run a task it
+/// claimed reports it blocked, twice before the first answer arrives: the
+/// leader records the block and puts the run back in the queue, the follower
+/// stops counting the run as its own, and it survives the repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_followers_execution_version_and_block_reach_the_leaders_record() {
+    within_deadline(async {
+        let (mut shard, client) = ThreeVoters::start().await;
+        let mut executors: Vec<FakeExecutor> = (0..3)
+            .map(|voter| {
+                let (executor, endpoint) = FakeExecutor::new();
+                shard.set_executor(voter, endpoint);
+                executor
+            })
+            .collect();
+        let leader = shard.drive_until_a_leader().await;
+        let leader_id = shard.id(leader);
+        shard.join_as_pending(&client, leader).await;
+        let follower = shard.others(leader)[0];
+        let nets = shard.nets.clone();
+        let follower_net = nets[follower].clone();
+
+        executors[follower].grant(1);
+        let started = shard
+            .drive_until(submitted_through(&client, &leader_id, plain_with(b"versioned")))
+            .await;
+        let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
+        executors[follower].report(Report::Started { run, execution_version: Some(7) });
+        shard
+            .drive_until(poll_until("a quorum stored the run's execution version", || {
+                nets.iter()
+                    .filter_map(|net| net.held_records().get(&started))
+                    .filter(|record| record.runs.first().is_some_and(|run| run.execution_version == 7))
+                    .count()
+                    >= QUORUM
+            }))
+            .await;
+
+        executors[follower].grant(1);
+        let blocked = shard
+            .drive_until(submitted_through(&client, &leader_id, plain_with(b"too new")))
+            .await;
+        let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
+        let block = Report::Blocked {
+            task: blocked.clone(),
+            reason: "input is newer than this worker's 3".into(),
+            incompatible: false,
+        };
+        executors[follower].report(block.clone());
+        executors[follower].report(block);
+        shard
+            .drive_until(poll_until("a quorum stored the block and the run back in the queue", || {
+                nets.iter()
+                    .filter_map(|net| net.held_records().get(&blocked))
+                    .filter(|record| {
+                        record.blocked_since.is_some()
+                            && record.blocked_reason.contains("newer than this worker's 3")
+                            && record.runs.last().is_some_and(|run| run.state == TaskRunState::Queued as i32)
+                    })
+                    .count()
+                    >= QUORUM
                     && follower_net.claimed_runs().get(&run).is_none()
             }))
             .await;
@@ -259,7 +328,7 @@ async fn members_report_their_free_places_and_a_runs_trace_context_and_failure_m
             (task.trace_parent, task.trace_state, task.baggage),
             (trace.trace_parent, trace.trace_state, trace.baggage)
         );
-        executors[follower].report(Report::Started(run.clone()));
+        executors[follower].report(Report::Started { run: run.clone(), execution_version: None });
         executors[follower].report(Report::Failed {
             run,
             reason: "ValueError".into(),

@@ -287,12 +287,12 @@ fn a_run_of_an_uncertain_task_is_asked_again_while_an_unknown_run_is_refused() {
     new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
 
     assert_eq!(
-        new.scheduler.report_started(&worker("w1"), &run),
+        new.scheduler.report_started(&worker("w1"), &run, None),
         Err(ReportRejection::NotReady)
     );
     let stranger = kabudachi_core::protocol::ids::TaskRunId::new("never-heard-of");
     assert_eq!(
-        new.scheduler.report_started(&worker("w1"), &stranger),
+        new.scheduler.report_started(&worker("w1"), &stranger, None),
         Err(ReportRejection::UnknownRun)
     );
 }
@@ -348,6 +348,7 @@ fn reported(claim: &Claim, state: ReportedState) -> ReportedRun {
         },
         state,
         continuation: None,
+        execution_version: None,
     }
 }
 
@@ -376,7 +377,7 @@ fn a_late_record_names_its_holder_unless_that_worker_answered() {
         .request_claim(&worker("w4"), &answered)
         .unwrap();
     old.scheduler
-        .report_started(&worker("w4"), &answered_claim.task_run_id)
+        .report_started(&worker("w4"), &answered_claim.task_run_id, None)
         .unwrap();
     old.scheduler.request_claim(&worker("w5"), &empty).unwrap();
     let records = newest_records(&old);
@@ -428,7 +429,7 @@ fn a_run_its_worker_still_holds_is_adopted_and_one_it_answered_without_is_lost_a
     let dropped = old.scheduler.submit(plain(b"dropped")).unwrap();
     let kept_claim = old.scheduler.request_claim(&worker("w1"), &kept).unwrap();
     old.scheduler
-        .report_started(&worker("w1"), &kept_claim.task_run_id)
+        .report_started(&worker("w1"), &kept_claim.task_run_id, None)
         .unwrap();
     old.scheduler
         .request_claim(&worker("w1"), &dropped)
@@ -464,7 +465,7 @@ fn a_running_non_retriable_run_its_worker_answered_without_is_orphaned_and_an_ep
     for task in [&risky, &fleeting] {
         let claim = old.scheduler.request_claim(&worker("w1"), task).unwrap();
         old.scheduler
-            .report_started(&worker("w1"), &claim.task_run_id)
+            .report_started(&worker("w1"), &claim.task_run_id, None)
             .unwrap();
     }
     let mut new = reconciling_after(&old);
@@ -487,7 +488,7 @@ fn a_reported_failure_is_applied_and_its_retry_queued() {
     let failed = old.scheduler.submit(plain(b"f").with_retries(1)).unwrap();
     let f = old.scheduler.request_claim(&worker("w1"), &failed).unwrap();
     old.scheduler
-        .report_started(&worker("w1"), &f.task_run_id)
+        .report_started(&worker("w1"), &f.task_run_id, None)
         .unwrap();
     let mut new = reconciling_after(&old);
 
@@ -825,7 +826,7 @@ fn rebuild_that_concludes() -> (Fixture, Rebuild, Vec<(TaskId, TaskRunState)>) {
         .unwrap();
     let claim = old.scheduler.request_claim(&worker("w1"), &awaited).unwrap();
     old.scheduler
-        .report_started(&worker("w1"), &claim.task_run_id)
+        .report_started(&worker("w1"), &claim.task_run_id, None)
         .unwrap();
     records.push(old.spy.revisions_of(&awaited).last().cloned().unwrap());
     let succeeded = ReportedState::Succeeded {
@@ -1106,7 +1107,7 @@ fn a_late_generation_of_a_key_leaves_what_the_running_generation_absorbed_intact
         .unwrap();
     let claim = old.scheduler.request_claim(&worker("w1"), &running).unwrap();
     old.scheduler
-        .report_started(&worker("w1"), &claim.task_run_id)
+        .report_started(&worker("w1"), &claim.task_run_id, None)
         .unwrap();
     let late = old
         .scheduler
@@ -1203,7 +1204,7 @@ fn a_claimed_compaction_still_holds_its_key_after_a_rebuild_and_its_fold_is_acce
     old.scheduler.set_compaction_runners(BTreeSet::from([runner.clone()]));
     let holder = old.scheduler.submit(generation(b"h")).unwrap();
     let held = old.scheduler.request_claim(&worker("w1"), &holder).unwrap();
-    old.scheduler.report_started(&worker("w1"), &held.task_run_id).unwrap();
+    old.scheduler.report_started(&worker("w1"), &held.task_run_id, None).unwrap();
     let mut newest = holder;
     for letter in b'a'..b'g' {
         newest = old.scheduler.submit(generation(&[letter; 80])).unwrap();
@@ -1318,7 +1319,7 @@ fn a_successor_learns_a_worker_still_holds_a_run_stored_cancelled_and_names_it_o
     let kept = old.scheduler.submit(plain(b"kept")).unwrap();
     let cancelled_claim = old.scheduler.request_claim(&worker("w1"), &cancelled).unwrap();
     old.scheduler
-        .report_started(&worker("w1"), &cancelled_claim.task_run_id)
+        .report_started(&worker("w1"), &cancelled_claim.task_run_id, None)
         .unwrap();
     let kept_claim = old.scheduler.request_claim(&worker("w1"), &kept).unwrap();
     // The old leader stored the cancel, and stepped down before its ack told
@@ -1373,7 +1374,7 @@ fn a_claim_whose_key_another_installed_generation_holds_is_not_rebuilt() {
     let held = old.scheduler.request_claim(&worker("w1"), &holder).unwrap();
     let holder_claimed = old.spy.revisions_of(&holder).last().cloned().unwrap();
     old.scheduler
-        .report_started(&worker("w1"), &held.task_run_id)
+        .report_started(&worker("w1"), &held.task_run_id, None)
         .unwrap();
     old.scheduler
         .complete(&worker("w1"), &held.task_run_id, Digest::blake3(b"out"), Completion::Final)
@@ -1457,7 +1458,7 @@ fn a_finished_generation_is_installed_though_the_record_of_the_one_it_absorbed_i
         .unwrap();
     let claim = old.scheduler.request_claim(&worker("w1"), &newer).unwrap();
     old.scheduler
-        .report_started(&worker("w1"), &claim.task_run_id)
+        .report_started(&worker("w1"), &claim.task_run_id, None)
         .unwrap();
     old.scheduler
         .complete(&worker("w1"), &claim.task_run_id, Digest::blake3(b"out"), Completion::Final)
@@ -1609,7 +1610,7 @@ fn a_run_lost_before_the_rebuild_still_does_not_count_against_retries() {
     new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
     let replay = new.scheduler.request_claim(&worker("w2"), &task).unwrap();
     new.scheduler
-        .report_started(&worker("w2"), &replay.task_run_id)
+        .report_started(&worker("w2"), &replay.task_run_id, None)
         .unwrap();
 
     let failure = new
@@ -1632,7 +1633,7 @@ fn a_generation_retried_before_the_rebuild_still_holds_its_key() {
         .unwrap();
     let claim = old.scheduler.request_claim(&worker("w1"), &retried).unwrap();
     old.scheduler
-        .report_started(&worker("w1"), &claim.task_run_id)
+        .report_started(&worker("w1"), &claim.task_run_id, None)
         .unwrap();
     old.scheduler
         .fail(&worker("w1"), &claim.task_run_id, "ValueError")

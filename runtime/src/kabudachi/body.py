@@ -18,6 +18,7 @@ from asgiref.sync import sync_to_async
 from kabudachi.errors import TaskBodyError, TaskFailure, UnknownTaskError, body_error, may_be_ctrl_c
 from kabudachi.lifecycle import RunHooks
 from kabudachi.registry import TaskDefinition, TaskRegistry
+from kabudachi.schemas import SchemaRegistry, process_schemas
 from kabudachi.serializers import Serializer, SerializerRegistry
 
 
@@ -31,10 +32,17 @@ class Given:
     was stored as blobs, `("reduce", operands, combines)` for a reduce step
     (the operands `reduce_operands` gives, and whether the step combines two
     results), or `None` when the claim's `serialized_input` is the whole
-    input."""
+    input.
+
+    A worker that migrated the member's input to its own version gives the
+    migrated bytes here, in `resolved` and, when `resolved` is `None`, as
+    `serialized_input`; `execution_version` is the version of the member's
+    input it runs at."""
 
     fields: tuple[tuple[str, Any], ...]
     resolved: Any
+    serialized_input: bytes | None = None
+    execution_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -200,17 +208,22 @@ def _contained(error: BaseException, hooks: RunHooks) -> TaskBodyError:
 
 
 def task_named(
-    registry: TaskRegistry, definition_id: str, source_version: int | None = None
+    registry: TaskRegistry,
+    definition_id: str,
+    source_version: int | None = None,
+    schemas: SchemaRegistry | None = None,
 ) -> TaskDefinition:
-    """The task registered as `definition_id`, at `source_version` if given.
-    Raises `UnknownTaskError` if this process has no such task, or has it at
-    another version."""
+    """The task registered as `definition_id`, with an input at version
+    `source_version` if given, by `schemas` (this process's by default).
+    Raises `UnknownTaskError` if this process has no such task, or has its
+    input at another version."""
     definition = registry.get(definition_id)
     if definition is None:
         raise UnknownTaskError(f"this process has no task named {definition_id!r}")
-    if source_version is not None and definition.version != source_version:
+    version = (process_schemas() if schemas is None else schemas).version_of(definition.input_type)
+    if source_version is not None and version != source_version:
         raise UnknownTaskError(
-            f"this process has task {definition_id!r} at version {definition.version}, "
+            f"this process has task {definition_id!r} with input version {version}, "
             f"not {source_version}"
         )
     return definition
@@ -265,7 +278,10 @@ def member_argument(
                 combines,
             )
         case None:
-            argument = serializer.decode(serialized_input, definition.input_type)
+            argument = serializer.decode(
+                serialized_input if given.serialized_input is None else given.serialized_input,
+                definition.input_type,
+            )
         case ("input", data):
             argument = serializer.decode(data, definition.input_type)
         case resolved:
@@ -303,12 +319,14 @@ def run_serialized(
     hooks: RunHooks,
     after: "asyncio.Future[None] | None" = None,
     given: "Given | asyncio.Future[Given] | None" = None,
+    schemas: SchemaRegistry | None = None,
 ) -> RunningBody:
     """Starts the task `definition_id` on its serialized input, folded onto
     the payloads of the generations it superseded (`chain`, oldest first),
     between the run hooks in `hooks`, once `after`, if given, is done. A
     member of a composite runs on what it is `given` instead, once that has
-    arrived. The
+    arrived. The input version is checked against `schemas`, this process's
+    by default. The
     outcome is the encoded result, or, for a task that returns a step, the
     step itself. Started in the caller's context, so the body sees the
     caller's context variables."""
@@ -319,12 +337,19 @@ def run_serialized(
         try:
             if after is not None:
                 await asyncio.wait({after})
-            definition = task_named(registry, definition_id, source_version)
+            arrived = None
+            if given is not None:
+                arrived = await given if isinstance(given, asyncio.Future) else given
+            # A member's input is migrated as it is read out, so its version is
+            # known only now.
+            version = source_version
+            if arrived is not None and arrived.execution_version is not None:
+                version = arrived.execution_version
+            definition = task_named(registry, definition_id, version, schemas)
             serializer = serializers.get(definition.serializer)
-            if given is None:
+            if arrived is None:
                 argument = fold_payloads(definition, serializer, [*chain, serialized_input])
             else:
-                arrived = await given if isinstance(given, asyncio.Future) else given
                 argument = member_argument(registry, serializers, definition, serialized_input, arrived)
             body = start_body(definition, argument, threads, hooks)
         except BaseException:

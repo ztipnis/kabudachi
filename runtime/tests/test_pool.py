@@ -32,6 +32,7 @@ from kabudachi.errors import (
 )
 from kabudachi.lifecycle import HookRegistry
 from kabudachi.native_protocol import OneNodeArguments
+from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.registry import TaskRegistry
 from kabudachi.serializers import process_serializers
@@ -215,6 +216,42 @@ def test_a_long_chain_is_compacted_in_a_task_process(markers):
     assert held == "held until folded", "a compaction folded while the key was busy"
     assert int((markers / "folded-in").read_text()) != os.getpid(), "the merge ran in a task process"
     assert newest == functools.reduce(lambda older, newer: f"({older}>{newer})", texts)
+
+
+def test_a_task_process_runs_on_the_input_the_session_migrated_to_the_tasks_version(markers):
+    kabudachi.configure(processes=1, concurrency=1)
+    configuration = config_module.process_configuration()
+    settings = configuration.settings()
+    registry = registry_module.default_registry()
+    hooks = lifecycle_module.default_hooks()
+    serializers = process_serializers()
+    older = serializers.get("pydantic").encode(pool_tasks.PooledV1(label="a", weight=3), pool_tasks.PooledV1)
+
+    async def main():
+        pool = ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
+        native = _native.NativeRuntime("worker", "incarnation", OneNodeArguments())
+        runtime = FaultingRuntime(native)
+        await pool.start()
+        session = Session(runtime, registry, serializers, configuration, executor=pool)
+        serving = asyncio.ensure_future(session.serve())
+        try:
+            async with asyncio.timeout(30):
+                await native.wait_until_leader()
+                # Submitted as a worker with the task's version 1 would have.
+                definition = pool_tasks.take_pooled.definition
+                return await session.tasks.submit(
+                    definition, older, SubmissionOptions(), SubmissionSettings("default"), 1
+                )
+        finally:
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)
+            await pool.stop(kill=True)
+            native.shutdown()
+
+    result = asyncio.run(main())
+
+    assert result.label == "A", "the body saw the input as version 2 reads it"
+    assert result.pid != os.getpid(), "and ran in a task process"
 
 
 def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_place_back_while_it_waits(

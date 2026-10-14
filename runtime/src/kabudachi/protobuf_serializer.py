@@ -9,6 +9,7 @@ import enum
 import typing
 from typing import Any
 
+from kabudachi import schemas
 from kabudachi.errors import SerializationError, SerializerUnavailableError
 
 try:
@@ -161,3 +162,40 @@ class ProtobufSerializer:
             items.append(_parse(message_type, payload[position:end]))
             position = end
         return items
+
+    def extract_version(self, payload: bytes, value_type: Any) -> int | None:
+        """Always `None`: a protobuf payload carries no version, so the task's
+        own source version is its version."""
+        return None
+
+    def validate(self, value: Any) -> None:
+        """Raises `SerializationError` if `value`, a message or a list of
+        messages, has a required field unset."""
+        for message in value if isinstance(value, list) else [value]:
+            if message is not None and not message.IsInitialized():
+                raise SerializationError(
+                    f"this {type(message).__name__} is missing required fields: "
+                    f"{', '.join(message.FindInitializationErrors())}"
+                )
+
+    def schema_family(self, value_type: Any) -> str | None:
+        """The family of `value_type`, or `None` for a type this does not support."""
+        return schemas.supported_family(self, value_type)
+
+    def type_compatibility(self, produced: Any, consumed: Any) -> bool | None:
+        """Whether a `produced` value fits where `consumed` is taken, judged
+        by family and version; `None` for a type this does not support."""
+        return schemas.compatibility(self, produced, consumed)
+
+    def load_plain(self, payload: bytes, value_type: Any) -> Any:
+        """What a migration takes: `payload` parsed as `value_type`. Fields
+        `value_type` lacks are kept as unknown fields."""
+        return self.decode(payload, value_type)
+
+    def dump_plain(self, plain: Any, value_type: Any) -> bytes:
+        """`plain`, conformed to `value_type` by dropping the fields it lacks
+        (the default migration), as bytes."""
+        for message in plain if isinstance(plain, list) else [plain]:
+            if message is not None:
+                message.DiscardUnknownFields()
+        return self.encode(plain, value_type)

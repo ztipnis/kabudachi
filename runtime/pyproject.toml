@@ -14,6 +14,9 @@ dependencies = [
 
 [project.optional-dependencies]
 protobuf = ["protobuf>=5.29"]
+pydantic = ["pydantic>=2.7,<3"]
+# Standard library only: the extra names the choice and installs nothing.
+dataclass = []
 
 [build-system]
 requires = ["uv_build>=0.8.3,<0.9.0"]
@@ -34,6 +37,7 @@ dev = [
     # aspect_rules_py cannot resolve; this range is pure Python.
     "hypothesis>=6.135,<6.150",
     "protobuf>=5.29",
+    "pydantic>=2.7,<3",
     "pytest>=9.1.1",
     "wrapt>=1.16",
 ]

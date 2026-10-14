@@ -3,12 +3,14 @@
 import pickle
 from typing import Any, Protocol
 
+from kabudachi.dataclass_serializer import DataclassSerializer
 from kabudachi.errors import (
     DuplicateSerializerError,
     SerializerUnavailableError,
     UnknownSerializerError,
 )
 from kabudachi.protobuf_serializer import ProtobufSerializer
+from kabudachi.pydantic_serializer import PydanticSerializer
 
 DEFAULT_SERIALIZER = "protobuf"
 
@@ -40,6 +42,41 @@ class Serializer(Protocol):
         """The `target_type` that `payload` encodes."""
         ...
 
+    # The members below are optional. A backend without them still works;
+    # `kabudachi.schemas` answers for it with the default named on each.
+
+    def extract_version(self, payload: bytes, value_type: Any) -> int | None:
+        """The schema version `payload` carries, or `None` if it carries none
+        (the default), in which case the task's source version is its version."""
+        ...
+
+    def validate(self, value: Any) -> None:
+        """Raises `SerializationError` if a decoded `value` is not valid. By
+        default every value is."""
+        ...
+
+    def schema_family(self, value_type: Any) -> str | None:
+        """The family `value_type` belongs to. By default the family declared
+        for it with `kabudachi.schema`, else its own name."""
+        ...
+
+    def type_compatibility(self, produced: Any, consumed: Any) -> bool | None:
+        """Whether a `produced` value can be given where `consumed` is taken,
+        or `None` if this backend cannot say (the default), which skips the
+        check."""
+        ...
+
+    def load_plain(self, payload: bytes, value_type: Any) -> Any:
+        """What a migration takes: `payload` in a plain form (for JSON, the
+        parsed object). A backend without this and `dump_plain` cannot migrate."""
+        ...
+
+    def dump_plain(self, plain: Any, value_type: Any) -> bytes:
+        """`plain`, which a migration returned, conformed to `value_type`
+        (dropping what `value_type` lacks, which is the default migration)
+        and encoded."""
+        ...
+
 
 class SerializerRegistry:
     """Serializer backends by name."""
@@ -52,6 +89,8 @@ class SerializerRegistry:
         """A registry holding the backends that ship with kabudachi."""
         registry = cls()
         registry.register(ProtobufSerializer())
+        registry.register(PydanticSerializer())
+        registry.register(DataclassSerializer())
         return registry
 
     def register(self, serializer: Serializer) -> None:

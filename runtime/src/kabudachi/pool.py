@@ -31,6 +31,7 @@ from kabudachi.handle import TaskHandle
 from kabudachi.lifecycle import HookRegistry
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskRegistry
+from kabudachi.schemas import process_schemas, runnable_versions
 
 _logger = logging.getLogger("kabudachi")
 
@@ -787,15 +788,18 @@ def _raisable(frame: ipc.Failed) -> BaseException:
 
 def _disagreements(registry: TaskRegistry, hooks: HookRegistry, ready: ipc.Ready) -> list[str]:
     """How what a task process found differs from this process's tasks and
-    hooks: a task missing there, at another version or without its
+    hooks: a task missing there, with its input at another version or without its
     serializer, and a hook missing there."""
     problems = []
+    ours = runnable_versions(registry, process_schemas())
     for definition in registry.definitions():
         version = ready.definitions.get(definition.name)
         if version is None:
             problems.append(f"{definition.name} is missing")
-        elif version != definition.version:
-            problems.append(f"{definition.name} is at version {version}, not {definition.version}")
+        elif version != ours[definition.name]:
+            problems.append(
+                f"{definition.name}'s input is at version {version}, not {ours[definition.name]}"
+            )
         elif definition.serializer not in ready.serializers:
             problems.append(
                 f"{definition.name}'s serializer {definition.serializer!r} is not registered"

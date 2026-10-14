@@ -189,7 +189,7 @@ def test_the_same_name_cannot_be_registered_twice():
 
 BAD_OPTIONS = (
     [("name", bad, "name") for bad in ["", "   ", 3, None]]
-    + [("version", bad, "version") for bad in [-1, 1.5, "1", True, None]]
+    + [("raise_on_failed_migration", bad, "raise_on_failed_migration") for bad in ["yes", 1, None]]
     + [("queue", bad, "queue") for bad in ["", 3, None]]
     + [("serializer", bad, "serializer") for bad in ["", "  ", 3, None]]
     + [("retries", bad, "retries") for bad in [-1, True, 1.5, "2", None]]
@@ -268,20 +268,20 @@ def test_a_failed_definition_registers_nothing():
 
 
 @pytest.mark.parametrize(
-    ("decorate", "name", "queue", "version"),
+    ("decorate", "name", "queue", "raising"),
     [
-        pytest.param(lambda: task(charge), f"{charge.__module__}.charge", UNSET, 0, id="bare"),
+        pytest.param(lambda: task(charge), f"{charge.__module__}.charge", UNSET, False, id="bare"),
         pytest.param(
-            lambda: task(name="billing.charge", queue="gpu", version=4)(charge),
+            lambda: task(name="billing.charge", queue="gpu", raise_on_failed_migration=True)(charge),
             "billing.charge",
             "gpu",
-            4,
+            True,
             id="with options",
         ),
     ],
 )
 def test_the_public_decorator_registers_in_the_default_registry(
-    monkeypatch, decorate, name, queue, version
+    monkeypatch, decorate, name, queue, raising
 ):
     monkeypatch.setattr(registry_module, "_default_registry", TaskRegistry())
 
@@ -291,7 +291,7 @@ def test_the_public_decorator_registers_in_the_default_registry(
     assert decorated.definition.name == name
     assert decorated.definition.name in registry_module.default_registry()
     assert decorated.definition.queue == queue
-    assert decorated.definition.version == version
+    assert decorated.definition.raise_on_failed_migration is raising
 
 
 def test_the_public_decorator_refuses_a_positional_name():
@@ -705,6 +705,9 @@ def test_an_unknown_setting_is_refused():
         ({"drain_grace": 5}, "drain_grace"),
         ({"drain_wait_limit": timedelta(0)}, "drain_wait_limit"),
         ({"drain_wait_limit": 5}, "drain_wait_limit"),
+        ({"version_block_ttl": timedelta(0)}, "version_block_ttl"),
+        ({"version_block_ttl": timedelta(seconds=-1)}, "version_block_ttl"),
+        ({"version_block_ttl": 5}, "version_block_ttl"),
         ({"processes": -1}, "processes"),
         ({"processes": True}, "processes"),
         # Above the cap without `concurrency_override`.
@@ -962,6 +965,7 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_ROUTING_REFRESH", "30")
     monkeypatch.setenv("KABUDACHI_DRAIN_GRACE", "4")
     monkeypatch.setenv("KABUDACHI_DRAIN_WAIT_LIMIT", "120")
+    monkeypatch.setenv("KABUDACHI_VERSION_BLOCK_TTL", "2.5")
     configuration = Configuration()
 
     names = (
@@ -983,6 +987,7 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         "routing_refresh",
         "drain_grace",
         "drain_wait_limit",
+        "version_block_ttl",
     )
     assert [configuration.resolve(name) for name in names] == [
         2,
@@ -1003,6 +1008,7 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         timedelta(seconds=30),
         timedelta(seconds=4),
         timedelta(seconds=120),
+        timedelta(seconds=2.5),
     ]
     assert authority_parts(configuration.resolve("authority")) == (
         "rediss://user:secret@cache.example:6380/",
@@ -1423,7 +1429,11 @@ def test_the_reducer_decorator_declares_a_reducer_with_its_options(fresh_registr
     tree = kabudachi.reducer(serializer="pickle", name="decorated.tree", associative=True)(_concat).definition
     retried = kabudachi.reducer(serializer="pickle", name="decorated.retried", retries=2)(_concat).definition
     orphaned = kabudachi.reducer(serializer="pickle", name="decorated.orphaned", retriable=False)(_concat).definition
+    kept = kabudachi.reducer(
+        serializer="pickle", name="decorated.kept", raise_on_failed_migration=True
+    )(_concat).definition
 
+    assert [found.raise_on_failed_migration for found in (bare, kept)] == [False, True]
     assert bare.name == f"{_latest.__module__}._latest"
     assert [
         (found.reducer.associative, found.reducer.tree) for found in (bare, tree)

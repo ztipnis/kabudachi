@@ -50,6 +50,19 @@ message SubmitTask {
 
 message ReportStarted {
   TaskRunId task_run_id = 1;
+  // The version the worker migrated the input to. 0 leaves the run's own,
+  // which is safe: a worker never runs at 0 a task submitted above 0 (that
+  // input is newer than it, so it blocks the task).
+  uint32 execution_version = 2;
+}
+
+// The worker cannot run this task's input at its version. A run the reporter
+// had claimed goes back to the queue; if `incompatible`, the task then ends
+// FAILED (MigrationError) and is not retried, else it waits for another worker.
+message ReportBlocked {
+  TaskId task_id = 1;
+  string reason = 2;
+  bool incompatible = 3;
 }
 
 // The run succeeded. Only the digest of its result travels. The result
@@ -115,6 +128,7 @@ message TaskRequest {
     SubmitComposite submit_composite = 10;
     SubmitMembers submit_members = 11;
     QuerySlowDown query_slow_down = 13;
+    ReportBlocked blocked = 12;
   }
 }
 
@@ -205,6 +219,8 @@ message CancelAnswer {
   bool was_running = 2;
 }
 
+message BlockNoted {}
+
 message CompactionApplied {
   // Whether the fold replaced the front of its key's chain: false when the
   // chain no longer started with the entries the run was given, and the
@@ -251,5 +267,6 @@ message TaskResponse {
     CompositeAccepted composite = 11;
     MembersAccepted members = 12;
     SlowDownState slow_down = 13;
+    BlockNoted blocked = 14;
   }
 }

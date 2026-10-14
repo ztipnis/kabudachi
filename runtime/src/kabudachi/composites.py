@@ -244,7 +244,8 @@ class Composites:
         definition = mapped.definition
         serializer = self._session.serializers.get(definition.serializer)
         settings = self._session.submission_settings(definition)
-        template = ("task", definition.name, definition.version, settings, None, [])
+        version = self._session.schemas.version_of(definition.input_type)
+        template = ("task", definition.name, version, settings, None, [])
         items = (serializer.encode(item, definition.input_type) for item in mapped.items)
         return ("map", mapped.on_error, [template], "streamed"), items
 

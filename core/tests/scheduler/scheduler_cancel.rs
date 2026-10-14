@@ -61,7 +61,7 @@ fn a_task_is_cancelled_in_whatever_state_its_run_is_in() {
         .task_run_id;
     fixture
         .scheduler
-        .report_started(&worker(), &running_run)
+        .report_started(&worker(), &running_run, None)
         .unwrap();
     let retrying = fixture.scheduler.submit(plain().with_retries(1)).unwrap();
     let failed_run = fixture
@@ -71,7 +71,7 @@ fn a_task_is_cancelled_in_whatever_state_its_run_is_in() {
         .task_run_id;
     fixture
         .scheduler
-        .report_started(&worker(), &failed_run)
+        .report_started(&worker(), &failed_run, None)
         .unwrap();
     fixture
         .scheduler
@@ -133,7 +133,7 @@ fn a_task_is_cancelled_in_whatever_state_its_run_is_in() {
     assert_eq!(
         fixture
             .scheduler
-            .report_started(&worker(), &claimed_run)
+            .report_started(&worker(), &claimed_run, None)
             .unwrap_err(),
         ReportRejection::NotAuthoritative
     );

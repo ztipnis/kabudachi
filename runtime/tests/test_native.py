@@ -302,6 +302,8 @@ async def _start_a_wait(native):
 # --- scheduling ----------------------------------------
 
 DIGEST = _native.result_digest(b"the-result")
+# The version of its input that `submit` gives the task it submits.
+SOURCE_VERSION = 3
 
 
 def arguments(
@@ -320,7 +322,7 @@ def arguments(
 
 
 def submit(native, payload=b"input-bytes", queue="default"):
-    return native.submit(arguments("billing.charge", 3, payload, "task", queue=queue))
+    return native.submit(arguments("billing.charge", SOURCE_VERSION, payload, "task", queue=queue))
 
 
 async def claim(native, limit=10):
@@ -353,11 +355,18 @@ def test_a_submitted_task_can_be_claimed(runtime):
     [only] = claims
     assert only.task_id == task_id
     assert only.definition_id == "billing.charge"
-    assert only.source_version == 3
+    assert only.source_version == SOURCE_VERSION
     assert only.serialized_input == b"input-bytes"
     assert only.queue == "default"
     assert only.task_run_id
     assert only.attempt_number == 1
+
+
+def test_a_block_time_to_live_of_zero_is_refused_by_both_runtimes():
+    with pytest.raises(ValueError, match="version_block_ttl_ms must be positive"):
+        new_runtime(version_block_ttl_ms=0)
+    with pytest.raises(ValueError, match="version_block_ttl_ms must be positive"):
+        networked_runtime(version_block_ttl_ms=0)
 
 
 def test_a_shard_of_one_claims_the_higher_priority_first_and_only_its_own_queues():

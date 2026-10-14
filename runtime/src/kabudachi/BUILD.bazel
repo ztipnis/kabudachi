@@ -12,6 +12,7 @@ py_library(
         "composites.py",
         "concurrency_places.py",
         "config.py",
+        "dataclass_serializer.py",
         "errors.py",
         "execution.py",
         "flow.py",
@@ -24,9 +25,11 @@ py_library(
         "options.py",
         "pool.py",
         "protobuf_serializer.py",
+        "pydantic_serializer.py",
         "registry.py",
         "run_info.py",
         "runner.py",
+        "schemas.py",
         "serializers.py",
         "session.py",
         "status.py",
@@ -44,6 +47,7 @@ py_library(
         "//bindings:_native",  # keep
         "@pypi//asgiref",  # keep
         "@pypi//protobuf",  # keep
+        "@pypi//pydantic",  # keep
         "@pypi//wrapt",  # keep
     ],
 )

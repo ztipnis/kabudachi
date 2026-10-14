@@ -156,7 +156,7 @@ impl Delivering {
             .drive_until(self.executors[self.runner].next_claim())
             .await;
         assert_eq!(claim.task.as_ref().and_then(|task| task.client()), Some(me));
-        self.report(Report::Started(run.clone()));
+        self.report(Report::Started { run: run.clone(), execution_version: None });
         (task, run)
     }
 

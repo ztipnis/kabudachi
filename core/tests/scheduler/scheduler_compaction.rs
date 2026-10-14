@@ -72,7 +72,7 @@ fn held_with(limits: Option<MemoryLimits>, runners: bool) -> Held {
         .unwrap();
     fixture
         .scheduler
-        .report_started(&holder_worker(), &claim.task_run_id)
+        .report_started(&holder_worker(), &claim.task_run_id, None)
         .unwrap();
     Held {
         fixture,
@@ -444,7 +444,7 @@ fn an_ordinary_completion_of_a_compaction_run_is_refused() {
     let mut held = held_key();
     held.submit_all(&payloads_of(0..6));
     let compaction = held.compaction_claim().unwrap();
-    held.fixture.scheduler.report_started(&runner(), &compaction.task_run_id).unwrap();
+    held.fixture.scheduler.report_started(&runner(), &compaction.task_run_id, None).unwrap();
 
     let refused = held.fixture.scheduler.complete(
         &runner(),

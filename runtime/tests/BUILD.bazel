@@ -90,6 +90,7 @@ py_test(
     deps = [
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
+        "@pypi//pydantic",
         "@pypi//pytest",  # keep
     ],
 )
@@ -104,6 +105,7 @@ py_test(
         "//runtime/tests:proto_messages",
         "//runtime/tests:session_world",
         "@pypi//hypothesis",  # keep
+        "@pypi//pydantic",
         "@pypi//pytest",  # keep
     ],
 )
@@ -129,6 +131,7 @@ py_test(
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
         "//runtime/tests:session_world",
+        "@pypi//pydantic",
         "@pypi//pytest",  # keep
     ],
 )
@@ -176,6 +179,7 @@ py_library(
     deps = [
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
+        "@pypi//pydantic",
     ],
 )
 
@@ -309,6 +313,39 @@ py_test(
         "@pypi//protobuf",  # keep
         "@pypi//wrapt",  # keep
         "@pypi//packaging",  # keep
+        "@pypi//pytest",  # keep
+    ],
+)
+
+# The tasks the migration test's submitter and worker declare at different
+# schema versions; `KABUDACHI_TEST_SCHEMA` picks the build.
+py_library(
+    name = "migration_tasks",
+    testonly = True,
+    srcs = ["migration_tasks.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//runtime/src/kabudachi",
+        "@pypi//pydantic",
+    ],
+)
+
+# A submitter at schema version 1 and a worker at version 3 in one shard of
+# two: migrates, drops an incompatible task, and fails a held one after a 3 s
+# block TTL. About 7 s on a laptop.
+py_test(
+    name = "test_networked_migration",
+    size = "medium",
+    timeout = "short",
+    srcs = ["test_networked_migration.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//bindings:_native",  # keep
+        "//runtime/tests:cluster",
+        # Imported by the workers' program by name (`KABUDACHI_TEST_TASKS`), not by the test.
+        "//runtime/tests:migration_tasks",  # keep
         "@pypi//pytest",  # keep
     ],
 )

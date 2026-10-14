@@ -14,7 +14,9 @@ from datetime import timedelta
 from pathlib import Path
 
 import kabudachi
+import pydantic
 from kabudachi.errors import TaskCancelledError, UnknownTaskError
+from kabudachi.schemas import schema
 from kabudachi.session import current_session
 from proto_messages import Greeting
 
@@ -386,3 +388,27 @@ async def context_async(request: Greeting) -> Greeting:
 @kabudachi.task(name="pool.context_sync")
 def context_sync(request: Greeting) -> Greeting:
     return _context_now()
+
+
+class PooledV1(pydantic.BaseModel):
+    label: str
+    weight: int = 0
+
+
+class PooledV2(pydantic.BaseModel):
+    label: str
+    pid: int = 0
+
+
+def shout(plain):
+    return {**plain, "label": plain["label"].upper()}
+
+
+schema(PooledV1, version=1, version_path="$.v", family="pool.pooled")
+schema(PooledV2, version=2, version_path="$.v", family="pool.pooled", migration=shout)
+
+
+@kabudachi.task(name="pool.take_pooled", serializer="pydantic")
+def take_pooled(pooled: PooledV2) -> PooledV2:
+    """Gives back its input, with the id of the process it ran in."""
+    return PooledV2(label=pooled.label, pid=os.getpid())

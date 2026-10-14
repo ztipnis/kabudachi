@@ -9,7 +9,7 @@ started with `spawn` and re-import your script, so put the call to `kabudachi.ru
 `if __name__ == "__main__":` whenever `processes` is above 0.
 
 Tasks take one input and return one result, both protobuf messages (the `protobuf` extra, see "Installing"),
-or other types if you register a serializer.
+pydantic models or dataclasses (see "Serializers"), or other types if you register a serializer.
 
 ## Example
 
@@ -57,10 +57,13 @@ bazel build //runtime:kabudachi_wheel
 WHEEL="$(bazel cquery --output=files //runtime:kabudachi_wheel)"
 pip install "$WHEEL"               # the runtime alone
 pip install "$WHEEL[protobuf]"     # with protobuf messages as task input and output
+pip install "$WHEEL[pydantic]"     # with pydantic models as task input and output
+pip install "$WHEEL[dataclass]"    # with dataclasses; needs nothing beyond the runtime
 ```
 
 The wheel holds the native extension, so nothing is compiled at install time. `pip install` pulls in
-`asgiref` and `wrapt`. The `protobuf` extra adds `protobuf`.
+`asgiref` and `wrapt`. The `protobuf` extra adds `protobuf` and the `pydantic` extra adds `pydantic`
+(2.7 or newer, below 3); the `dataclass` extra adds nothing.
 
 ## Running
 
@@ -181,7 +184,8 @@ Set `listen` and the worker joins a networked shard instead of running one of it
 | option | meaning |
 |---|---|
 | `name` | how workers find the task; defaults to its module and name, which then must be at package scope |
-| `version`, `queue`, `serializer` | the data format version, the queue, and the registered serializer name |
+| `queue`, `serializer` | the queue, and the registered serializer name |
+| `raise_on_failed_migration` | `True` to leave a task whose input this worker cannot migrate for another worker instead of dropping it (see "Schemas and migrations") |
 | `retries` | how many more times a run that raises or times out is tried again (not for `@ephemeral_task`) |
 | `retriable` | `False` for a `@task` that is not safe to run twice: a run that was running when its worker or task process was lost ends with `TaskOrphanedError` instead of being run again. Takes no `retries` |
 | `timeout`, `cancel_grace` | ask the body to stop after `timeout`; fail the run if it has not stopped `cancel_grace` later |
@@ -245,6 +249,10 @@ failure is a `TaskFailure` with its `kind` and `message`. A coalescing task cann
 
 A stage that consumes the array of a `collect_all` group receives failures in it, so it needs a
 serializer that can encode them; the protobuf serializer cannot.
+
+Building a `flow()`, `group()`, `.map` or `.reduce` checks, where it is written, that what each step
+gives fits what the step after it takes, and raises `TypeError` if it cannot. See "Schemas and
+migrations" for what fits.
 
 ### Large groups and maps
 
@@ -323,7 +331,7 @@ is not checked: a seed that is not an identity is counted once per chunk.
 
 `reducer.reduce` is also a `flow` stage that folds the list the stage before it returns, and so is
 `reducer.reduce.options(initial=..., chunk_size=...)`. The stage before it is a task that returns
-`list[X]` where the reducer's item is `X` (a different type raises `TaskDefinitionError` when the
+`list[X]` where the reducer's item is `X` (a different type raises `TypeError` when the
 flow is built), or a `map`, in which case the reduce folds the map's results. A reduce cannot be the
 first stage of a flow, since it has no list to fold: call it with `reducer.reduce(items)` instead.
 The flow's results list holds the folded value for the reduce's stage.
@@ -343,6 +351,138 @@ record or one message: an item or an `initial` too long to be stored inline is s
 the root of the reduce's tree owns, and the reducer reads it back whole. Memory limits apply as
 they do to maps (see "Large groups and maps"). A step must return a value: a reducer that returns a
 step fails the reduce with `ReducerContinuedError`.
+
+## Schemas and migrations
+
+Tasks have no versions of their own. A task's input type has one, and a worker brings a task's input to
+its own version of that type when it claims the task. The stored task never changes; only the worker's
+copy is migrated, one version at a time. A worker whose version already matches does nothing.
+
+```python
+kabudachi.schema(Type, version=N, version_path=None, family=None, migration=...)
+```
+
+declares `Type` as version `N` of a family. A family is a data type's identity across versions: by
+default a protobuf message's full name, or `module.qualname` of any other class. Give the same `family`
+to separate classes to make them versions of one, such as `OrderV1` and `OrderV2`. A type never declared
+is version 0 of its own family, and `version` is 0 by default. `version_path` (`"$.version"`, or
+`"$.meta.v"`) is where a JSON-encoded payload carries its version; without one a payload is taken to be at
+the version of the type it was submitted as. A family has one `version_path`, one class per version, and
+at most one migration per bump; declaring a contradiction raises `ValueError`.
+
+`migration` is the bump from `version - 1`:
+
+- left out: the default step, which drops the fields the new version lacks and gives new fields their
+  defaults;
+- a function: an explicit step, taking the older payload's plain form and returning the newer's. The plain
+  form is the JSON object for the `pydantic` and `dataclass` serializers and the message for `protobuf`.
+  The framework writes the new version into the result, so a step need not;
+- `None`: the bump cannot be migrated. A payload that would cross it is refused.
+
+`@kabudachi.migration(Type, from_version=N)` registers the explicit step from `N` to `N + 1` of `Type`'s
+family on a function, as an alternative to passing `migration=`.
+
+```python
+from pydantic import BaseModel
+
+import kabudachi
+
+
+class OrderV1(BaseModel):
+    item: str
+    quantity: int
+    unit_price: float
+
+
+class OrderV2(BaseModel):
+    item: str
+    quantity: int
+    unit_cents: int
+
+
+class Shipment(BaseModel):
+    summary: str
+
+
+kabudachi.schema(OrderV1, version=1, version_path="$.version", family="shop.Order")
+kabudachi.schema(OrderV2, version=2, version_path="$.version", family="shop.Order")
+
+
+@kabudachi.migration(OrderV1, from_version=1)
+def cents_not_dollars(order: dict) -> dict:
+    return {
+        "item": order["item"],
+        "quantity": order["quantity"],
+        "unit_cents": round(order["unit_price"] * 100),
+    }
+
+
+@kabudachi.task(serializer="pydantic")
+def ship(order: OrderV2) -> Shipment:
+    return Shipment(summary=f"{order.quantity} x {order.item} at {order.unit_cents}c")
+```
+
+A worker running this code takes an order submitted as `OrderV1` by an older worker, runs
+`cents_not_dollars` on its JSON and runs `ship` on the result. Every worker of a shard must declare a
+family's bumps the same way; during a rollout their versions differ, which
+is the point.
+
+### A task that cannot be migrated
+
+A worker that claims a task whose input it cannot bring to its version, because a migration raised, a bump
+is declared incompatible or the serializer cannot migrate, drops the task by default: it logs a warning
+naming the reason and the task fails with `MigrationError`. A migration can raise `MigrateRejectError` to
+say the payload cannot be migrated here; that is treated the same way as any failed migration.
+
+With `raise_on_failed_migration=True` on the task, the worker instead leaves the task for another worker,
+whose version may run it. If no worker can, it fails with `MigrationError` once it has waited
+`Settings.version_block_ttl` (`KABUDACHI_VERSION_BLOCK_TTL`, in seconds; one hour by default), which every
+worker of a shard should set alike.
+
+A task whose input is newer than the worker's version is always left for another worker, whatever the
+option, and fails the same way after `version_block_ttl`.
+
+### What composes
+
+A flow, group, `.map` or `.reduce` checks each adjacency where it is built: what a step gives must fit what
+the step after it takes, or `TypeError` is raised. A returned step is checked in the same way when the
+run of the task that returns it completes. What fits:
+
+- the same type, or a subclass;
+- a different class of the same family, if the producer's version is not newer than the consumer's and no
+  bump between them is declared incompatible (so a downgrade is refused);
+- a group's list of results, or a map's, where a list of the one type is taken, entry by entry;
+- under `on_error="collect_all"`, each entry is `T | TaskFailure`: a stage taking the list must accept
+  failures as well as `T`;
+- when a type cannot be judged, such as `Any` or what a task that returns a step gives, the check passes.
+
+Types of different families do not compose, even across serializers.
+
+## Serializers
+
+A task's `serializer` names the backend that encodes its input and output. `protobuf` is the default.
+
+- `pydantic` (extra `pydantic`): a `BaseModel`, a `list` of one, or `None`. A model is written as canonical
+  JSON (sorted keys, no whitespace, UTF-8, field aliases used), so equal values are equal bytes. A model
+  holding a `set` is refused, since a set has no stable order: use a list. A payload that fails validation
+  raises `SerializationError` naming the field, never its value.
+- `dataclass` (extra `dataclass`, which adds no dependency): a dataclass, a `list` of one, or `None`. Fields
+  may be `str`, `int`, `float`, `bool`, `None`, other such dataclasses, `list[...]`, `dict[str, ...]` and
+  `X | None`. The encoding is canonical JSON as above.
+
+Either serializer finds a payload's version at the family's `version_path`, and writes it there when
+encoding.
+
+A custom serializer needs `name`, `available`, `supports`, `encode` and `decode`. It may add the members
+below; one it lacks takes its default, so existing backends keep working:
+
+| member | default |
+|---|---|
+| `extract_version(payload, value_type)` | `None`: the payload carries no version, and the source type's is used |
+| `validate(value)` | every decoded value is valid; raise `SerializationError` otherwise |
+| `schema_family(value_type)` | the family declared with `kabudachi.schema`, else the type's own |
+| `type_compatibility(produced, consumed)` | `None`: cannot say, so the family and version rules above decide |
+| `load_plain(payload, value_type)` and `dump_plain(plain, value_type)` | absent: the backend cannot migrate, and a task needing a migration is refused. `dump_plain` conforms the migrated form to `value_type` (dropping what it lacks) and encodes it |
 
 ## Coalescing and backpressure
 
@@ -399,7 +539,8 @@ and report ready, default 60 s), `max_runs_per_process` (runs a task process tak
 replaced; no limit by default; the fresh one starts once it has drained and exited, and until then it
 counts against `processes`), `queue`, `result_ttl` (seconds a finished task is kept), `cancel_grace`,
 `queues`, `queue_options` and `router` (see "Queues" below), `memory_soft_limit` and
-`memory_hard_limit` (bytes), and the networked settings `listen`, `seeds`, `external_address`,
+`memory_hard_limit` (bytes), `version_block_ttl` (how long a task left for another worker waits before
+it fails with `MigrationError`, one hour by default; see "Schemas and migrations"), and the networked settings `listen`, `seeds`, `external_address`,
 `authority`, `shard`, `heartbeat_interval`, `heartbeat_timeout` and `reconnect_timeout` (see
 "Networked workers"). In the environment a duration is a number of seconds, and `seeds`, `imports`
 and `queues` are comma-separated lists.

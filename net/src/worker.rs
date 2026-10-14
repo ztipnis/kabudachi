@@ -31,6 +31,7 @@ use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::scheduler::{MemoryLimits, Scheduler};
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::RealClock;
+use kabudachi_core::versions::RunnableVersions;
 pub use libp2p::Multiaddr;
 
 use crate::authority::{AuthorityClient, SharedAuthority};
@@ -121,6 +122,15 @@ pub struct WorkerConfig {
     /// How the shard's queues are ordered and limited. Every worker of a shard
     /// should give the same policy: its leader's decides what each claim gets.
     pub queue_policy: QueuePolicy,
+    /// The input version this worker runs of each task definition: it claims
+    /// no task of its own records whose input is newer, and tells the leader
+    /// it cannot run it.
+    pub runnable_versions: RunnableVersions,
+    /// How long a task may wait blocked by workers that cannot run its input
+    /// before it fails, while this worker leads; `None` for the scheduler's
+    /// default. Every worker of a shard should give the same: its leader's
+    /// decides.
+    pub version_block_ttl: Option<StdDuration>,
 }
 
 impl WorkerConfig {
@@ -155,6 +165,8 @@ impl WorkerConfig {
             executor: None,
             queues: Subscription::Every,
             queue_policy: QueuePolicy::new(),
+            runnable_versions: RunnableVersions::default(),
+            version_block_ttl: None,
         }
     }
 
@@ -197,6 +209,21 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_queue_policy(mut self, policy: QueuePolicy) -> Self {
         self.queue_policy = policy;
+        self
+    }
+
+    /// Runs each task definition's input at the version `runnable` names.
+    #[must_use]
+    pub fn with_runnable_versions(mut self, runnable: RunnableVersions) -> Self {
+        self.runnable_versions = runnable;
+        self
+    }
+
+    /// Fails a task blocked for `ttl` by workers that cannot run its input,
+    /// while this worker leads.
+    #[must_use]
+    pub fn with_version_block_ttl(mut self, ttl: StdDuration) -> Self {
+        self.version_block_ttl = Some(ttl);
         self
     }
 
@@ -377,6 +404,11 @@ impl Worker {
         let (mut node, first) = WorkerNode::start(identity, entry, clock, authority_timings);
         let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         scheduler.set_result_ttl(retention_of(&config));
+        if let Some(ttl) = config.version_block_ttl {
+            scheduler.set_version_block_ttl(kabudachi_core::time::Duration::from_millis(
+                u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+            ));
+        }
         scheduler.set_memory_limits(config.memory_limits);
         // The scheduler counts the shard's admitted input against the whole
         // limits; this process's own memory is split between the payloads it
@@ -404,6 +436,7 @@ impl Worker {
                 replication_factor: config.replication_factor,
                 queues: config.queues.clone(),
                 queue_policy: config.queue_policy.clone(),
+                runnable: config.runnable_versions.clone(),
             },
             // Borrowed, so `observe` outlives the guards above: once it is
             // dropped, the worker shows out of its shard.

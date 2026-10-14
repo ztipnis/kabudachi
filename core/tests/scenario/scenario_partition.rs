@@ -228,7 +228,7 @@ fn no_replacement_run_is_claimable_until_the_reconnect_timeout_has_run_out_under
         .expect("the task is queued");
     assert_eq!(first.attempt_number, 1);
     scheduler
-        .report_started(&cut_off, &first.task_run_id)
+        .report_started(&cut_off, &first.task_run_id, None)
         .expect("the claim is fresh");
 
     let rest: BTreeSet<WorkerId> = cluster
@@ -365,7 +365,7 @@ fn a_worker_reported_lost_and_heard_again_before_a_runs_own_deadline_keeps_that_
         .request_claim(&cut_off, &task)
         .expect("the task is queued");
     scheduler
-        .report_started(&cut_off, &first.task_run_id)
+        .report_started(&cut_off, &first.task_run_id, None)
         .expect("the claim is fresh");
 
     let rest: BTreeSet<WorkerId> = cluster

@@ -205,7 +205,7 @@ impl Model {
                 if let Some(i) = self.pick_claim(*pick) {
                     let _ = self
                         .scheduler
-                        .report_started(&self.worker, &self.claims[i].task_run_id);
+                        .report_started(&self.worker, &self.claims[i].task_run_id, None);
                 }
             }
             Op::Complete { pick, continues } => {

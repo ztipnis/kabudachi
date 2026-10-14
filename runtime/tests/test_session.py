@@ -4,11 +4,13 @@ provoked on."""
 
 import asyncio
 import gc
+import json
 import logging
 import threading
 import time
 from datetime import timedelta
 
+import pydantic
 import pytest
 
 from kabudachi._native import EventKind, RunState, result_digest
@@ -18,6 +20,7 @@ from kabudachi.errors import (
     CertificationError,
     CoalescedPayloadTooLargeError,
     ConfigurationError,
+    MigrationError,
     PayloadTooLargeError,
     ResultTooLargeError,
     ResultUnavailableError,
@@ -33,8 +36,9 @@ from kabudachi.errors import (
     TaskTimeoutError,
     UnknownTaskError,
 )
-from kabudachi.options import SubmissionOptions
+from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.registry import TaskKind, TaskRegistry
+from kabudachi.schemas import MigrateRejectError, SchemaRegistry, schema
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.session import Session, validate_definitions
 from kabudachi.status import Durability, TaskStatus
@@ -56,14 +60,17 @@ def explode(request: Greeting) -> Greeting:
     ("task_options", "default_queue", "version", "queue"),
     [
         pytest.param({}, None, 0, "default", id="defaults"),
-        pytest.param({"queue": "gpu", "version": 4}, None, 4, "gpu", id="the task's own queue and version"),
+        pytest.param({"queue": "gpu"}, None, 4, "gpu", id="the task's own queue and its input's version"),
         pytest.param({}, "emails", 0, "emails", id="configured default queue"),
     ],
 )
-def test_submission_carries_the_task_definition_encoded_input_queue_and_version(
+def test_submission_carries_the_task_definition_encoded_input_queue_and_input_version(
     task_options, default_queue, version, queue
 ):
-    world = World(echo, **task_options)
+    schemas = SchemaRegistry()
+    if version:
+        schemas.declare(Greeting, version=version)
+    world = World(echo, schemas=schemas, **task_options)
     if default_queue is not None:
         world.configuration.configure(queue=default_queue)
     argument = Greeting(text="hi", times=2)
@@ -74,6 +81,17 @@ def test_submission_carries_the_task_definition_encoded_input_queue_and_version(
     assert definition_id == "tests.echo"
     assert payload == argument.SerializeToString()
     assert (submitted_version, submitted_queue) == (version, queue)
+
+
+def test_a_session_with_its_own_schemas_runs_a_task_at_the_version_they_give_its_input():
+    schemas = SchemaRegistry()
+    schemas.declare(Greeting, version=4)
+    world = World(echo, schemas=schemas)
+
+    async def body():
+        return await world.call("echo", Greeting(text="hi"))
+
+    assert run(with_events(world, body)).text == "hi"
 
 
 def test_an_argument_of_the_wrong_type_is_refused_before_anything_is_submitted():
@@ -854,6 +872,7 @@ def test_a_compaction_the_leader_refuses_to_take_is_not_reported_as_a_failed_mer
         compaction=True,
         definition_id=world.tasks["echo"].definition.name,
         task_run_id="run-1",
+        source_version=0,
         chain=[payload, payload],
     )
 
@@ -1921,3 +1940,458 @@ def test_an_input_past_the_payload_limit_is_refused_without_running_the_router()
 
     assert routed_values == []
     assert world.runtime.submitted == []
+
+
+# --- migrating what a worker claims ---------------------------------------------
+
+
+class ParcelV1(pydantic.BaseModel):
+    label: str
+    weight: int = 0
+
+
+class ParcelV2(pydantic.BaseModel):
+    label: str
+    priority: int = 0
+
+
+def shelve(plain):
+    return {**plain, "label": plain["label"].upper()}
+
+
+class CrateV1(pydantic.BaseModel):
+    label: str
+
+
+class CrateV2(pydantic.BaseModel):
+    label: str
+
+
+schema(ParcelV1, version=1, version_path="$.v", family="tests.session.parcel")
+schema(ParcelV2, version=2, version_path="$.v", family="tests.session.parcel", migration=shelve)
+schema(CrateV1, version=1, version_path="$.v", family="tests.session.crate")
+schema(CrateV2, version=2, version_path="$.v", family="tests.session.crate", migration=None)
+
+
+class PlateV1(pydantic.BaseModel):
+    label: str
+
+
+class PlateV2(pydantic.BaseModel):
+    label: str
+
+
+class Tally(pydantic.BaseModel):
+    total: int
+
+
+# Versioned, but their payloads say nothing of their version: the claim's own
+# source version is the only word on what a payload of the family is at.
+schema(PlateV1, version=1, family="tests.session.plate")
+schema(PlateV2, version=2, family="tests.session.plate")
+schema(Tally, version=1, family="tests.session.tally")
+
+
+def parcel_world(seen, **world_options):
+    def take_parcel(parcel: ParcelV2) -> ParcelV2:
+        seen.append(parcel)
+        return parcel
+
+    return World(take_parcel, serializer="pydantic", **world_options)
+
+
+def crate_world(seen, **world_options):
+    def take_crate(crate: CrateV2) -> CrateV2:
+        seen.append(crate)
+        return crate
+
+    return World(take_crate, serializer="pydantic", **world_options)
+
+
+def submit_at(world, name, payload, version):
+    """Submits `payload` as a task of an older (or newer) worker would have."""
+    return world.session.tasks.submit(
+        world.tasks[name].definition, payload, SubmissionOptions(), SubmissionSettings("default"), version
+    )
+
+
+def encoded(value):
+    """`value` as the pydantic serializer writes it, with its schema version."""
+    return SerializerRegistry.with_defaults().get("pydantic").encode(value, type(value))
+
+
+def test_a_task_submitted_at_an_older_version_runs_on_its_input_migrated_and_records_both_versions():
+    seen = []
+    world = parcel_world(seen)
+
+    async def body():
+        handle = submit_at(world, "take_parcel", encoded(ParcelV1(label="a", weight=3)), 1)
+        result = await handle
+        return result, await world.native.task_record(handle.task_id)
+
+    result, record = run(world.working(body))
+
+    # The explicit step shelved the label; the default dropped the weight.
+    assert seen == [ParcelV2(label="A")] == [result]
+    assert [(run.source_version, run.execution_version) for run in record.runs] == [(1, 2)]
+
+
+@pytest.mark.parametrize(
+    ("make_world", "name", "payload", "version", "reason"),
+    [
+        pytest.param(
+            parcel_world,
+            "take_parcel",
+            json.dumps({"label": "a", "v": 3}).encode(),
+            3,
+            "newer than this worker's",
+            id="an input newer than the worker's version",
+        ),
+        pytest.param(
+            lambda seen, **options: crate_world(seen, raise_on_failed_migration=True, **options),
+            "take_crate",
+            encoded(CrateV1(label="a")),
+            1,
+            "declared incompatible",
+            id="a bump that cannot be migrated, for a task that asked to keep it",
+        ),
+    ],
+)
+def test_a_task_the_worker_cannot_run_waits_for_another_worker_and_fails_after_the_time_limit(
+    make_world, name, payload, version, reason, caplog
+):
+    seen = []
+    world = make_world(seen, version_block_ttl_ms=200)
+
+    async def body():
+        handle = submit_at(world, name, payload, version)
+        with pytest.raises(MigrationError, match=f"could not be run at its input version: .*{reason}"):
+            await asyncio.wait_for(handle, WAIT)
+        return await world.native.task_record(handle.task_id)
+
+    with caplog.at_level(logging.WARNING, logger="kabudachi"):
+        record = run(with_events(world, body))
+
+    assert seen == []
+    assert reason in record.blocked_reason
+    assert "dropping task" not in caplog.text
+
+
+def flow_status(world, *members):
+    """Runs a flow of `members`, each a (task name, version, payload) a
+    submitter of that version made; a payload of `None` takes the result of
+    the member before. The composite's status once it is over."""
+    tree = (
+        "flow",
+        "fail_fast",
+        [
+            (
+                "task",
+                f"tests.{name}",
+                version,
+                world.session.submission_settings(world.tasks[name].definition),
+                payload,
+                [],
+            )
+            for name, version, payload in members
+        ],
+    )
+
+    async def body():
+        composite_id = world.runtime.submit_composite(tree)
+        while (status := await world.runtime.composite_status(composite_id))[0] == "running":
+            await asyncio.sleep(0.005)
+        return status
+
+    return run(world.working(body))
+
+
+def test_a_member_of_a_flow_has_its_input_migrated_before_its_run_is_reported_started():
+    seen = []
+    world = parcel_world(seen)
+
+    status = flow_status(world, ("take_parcel", 1, encoded(ParcelV1(label="a", weight=3))))
+
+    assert status[0] == "succeeded"
+    assert seen == [ParcelV2(label="A")]
+    assert [event[0] for event in world.runtime.events] == ["started", "complete"]
+
+
+def test_a_member_whose_input_cannot_be_migrated_never_runs_and_is_only_reported_blocked(caplog):
+    seen = []
+    world = crate_world(seen)
+
+    with caplog.at_level(logging.WARNING, logger="kabudachi"):
+        flow_status(world, ("take_crate", 1, encoded(CrateV1(label="a"))))
+
+    assert seen == []
+    assert "dropping task" in caplog.text
+    assert [event[0] for event in world.runtime.events] == ["blocked"]
+
+
+class GadgetV1(pydantic.BaseModel):
+    label: str
+
+
+class GadgetV2(pydantic.BaseModel):
+    label: str
+
+
+def move_gadget(plain):
+    if plain["label"] == "refuse":
+        raise MigrateRejectError("only gadgets built on weekdays can move")
+    raise ValueError(f"cannot move the gadget labelled {plain['label']}")
+
+
+schema(GadgetV1, version=1, version_path="$.v", family="tests.session.gadget")
+schema(GadgetV2, version=2, version_path="$.v", family="tests.session.gadget", migration=move_gadget)
+
+
+@pytest.mark.parametrize(
+    ("name", "make_input", "reason", "leaked"),
+    [
+        pytest.param(
+            "take_gadget",
+            lambda: encoded(GadgetV1(label="refuse")),
+            "was refused: only gadgets built on weekdays can move",
+            None,
+            id="a refusal",
+        ),
+        pytest.param(
+            "take_gadget",
+            lambda: encoded(GadgetV1(label="secret")),
+            "failed with ValueError",
+            "secret",
+            id="any other error",
+        ),
+        pytest.param(
+            "take_crate",
+            lambda: encoded(CrateV1(label="secret")),
+            "declared incompatible",
+            "secret",
+            id="a bump declared incompatible",
+        ),
+    ],
+)
+def test_a_migration_that_cannot_be_made_drops_the_task_and_only_a_refusal_gives_its_message(
+    name, make_input, reason, leaked, caplog
+):
+    seen = []
+
+    def take_gadget(gadget: GadgetV2) -> GadgetV2:
+        seen.append(gadget)
+        return gadget
+
+    def take_crate(crate: CrateV2) -> CrateV2:
+        seen.append(crate)
+        return crate
+
+    world = World(take_gadget, take_crate, serializer="pydantic")
+
+    async def body():
+        handle = submit_at(world, name, make_input(), 1)
+        with pytest.raises(MigrationError) as raised:
+            await asyncio.wait_for(handle, WAIT)
+        return handle.task_id, str(raised.value)
+
+    with caplog.at_level(logging.WARNING, logger="kabudachi"):
+        task_id, message = run(with_events(world, body))
+
+    assert seen == []
+    [warning] = [record.getMessage() for record in caplog.records if "dropping task" in record.getMessage()]
+    assert f"task {task_id}" in warning and f"tests.{name}" in warning
+    for text in (message, warning):
+        assert reason in text
+        assert leaked is None or leaked not in text
+    assert [event[3] for event in world.runtime.events if event[0] == "blocked"] == [True]
+
+
+def test_a_result_a_member_takes_is_migrated_from_the_version_its_producer_wrote():
+    seen = []
+
+    def make_parcel(parcel: ParcelV2) -> ParcelV2:
+        return parcel
+
+    def take_parcel(parcel: ParcelV2) -> ParcelV2:
+        seen.append(parcel)
+        return parcel
+
+    world = World(make_parcel, take_parcel, serializer="pydantic")
+    store = world.runtime.store_result
+
+    async def stored_by_an_older_worker(task_id, outcome):
+        return await store(task_id, encoded(ParcelV1(label="a", weight=3)))
+
+    world.runtime.store_result = stored_by_an_older_worker
+
+    status = flow_status(
+        world,
+        ("make_parcel", 2, encoded(ParcelV2(label="unused"))),
+        ("take_parcel", 2, None),
+    )
+
+    assert status[0] == "succeeded"
+    assert seen == [ParcelV2(label="A")]
+
+
+def append_label(item: ParcelV2, previous: ParcelV2) -> ParcelV2:
+    return ParcelV2(label=previous.label + item.label)
+
+
+def test_a_reduce_step_has_the_items_stored_at_an_older_version_migrated_before_it_folds_them():
+    world = World(append_label, serializer="pydantic")
+    operands = world.runtime.reduce_operands
+
+    async def stored_by_an_older_worker(task_run_id):
+        return [
+            (role, encoded(ParcelV1(label=json.loads(payload)["label"], weight=3)) if role == "item" else payload)
+            for role, payload in await operands(task_run_id)
+        ]
+
+    world.runtime.reduce_operands = stored_by_an_older_worker
+
+    async def body():
+        reduce = world.tasks["append_label"].reduce.options(initial=ParcelV2(label=""))
+        return await reduce.start(world.session, [ParcelV2(label="a"), ParcelV2(label="b")])
+
+    # The explicit step shelved each stored item's label before the reducer saw it.
+    assert run(with_events(world, body)) == ParcelV2(label="AB")
+
+
+def add_plate(plate: PlateV2, tally: Tally) -> Tally:
+    return Tally(total=tally.total + len(plate.label))
+
+
+def test_a_reduce_over_a_versioned_item_type_does_not_take_its_other_family_result_for_an_item():
+    world = World(add_plate, serializer="pydantic")
+
+    async def body():
+        reduce = world.tasks["add_plate"].reduce.options(initial=Tally(total=0))
+        return await reduce.start(world.session, [PlateV2(label="a"), PlateV2(label="bc")])
+
+    # The running total has no version of its own; it is not at the items' version 2.
+    assert run(with_events(world, body)) == Tally(total=3)
+
+
+def test_a_result_of_an_older_class_of_the_family_reaches_its_consumer_as_the_class_its_producer_wrote():
+    seen = []
+
+    def make_plate(plate: PlateV1) -> PlateV1:
+        return plate
+
+    def take_plate(plate: PlateV2) -> PlateV2:
+        seen.append(plate)
+        return PlateV2(label=plate.label)
+
+    world = World(make_plate, take_plate, serializer="pydantic")
+
+    status = flow_status(
+        world,
+        ("make_plate", 1, encoded(PlateV1(label="a"))),
+        ("take_plate", 2, None),
+    )
+
+    assert status[0] == "succeeded"
+    assert seen == [PlateV1(label="a")]
+    assert [event[0] for event in world.runtime.events] == ["started", "complete", "started", "complete"]
+
+
+def merge_parcels(older: ParcelV2, newer: ParcelV2) -> ParcelV2:
+    return ParcelV2(label=older.label + newer.label)
+
+
+def merge_plates(older: PlateV2, newer: PlateV2) -> PlateV2:
+    return PlateV2(label=older.label + newer.label)
+
+
+def plate_world():
+    def fold_plate(plate: PlateV2) -> PlateV2:
+        return plate
+
+    return World(fold_plate, serializer="pydantic", kind=TaskKind.COALESCING, merge=merge_plates)
+
+
+def compaction(world, name, *payloads, source_version=1):
+    """Hands the session the leader's compaction of `payloads`, submitted at
+    `source_version`; what it completed the fold with and what it reported
+    failed."""
+    from types import SimpleNamespace
+
+    folded, failed = [], []
+    world.runtime.complete_compaction = lambda run, payload: folded.append(payload)
+    world.runtime.report_failure = lambda run, kind, message="": failed.append((kind, message))
+    claim = SimpleNamespace(
+        compaction=True,
+        definition_id=world.tasks[name].definition.name,
+        task_run_id="run-1",
+        source_version=source_version,
+        chain=list(payloads),
+    )
+
+    async def body():
+        world.session._start(claim)
+        await world.session.wait_until_running_finish()
+
+    run(body())
+    return folded, failed
+
+
+@pytest.mark.parametrize(
+    ("make_world", "name", "chain", "source_version"),
+    [
+        pytest.param(
+            lambda: parcel_world([], kind=TaskKind.COALESCING, merge=merge_parcels),
+            "take_parcel",
+            [encoded(ParcelV2(label="a")), encoded(ParcelV2(label="b"))],
+            1,
+            id="payloads that say they are at this worker's version",
+        ),
+        pytest.param(
+            plate_world,
+            "fold_plate",
+            [encoded(PlateV2(label="a")), encoded(PlateV2(label="b"))],
+            2,
+            id="payloads that do not, submitted at this worker's version",
+        ),
+    ],
+)
+def test_a_compaction_folds_a_chain_that_is_at_this_workers_version(make_world, name, chain, source_version):
+    world = make_world()
+
+    folded, failed = compaction(world, name, *chain, source_version=source_version)
+
+    assert failed == []
+    [payload] = folded
+    assert json.loads(payload)["label"] == "ab"
+
+
+@pytest.mark.parametrize(
+    ("make_world", "name", "chain", "source_version"),
+    [
+        pytest.param(
+            lambda: parcel_world([], kind=TaskKind.COALESCING, merge=merge_parcels),
+            "take_parcel",
+            [encoded(ParcelV1(label="a", weight=1)), encoded(ParcelV1(label="b"))],
+            1,
+            id="payloads that say they are at an older version",
+        ),
+        pytest.param(
+            plate_world,
+            "fold_plate",
+            [encoded(PlateV1(label="a")), encoded(PlateV1(label="b"))],
+            1,
+            id="payloads that do not, submitted at an older version",
+        ),
+    ],
+)
+def test_a_compaction_of_a_chain_at_another_version_fails_and_folds_nothing_for_a_claim_to_migrate(
+    make_world, name, chain, source_version
+):
+    world = make_world()
+
+    folded, failed = compaction(world, name, *chain, source_version=source_version)
+
+    assert folded == []
+    [(kind, message)] = failed
+    assert kind == "MigrationError"
+    assert "a claim migrates it" in message

@@ -18,6 +18,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Takes a task that is over out of every place it was waiting in.
     pub(super) fn record_finished(&mut self, task_id: &TaskId, now: Instant) {
         self.release(task_id, now);
+        // A task that ends without starting is no longer blocked.
+        self.blocked.remove(task_id);
         if let Some(key) = self.compaction_key_of(task_id) {
             self.occupancy.end_compaction(&key, task_id);
         }
@@ -105,6 +107,31 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             task_id: task_id.clone(),
             task_run_id: run_id,
         });
+    }
+
+    /// Fails `task_id`'s pending run for good with failure `kind`: no attempt
+    /// follows. The task leaves the waiting room and is finished, and `event`,
+    /// given the task and its run, reports it.
+    pub(super) fn fail_pending(
+        &mut self,
+        task_id: &TaskId,
+        kind: &str,
+        now: Instant,
+        event: impl FnOnce(TaskId, TaskRunId) -> Event,
+    ) {
+        let stamped_at = WallTime::now(&self.clock);
+        let run_id = self.current_run[task_id].clone();
+        let run = self
+            .runs
+            .get_mut(&run_id)
+            .expect("every current run is stored");
+        run.transition_to(TaskRunState::Failed, stamped_at)
+            .expect("a pending run can always fail");
+        run.failure_kind = kind.to_owned();
+        self.waiting.leave(task_id);
+        self.record_finished(task_id, now);
+        self.mark_decided(&run_id);
+        self.events.push(event(task_id.clone(), run_id));
     }
 
     /// `older`, a pending generation, is replaced by `newer`, which has

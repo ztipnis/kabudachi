@@ -167,21 +167,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if claim_size <= MAX_SUBMISSION_BYTES {
             return;
         }
-        let stamped_at = WallTime::now(&self.clock);
-        let run_id = self.current_run[&waiting].clone();
-        let run = self
-            .runs
-            .get_mut(&run_id)
-            .expect("every current run is stored");
-        run.transition_to(TaskRunState::Failed, stamped_at)
-            .expect("a pending run can always fail");
-        run.failure_kind = COALESCED_PAYLOAD_TOO_LARGE.to_owned();
-        self.waiting.leave(&waiting);
-        self.record_finished(&waiting, now);
-        self.mark_decided(&run_id);
-        self.events.push(Event::CoalescedPayloadTooLarge {
-            task_id: waiting,
-            task_run_id: run_id,
+        self.fail_pending(&waiting, COALESCED_PAYLOAD_TOO_LARGE, now, |task_id, task_run_id| {
+            Event::CoalescedPayloadTooLarge {
+                task_id,
+                task_run_id,
+            }
         });
     }
 
@@ -310,7 +300,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             run.current_state() == TaskRunState::Claimed && self.is_compaction(&run.task_id())
         });
         if claimed {
-            let _ = self.start_owned(worker, run_id);
+            let _ = self.start_owned(worker, run_id, None);
         }
     }
 

@@ -770,6 +770,7 @@ impl Cluster {
                         },
                         state: ReportedState::Claimed,
                         continuation: None,
+                        execution_version: None,
                     },
                 );
             }
@@ -864,7 +865,7 @@ impl Cluster {
     /// `run`, and the answer is held as `claim`'s is.
     pub fn start(&mut self, at: &WorkerId, claimant: &WorkerId, run: &TaskRunId) -> Ticket {
         let task = self.task_of(at, run);
-        let answer = match self.scheduler_mut(at).report_started(claimant, run) {
+        let answer = match self.scheduler_mut(at).report_started(claimant, run, None) {
             Ok(()) => Answer::Started,
             Err(rejection) => Answer::Refused(rejection.to_string()),
         };

@@ -81,6 +81,9 @@ message ReportedRun {
   string failure_message = 6;
   // With REPORTED_RUN_SUCCEEDED: the step the run returned.
   StepDescription continuation = 5;
+  // The version the worker migrated the run's input to; 0 when it has not
+  // said (see `ReportStarted.execution_version`).
+  uint32 execution_version = 8;
 }
 
 message ReconcileReport {

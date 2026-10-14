@@ -134,6 +134,19 @@ class TaskSupersededError(KabudachiError, RuntimeError):
         return (TaskSupersededError, (str(self), self.superseded_by))
 
 
+class MigrateRejectError(KabudachiError, RuntimeError):
+    """Raised by a migration to say this input cannot be migrated here. A
+    worker drops the task, which ends with `MigrationError`; if the task has
+    `raise_on_failed_migration`, the task stays queued for a worker that
+    can run it."""
+
+
+class MigrationError(KabudachiError, RuntimeError):
+    """A task's input could not be run at any worker's version: no worker
+    could migrate it, or none with a version it fits was found before the
+    block's time limit. The message names the reason."""
+
+
 class StartupError(KabudachiError, RuntimeError):
     """The worker's task processes could not start: one could not import the
     task modules, did not find the same tasks as the worker, or exited first."""

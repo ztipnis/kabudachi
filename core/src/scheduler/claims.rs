@@ -75,8 +75,8 @@ pub enum ClaimRejection {
     Superseded,
     #[error("another generation of the task's coalescing key is running")]
     KeyBusy,
-    /// The task is a compaction run and the asking worker has not said it
-    /// runs them.
+    /// The task is a compaction run the worker has not said it runs, or one
+    /// the worker said it cannot run at its input version.
     #[error("the worker does not run compaction")]
     CannotRun,
     /// The task's queue is not one the claiming worker takes.
@@ -271,7 +271,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             if full && !self.is_compaction(&task_id) {
                 continue;
             }
-            if passed.contains(&task_id) || self.is_blocked(&task_id) || self.is_held_back(&task_id)
+            if passed.contains(&task_id)
+                || self.is_blocked(&task_id)
+                || self.is_held_back(&task_id)
+                || self.blocked_by(&task_id, worker)
             {
                 continue;
             }
@@ -308,6 +311,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .ok_or(ClaimRejection::TaskUnknown)?
             .clone();
         match self.runs[&run_id].current_state() {
+            TaskRunState::Queued if self.blocked_by(task_id, worker) => {
+                Err(ClaimRejection::CannotRun)
+            }
             TaskRunState::Queued if self.is_held_back(task_id) => Err(ClaimRejection::NotReady),
             TaskRunState::Queued if self.is_blocked(task_id) => Err(ClaimRejection::KeyBusy),
             TaskRunState::Queued

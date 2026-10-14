@@ -23,6 +23,7 @@ from kabudachi.lifecycle import HookRegistry, RunContext, hooks_for_run, initial
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskRegistry
 from kabudachi.run_info import RunInfo, run_context
+from kabudachi.schemas import SchemaRegistry
 from kabudachi.serializers import SerializerRegistry
 
 
@@ -146,10 +147,14 @@ class InProcessExecutor:
         serializers: SerializerRegistry,
         concurrency: int,
         hooks: HookRegistry,
+        schemas: SchemaRegistry | None = None,
     ) -> None:
         self._registry = registry
         self._serializers = serializers
         self._hooks = hooks
+        # The schemas of the session that hands this executor its runs; this
+        # process's by default.
+        self._schemas = schemas
         self._places = ConcurrencyPlaces(concurrency)
         # As many threads as places, or synchronous bodies would queue behind
         # the event loop's small default pool.
@@ -206,6 +211,7 @@ class InProcessExecutor:
             hooks,
             job.after,
             job.given,
+            self._schemas,
         )
         self._hold(job.run_id, body)
         return body

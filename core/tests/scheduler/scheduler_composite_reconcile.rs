@@ -108,7 +108,7 @@ fn a_continuation_committed_by_its_certifying_revision_is_rebuilt_from_the_run_w
     let generation = || Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_coalescing_key("k");
     let task = old.scheduler.submit(generation()).unwrap();
     let claim = old.scheduler.request_claim(&worker(), &task).unwrap();
-    old.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("explode", Some(b"x"))]);
     let mark = old.spy.mark();
     old.scheduler
@@ -146,7 +146,7 @@ fn a_new_leader_answers_a_finished_continuing_task_as_continued() {
         .submit(Submission::new(TaskDefinitionId::new("plain"), 0, b"p".to_vec(), "default").with_client(client.clone()))
         .unwrap();
     let plain_claim = old.scheduler.request_claim(&worker(), &plain).unwrap();
-    old.scheduler.report_started(&worker(), &plain_claim.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &plain_claim.task_run_id, None).unwrap();
     old.scheduler
         .complete(&worker(), &plain_claim.task_run_id, Digest::blake3(b"result"), Completion::Final)
         .unwrap();
@@ -155,7 +155,7 @@ fn a_new_leader_answers_a_finished_continuing_task_as_continued() {
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_client(client))
         .unwrap();
     let claim = old.scheduler.request_claim(&worker(), &task).unwrap();
-    old.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
     old.scheduler
         .complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step.clone()))
@@ -187,7 +187,7 @@ fn a_run_whose_certifying_revision_was_lost_is_certified_with_its_step_from_the_
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
         .unwrap();
     let claim = old.scheduler.request_claim(&worker(), &task).unwrap();
-    old.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("stage", Some(b"x"))]);
     let mark = old.spy.mark();
     old.scheduler
@@ -201,6 +201,7 @@ fn a_run_whose_certifying_revision_was_lost_is_certified_with_its_step_from_the_
                 claim: claim.clone(),
                 state: ReportedState::Succeeded { result_digest: step.digest(), delivered: false },
                 continuation: Some(step),
+                execution_version: None,
             }],
             asked_at: None,
         },
@@ -322,7 +323,7 @@ fn the_items_an_expansion_split_are_kept_as_long_as_the_flow_that_names_them() {
         run_member(&mut fixture, &flow, 0, b"[1]");
         let split = flow.child(1);
         let expansion = fixture.scheduler.request_claim(&worker(), &split.expansion_task()).unwrap();
-        fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+        fixture.scheduler.report_started(&worker(), &expansion.task_run_id, None).unwrap();
         fixture.scheduler.submit_members(item_batch(&split, 0, 1, false)).unwrap();
         fixture
             .scheduler
@@ -432,7 +433,7 @@ fn a_continuation_certified_while_its_composite_record_is_unknown_is_taken_from_
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
         .unwrap();
     let claim = old.scheduler.request_claim(&worker(), &task).unwrap();
-    old.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("stage", Some(b"x"))]);
     let mark = old.spy.mark();
     old.scheduler
@@ -450,6 +451,7 @@ fn a_continuation_certified_while_its_composite_record_is_unknown_is_taken_from_
                 claim: claim.clone(),
                 state: ReportedState::Succeeded { result_digest: step.digest(), delivered: false },
                 continuation: Some(step),
+                execution_version: None,
             }],
             asked_at: None,
         },
@@ -502,7 +504,7 @@ fn a_map_whose_seal_was_lost_with_its_leader_is_sealed_from_its_expansion_runs_r
         let map = flow.child(1);
         let expansion_task = map.expansion_task();
         let expansion = old.scheduler.request_claim(&worker(), &expansion_task).unwrap();
-        old.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+        old.scheduler.report_started(&worker(), &expansion.task_run_id, None).unwrap();
         old.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
         for index in 0..2 {
             run_member(&mut old, &map, index, b"done");
@@ -554,7 +556,7 @@ fn a_sealed_map_does_not_wait_for_a_member_whose_task_record_was_lost() {
     run_member(&mut old, &flow, 0, b"[1, 2, 3]");
     let map = flow.child(1);
     let expansion = old.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
-    old.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &expansion.task_run_id, None).unwrap();
     old.scheduler.submit_members(item_batch(&map, 0, 3, false)).unwrap();
     run_member(&mut old, &map, 0, b"done");
     run_member(&mut old, &map, 2, b"done");
@@ -579,7 +581,7 @@ fn a_map_whose_seal_and_a_member_record_were_both_lost_ends_with_the_member_lost
     run_member(&mut old, &flow, 0, b"[1, 2, 3]");
     let map = flow.child(1);
     let expansion = old.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
-    old.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &expansion.task_run_id, None).unwrap();
     old.scheduler.submit_members(item_batch(&map, 0, 3, false)).unwrap();
     run_member(&mut old, &map, 0, b"done");
     run_member(&mut old, &map, 2, b"done");

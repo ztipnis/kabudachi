@@ -168,6 +168,7 @@ use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::Clock;
+use kabudachi_core::versions::RunnableVersions;
 use libp2p::Multiaddr;
 
 use crate::authority::AuthorityClient;
@@ -203,6 +204,9 @@ pub struct DriverConfig {
     /// How the queues are ordered and limited. Every worker of a shard should
     /// give the same policy: its leader's decides what each claim gets.
     pub queue_policy: QueuePolicy,
+    /// The input version this worker runs of each task definition (see
+    /// `kabudachi_core::versions`).
+    pub runnable: RunnableVersions,
 }
 
 impl Default for DriverConfig {
@@ -215,6 +219,7 @@ impl Default for DriverConfig {
             replication_factor: ReplicationFactor::DEFAULT,
             queues: Subscription::Every,
             queue_policy: QueuePolicy::new(),
+            runnable: RunnableVersions::default(),
         }
     }
 }

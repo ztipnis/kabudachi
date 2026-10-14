@@ -6,14 +6,20 @@ retries, timeouts and queues stay per stage and nothing is inherited between
 stages.
 """
 
+import types
+import typing
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+from kabudachi import schemas
 from kabudachi.composites import FlowHandle, GroupHandle, ReduceHandle
 from kabudachi.config import UNSET
-from kabudachi.errors import ReduceEmptyError, TaskDefinitionError
+from kabudachi.errors import ReduceEmptyError, TaskFailure
 from kabudachi.handle import TaskHandle
 from kabudachi.registry import TaskDefinition, TaskKind
+from kabudachi.schemas import UNKNOWN, Each, Either, Items, OutputShape, Value
+from kabudachi.serializers import process_serializers
 from kabudachi.session import Session, current_session
 
 
@@ -85,11 +91,16 @@ class BoundTask:
         """Whether a call, or the previous stage of a flow, has to supply an input."""
         return self._value is UNSET
 
-    @property
-    def output_type(self) -> Any:
+    def output_shape(self) -> OutputShape:
         """What the step gives the next one; unknown for a task that returns a
         step, whose handle resolves to the continuation's list of results."""
-        return None if self.definition.continues else self.definition.output_type
+        if self.definition.continues:
+            return UNKNOWN
+        return Value(self.definition.output_type, self.definition.serializer)
+
+    def check_types(self) -> None:
+        """Nothing: a task's own output is not next to any other step, so the
+        checks happen between the stages of the flow or group that holds it."""
 
     def input_requirements(self) -> list[tuple[str, Any, str]]:
         """The (name, type, serializer name) of each task that takes the input of this step."""
@@ -120,7 +131,8 @@ class BoundTask:
                 for name, field_value in sorted(self._fields.items())
             ]
         settings = session.submission_settings(definition)
-        return ("task", definition.name, definition.version, settings, value, fields)
+        version = session.schemas.version_of(definition.input_type)
+        return ("task", definition.name, version, settings, value, fields)
 
     def __call__(self, *arguments: Any) -> TaskHandle:
         self.check_arguments(arguments)
@@ -193,8 +205,6 @@ class Flow:
     is_step = True
     is_task = False
     handle_type = FlowHandle
-    output_type = None
-    """Unknown: a flow resolves to the list of its stages' results."""
 
     def __init__(self, stages: list[Any]) -> None:
         self.stages = stages
@@ -202,6 +212,18 @@ class Flow:
     @property
     def needs_input(self) -> bool:
         return self.stages[0].needs_input
+
+    def output_shape(self) -> OutputShape:
+        """A flow resolves to the list of its stages' results, in order."""
+        return Items(tuple(stage.output_shape() for stage in self.stages))
+
+    def check_types(self) -> None:
+        """Raises `TypeError` unless every stage's output fits the stage after
+        it, here and in the steps nested inside."""
+        for before, after in zip(self.stages, self.stages[1:]):
+            _check_adjacent(before, after)
+        for stage in self.stages:
+            stage.check_types()
 
     def input_requirements(self) -> list[tuple[str, Any, str]]:
         """The (name, type, serializer name) of each task the flow's input goes to.
@@ -251,8 +273,6 @@ class Group:
     is_step = True
     is_task = False
     handle_type = GroupHandle
-    output_type = None
-    """Unknown: a group resolves to the list of its members' results."""
 
     def __init__(self, members: list[Any], on_error: str) -> None:
         self.members = members
@@ -261,6 +281,16 @@ class Group:
     @property
     def needs_input(self) -> bool:
         return any(member.needs_input for member in self.members)
+
+    def output_shape(self) -> OutputShape:
+        """A group resolves to the list of its members' results, in order,
+        each of which is the failure under `collect_all` if the member failed."""
+        return Items(tuple(_result_shape(member.output_shape(), self.on_error) for member in self.members))
+
+    def check_types(self) -> None:
+        """Raises `TypeError` unless the steps nested in the members fit together."""
+        for member in self.members:
+            member.check_types()
 
     def input_requirements(self) -> list[tuple[str, Any, str]]:
         """The (name, type, serializer name) of each member task that takes the group's input."""
@@ -316,13 +346,20 @@ class MapStep:
     is_task = False
     handle_type = GroupHandle
     needs_input = True
-    output_type = None
 
     def __init__(self, definition: TaskDefinition, serializers: Any, on_error: str = "fail_fast") -> None:
         _refuse_coalescing(definition)
         self.definition = definition
         self._serializers = serializers
         self._on_error = on_error
+
+    def output_shape(self) -> OutputShape:
+        """A list whose every item is the task's result, or its failure under `collect_all`."""
+        return Each(_result_shape(Value(self.definition.output_type, self.definition.serializer), self._on_error))
+
+    def check_types(self) -> None:
+        """Nothing: a map's items are all its one task's, so there is no
+        adjacency inside it; what feeds it is checked by the enclosing flow."""
 
     def input_requirements(self) -> list[tuple[str, Any, str]]:
         """The (name, type, serializer name) of the task, whose input must be a list of what it takes."""
@@ -405,14 +442,22 @@ class ReduceStep:
         if initial is not UNSET:
             serializers.get(definition.serializer).encode(initial, definition.output_type)
 
-    @property
-    def output_type(self) -> Any:
-        """The reducer's result type, which is what the reduce gives."""
-        return self.definition.output_type
+    def output_shape(self) -> OutputShape:
+        """The reducer's result, which is what the reduce gives."""
+        return Value(self.definition.output_type, self.definition.serializer)
+
+    def check_types(self) -> None:
+        """A reduce joins nothing to check."""
 
     def input_requirements(self) -> list[tuple[str, Any, str]]:
-        """The (name, type, serializer name) of the reducer, whose input must be a list of its items."""
-        return [(self.definition.name, list[self.definition.input_type], self.definition.serializer)]
+        """The (name, type, serializer name) of the reducer, whose input must be
+        a list of its items. Without an `initial` the first item starts the
+        fold as the previous result, so the items must also fit that."""
+        name, serializer = self.definition.name, self.definition.serializer
+        required = [(name, list[self.definition.input_type], serializer)]
+        if self._initial is UNSET:
+            required.append((name, list[self.definition.reducer.previous_type], serializer))
+        return required
 
     def definitions(self) -> list[TaskDefinition]:
         return [self.definition]
@@ -453,7 +498,8 @@ class ReduceStep:
     def _reducer(self, session: Session) -> tuple:
         definition = self.definition
         settings = session.submission_settings(definition)
-        return ("task", definition.name, definition.version, settings, None, [])
+        version = session.schemas.version_of(definition.input_type)
+        return ("task", definition.name, version, settings, None, [])
 
     def _described_options(self, session: Session) -> dict[str, Any]:
         definition = self.definition
@@ -483,10 +529,68 @@ def _steps(kind: str, steps: tuple[Any, ...]) -> list[Any]:
     return converted
 
 
-def _fits(produced: Any, wanted: Any) -> bool:
-    if produced == wanted:
-        return True
-    return isinstance(produced, type) and isinstance(wanted, type) and issubclass(produced, wanted)
+def _result_shape(shape: OutputShape, on_error: str) -> OutputShape:
+    """`shape`, or under `collect_all` either it or the failure in its place."""
+    if on_error != "collect_all":
+        return shape
+    return Either((shape, Value(TaskFailure, "")))
+
+
+def _type_text(annotation: Any) -> str:
+    """A type as a reader writes it: `Greeting`, `list[Greeting | TaskFailure]`."""
+    if annotation is type(None):
+        return "None"
+    origin = typing.get_origin(annotation)
+    if origin is None:
+        return annotation.__name__ if isinstance(annotation, type) else repr(annotation)
+    arguments = typing.get_args(annotation)
+    if origin in (typing.Union, types.UnionType):
+        return " | ".join(_type_text(argument) for argument in arguments)
+    return f"{getattr(origin, '__name__', repr(origin))}[{', '.join(_type_text(a) for a in arguments)}]"
+
+
+def _shape_text(shape: OutputShape) -> str:
+    """A shape as the type of what it gives the next step."""
+    match shape:
+        case Value(value_type, _):
+            return _type_text(value_type)
+        case Items(entries):
+            return f"list[{_union_text(entries)}]"
+        case Each(item):
+            return f"list[{_shape_text(item)}]"
+        case Either(options):
+            return _union_text(options)
+        case _:
+            return "an unknown type"
+
+
+def _union_text(shapes: tuple[OutputShape, ...]) -> str:
+    texts = dict.fromkeys(_shape_text(shape) for shape in shapes)
+    return " | ".join(texts)
+
+
+def _describe(step: Any) -> str:
+    """The tasks of a step as the caller wrote it: `to_receipt`, `group(shout, to_receipt)`."""
+    if isinstance(step, Flow):
+        return f"flow({', '.join(_describe(stage) for stage in step.stages)})"
+    if isinstance(step, Group):
+        return f"group({', '.join(_describe(member) for member in step.members)})"
+    if isinstance(step, MapStep):
+        return f"{step.definition.name}.map"
+    return step.definition.name
+
+
+def _check_adjacent(before: Any, after: Any) -> None:
+    """Raises `TypeError` unless what `before` gives fits every task of `after`
+    that takes it."""
+    shape = before.output_shape()
+    serializers = process_serializers()
+    for name, wanted, serializer in after.input_requirements():
+        if schemas.fits(shape, wanted, serializer, serializers) is False:
+            raise TypeError(
+                f"{_describe(before)} gives {_shape_text(shape)}, "
+                f"which {name} cannot take as its input {_type_text(wanted)}"
+            )
 
 
 def flow(*stages: Any) -> Flow:
@@ -497,9 +601,9 @@ def flow(*stages: Any) -> Flow:
     list).
 
     A stage that is fully bound ignores the output before it. Raises
-    `TypeError` for a stage that is not a step, `ValueError` for no stages,
-    and `TaskDefinitionError` if a task's output type does not fit the next
-    task's input.
+    `TypeError` for a stage that is not a step or whose output does not fit
+    the input of the stage after it (a task's by its type, a group's or
+    flow's by the types of its entries), and `ValueError` for no stages.
     """
     if not stages:
         raise ValueError("a flow needs at least one stage")
@@ -510,17 +614,9 @@ def flow(*stages: Any) -> Flow:
             f"give it its items with {steps[0].definition.name}.reduce(items), "
             "or put it after a stage that returns a list"
         )
-    for before, after in zip(steps, steps[1:]):
-        produced = before.output_type
-        if produced is None:
-            continue  # a group or flow gives a list whose members are not checked
-        for name, wanted, _ in after.input_requirements():
-            if not _fits(produced, wanted):
-                raise TaskDefinitionError(
-                    f"{before.definition.name} returns {produced!r}, "
-                    f"which {name} cannot take as its input {wanted!r}"
-                )
-    return Flow(steps)
+    built = Flow(steps)
+    built.check_types()
+    return built
 
 
 def group(*members: Any, on_error: str = "fail_fast") -> Group:
@@ -531,11 +627,15 @@ def group(*members: Any, on_error: str = "fail_fast") -> Group:
     `asyncio.gather`: the group is then failed and, like `gather`, the other
     members are left to finish. `"collect_all"` returns a list in which a
     failed member's entry is its error. Cancelling a group cancels every
-    member. Raises `ValueError` for no members or an unknown policy.
+    member. Raises `ValueError` for no members or an unknown policy, and
+    `TypeError` for a member that is not a step or holds stages that do not
+    fit together.
     """
     if not members:
         raise ValueError("a group needs at least one member")
-    return Group(_steps("group", members), _policy(on_error))
+    built = Group(_steps("group", members), _policy(on_error))
+    built.check_types()
+    return built
 
 
 STEP_TYPES = (BoundTask, Flow, Group)

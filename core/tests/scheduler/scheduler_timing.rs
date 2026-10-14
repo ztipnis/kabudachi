@@ -151,7 +151,7 @@ fn expiry_is_only_about_starting() {
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
     fixture
         .scheduler
-        .report_started(&worker(), &claim.task_run_id)
+        .report_started(&worker(), &claim.task_run_id, None)
         .unwrap();
     fixture
         .scheduler
@@ -253,7 +253,7 @@ fn finished_task(fixture: &mut Fixture) -> TaskId {
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
     fixture
         .scheduler
-        .report_started(&worker(), &claim.task_run_id)
+        .report_started(&worker(), &claim.task_run_id, None)
         .unwrap();
     fixture
         .scheduler
@@ -283,7 +283,8 @@ fn a_scheduler_that_does_not_lead_still_forgets_finished_tasks_on_time() {
         CaughtUp {
             queued: 0,
             expired: 0,
-            forgotten: 1
+            forgotten: 1,
+            migration_failed: 0,
         }
     );
     assert!(fixture.scheduler.runs_of(&task).is_empty());

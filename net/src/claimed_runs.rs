@@ -8,8 +8,8 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::ids::TaskRunId;
-use kabudachi_core::protocol::messages::Claim as WireClaim;
+use kabudachi_core::protocol::ids::{TaskId, TaskRunId};
+use kabudachi_core::protocol::messages::{Claim as WireClaim, TaskIds as _};
 use kabudachi_core::reconcile::{ReportedRun, ReportedState};
 use kabudachi_core::scheduler::composite::Step;
 use kabudachi_core::scheduler::{Claim, MAX_FAILURE_MESSAGE_BYTES};
@@ -38,6 +38,9 @@ pub struct ClaimedRun {
     /// The claim as the leader granted it.
     pub claim: WireClaim,
     pub state: HeldRun,
+    /// The version of its input the run executes, once it reported starting
+    /// with one (it migrated the input); a new leader is told it.
+    pub execution_version: Option<u32>,
 }
 
 /// Shared by a `Net` and whoever reads it; cheap to clone.
@@ -110,6 +113,7 @@ impl ClaimedRuns {
                 claim: Claim { chain: Vec::new(), ..claim },
                 state,
                 continuation,
+                execution_version: held.execution_version,
             };
             if !take(run) {
                 return;
@@ -135,9 +139,28 @@ impl ClaimedRuns {
                 ClaimedRun {
                     claim,
                     state: HeldRun::Claimed,
+                    execution_version: None,
                 },
             );
         }
+    }
+
+    /// Notes that `run` began executing its input at `version`, if it is
+    /// still held.
+    pub(crate) fn set_execution_version(&self, run: &TaskRunId, version: u32) {
+        if let Some(held) = self.runs().get_mut(run) {
+            held.execution_version = Some(version);
+        }
+    }
+
+    /// The run this worker claimed for `task` and has not started, if it
+    /// holds one.
+    pub(crate) fn claimed_run_of(&self, task: &TaskId) -> Option<TaskRunId> {
+        self.runs()
+            .iter()
+            .filter(|(_, held)| held.state == HeldRun::Claimed)
+            .find(|(_, held)| held.claim.task.as_ref().is_some_and(|claimed| claimed.task_id() == *task))
+            .map(|(run, _)| run.clone())
     }
 
     /// Notes what this worker did to `run`, if it still holds it. A run
