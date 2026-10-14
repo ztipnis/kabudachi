@@ -36,9 +36,10 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelTask, CompactionApplied, PlaceRecords, PlacedKey, RecordPlacements, ReportCompacted, ReportCompleted,
-    ReportFailed, ReportLost, ReportStarted, StartAccepted, SubmitAccepted, TaskReject, TaskRejectReason,
-    TaskRequest, TaskResponse, task_request, task_response,
+    CancelTask, CompactionApplied, PlaceRecords, PlacedKey, RecordPlacements, ReportCompacted,
+    ReportCompleted, ReportFailed, ReportLost, ReportStarted, StartAccepted, SubmitAccepted,
+    SubmitTask, TaskReject, TaskRejectReason, TaskRequest, TaskResponse, task_request,
+    task_response,
 };
 use kabudachi_core::protocol::ids::IdGenerator;
 use kabudachi_core::scheduler::{Completion, Observer, Scheduler, Submitted};
@@ -516,60 +517,13 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
 ) -> TaskResponse {
     use task_request::Request;
     let result = match request {
-        Request::Submit(task) => match wire::submitted(task, clock) {
-            Ok(submitted) => scheduler
-                .submit_minted(submitted)
-                .map(|task_id| {
-                    task_response::Result::Submitted(SubmitAccepted {
-                        task_id: Some(task_id.into()),
-                    })
-                })
-                .map_err(wire::submit_reject),
-            Err(Malformed) => Err(TaskRejectReason::TaskRejectMalformed),
-        },
-        Request::Started(report) => run_id(report.task_run_id.as_ref()).and_then(|run| {
-            scheduler
-                .report_started(from, &run)
-                .map(|()| task_response::Result::Started(StartAccepted {}))
-                .map_err(wire::report_reject)
-        }),
-        Request::Completed(report) => run_id(report.task_run_id.as_ref()).and_then(|run| {
-            let digest = wire::digest(report.result_digest.as_ref())
-                .map_err(|Malformed| TaskRejectReason::TaskRejectMalformed)?;
-            scheduler
-                .complete(from, &run, digest, Completion::Final)
-                .map(|certification| task_response::Result::Certified(wire::certified(certification)))
-                .map_err(wire::report_reject)
-        }),
-        Request::Compacted(report) => run_id(report.task_run_id.as_ref()).and_then(|run| {
-            scheduler
-                .complete_compaction(from, &run, report.folded_payload.clone())
-                .map(|compacted| {
-                    task_response::Result::Compaction(CompactionApplied {
-                        applied: compacted.applied,
-                    })
-                })
-                .map_err(wire::report_reject)
-        }),
-        Request::Failed(report) => run_id(report.task_run_id.as_ref()).and_then(|run| {
-            scheduler
-                .fail(from, &run, report.failure_kind.clone())
-                .map(|failure| task_response::Result::Failed(wire::failed(failure)))
-                .map_err(wire::report_reject)
-        }),
-        Request::Lost(report) => run_id(report.task_run_id.as_ref()).and_then(|run| {
-            scheduler
-                .report_lost(from, &run)
-                .map(|lost| task_response::Result::Lost(wire::lost(lost)))
-                .map_err(wire::report_reject)
-        }),
-        Request::Cancel(cancel) => match cancel.task_id.clone() {
-            Some(task) => scheduler
-                .cancel(&TaskId::from(task))
-                .map(|cancellation| task_response::Result::Cancelled(wire::cancel_answer(cancellation)))
-                .map_err(wire::cancel_reject),
-            None => Err(TaskRejectReason::TaskRejectMalformed),
-        },
+        Request::Submit(task) => submit(scheduler, task, clock),
+        Request::Started(report) => started(scheduler, from, report),
+        Request::Completed(report) => completed(scheduler, from, report),
+        Request::Compacted(report) => compacted(scheduler, from, report),
+        Request::Failed(report) => failed(scheduler, from, report),
+        Request::Lost(report) => lost(scheduler, from, report),
+        Request::Cancel(request) => cancel(scheduler, request),
         // Where records go is the driver's to say: it alone knows the voters.
         Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
     };
@@ -578,6 +532,106 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
             result: Some(result),
         },
         Err(reason) => wire::reject(reason),
+    }
+}
+
+/// What the leader decided of one request: the answer, or why it refuses.
+type Answered = Result<task_response::Result, TaskRejectReason>;
+
+fn submit<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    task: &SubmitTask,
+    clock: &impl Clock,
+) -> Answered {
+    let Ok(submitted) = wire::submitted(task, clock) else {
+        return Err(TaskRejectReason::TaskRejectMalformed);
+    };
+    scheduler
+        .submit_minted(submitted)
+        .map(|task_id| {
+            task_response::Result::Submitted(SubmitAccepted {
+                task_id: Some(task_id.into()),
+            })
+        })
+        .map_err(wire::submit_reject)
+}
+
+fn started<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    from: &WorkerId,
+    report: &ReportStarted,
+) -> Answered {
+    let run = run_id(report.task_run_id.as_ref())?;
+    scheduler
+        .report_started(from, &run)
+        .map(|()| task_response::Result::Started(StartAccepted {}))
+        .map_err(wire::report_reject)
+}
+
+fn completed<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    from: &WorkerId,
+    report: &ReportCompleted,
+) -> Answered {
+    let run = run_id(report.task_run_id.as_ref())?;
+    let digest = wire::digest(report.result_digest.as_ref())
+        .map_err(|Malformed| TaskRejectReason::TaskRejectMalformed)?;
+    scheduler
+        .complete(from, &run, digest, Completion::Final)
+        .map(|certification| task_response::Result::Certified(wire::certified(certification)))
+        .map_err(wire::report_reject)
+}
+
+fn compacted<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    from: &WorkerId,
+    report: &ReportCompacted,
+) -> Answered {
+    let run = run_id(report.task_run_id.as_ref())?;
+    scheduler
+        .complete_compaction(from, &run, report.folded_payload.clone())
+        .map(|compacted| {
+            task_response::Result::Compaction(CompactionApplied {
+                applied: compacted.applied,
+            })
+        })
+        .map_err(wire::report_reject)
+}
+
+fn failed<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    from: &WorkerId,
+    report: &ReportFailed,
+) -> Answered {
+    let run = run_id(report.task_run_id.as_ref())?;
+    scheduler
+        .fail(from, &run, report.failure_kind.clone())
+        .map(|failure| task_response::Result::Failed(wire::failed(failure)))
+        .map_err(wire::report_reject)
+}
+
+fn lost<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    from: &WorkerId,
+    report: &ReportLost,
+) -> Answered {
+    let run = run_id(report.task_run_id.as_ref())?;
+    scheduler
+        .report_lost(from, &run)
+        .map(|lost| task_response::Result::Lost(wire::lost(lost)))
+        .map_err(wire::report_reject)
+}
+
+fn cancel<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    cancel: &CancelTask,
+) -> Answered {
+    match cancel.task_id.clone() {
+        Some(task) => scheduler
+            .cancel(&TaskId::from(task))
+            .map(|cancellation| task_response::Result::Cancelled(wire::cancel_answer(cancellation)))
+            .map_err(wire::cancel_reject),
+        None => Err(TaskRejectReason::TaskRejectMalformed),
     }
 }
 

@@ -152,15 +152,17 @@
 //! of its own.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::coordination_authority::{
-    LeaderHint, LineageSource, RecoveryEpoch, ShardRecord, Uuid7Lineages,
+    AuthorityError, LeaderHint, LineageSource, LiveRegistrations, RecoveryEpoch, ShardRecord,
+    Uuid7Lineages,
 };
 use kabudachi_core::election::{AuthorityReply, AuthorityRequest, Entry, JoinFloor};
 use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
 use kabudachi_core::protocol::messages::{JoinResponse, JoinResponseIds};
-use kabudachi_core::time::{Clock, Instant};
+use kabudachi_core::time::{Clock, Duration, Instant};
 use libp2p::Multiaddr;
 
 use crate::authority::AuthorityClient;
@@ -268,8 +270,7 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
     retry_interval: StdDuration,
     seed_rounds: u32,
 ) -> Entry {
-    let seed_rounds = seed_rounds.max(1);
-    let mut silent_rounds: u32 = 0;
+    let mut silence = SeedSilence::new(seeds, seed_rounds);
     let mut search = SearchRounds::for_bootstrap(name, my_id.clone(), seeds.to_vec());
     // The incarnation a founding against an empty name would create.
     let candidate = authority
@@ -291,67 +292,153 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
             return Entry::Joining(pointer);
         }
 
-        let mut pause = retry_interval;
-        match authority.as_deref_mut() {
-            None if !search.shard_exists() => {
-                silent_rounds += 1;
-                if seeds.is_empty() || silent_rounds >= seed_rounds {
-                    // With no authority, silence is the only evidence that no
-                    // shard exists, and a slow seed is silent too. Founding
-                    // after a bounded number of rounds keeps a worker whose
-                    // seeds are really gone from waiting for ever, at the
-                    // cost that a seed that was only slow now leads a second
-                    // shard beside this one. Nothing joins the two yet: that
-                    // needs shard merging, run when the two sides reach each
-                    // other again.
-                    return Entry::Founding {
-                        shard_id: candidate.clone(),
-                        recovery_epoch: RecoveryEpoch::founding(0, lineages),
-                        registered_at: None,
-                    };
-                }
-                search.log(WaitReason::SeedsSilent {
-                    rounds: silent_rounds,
-                    bound: seed_rounds,
-                });
-                // Each silent round waits twice as long as the last, so a
-                // seed that is slow to start gets longer to answer.
-                pause = retry_interval.saturating_mul(1 << (silent_rounds - 1).min(16));
-            }
-            None => {}
-            Some(calls) => {
-                match consult_authority(
-                    calls,
-                    port,
-                    lineages,
-                    &mut search,
-                    clock,
-                    my_id,
-                    &candidate,
-                    &mut record_seen,
-                    retry_interval,
-                )
-                .await
-                {
-                    AuthorityRound::Joined(pointer) => return Entry::Joining(pointer),
-                    AuthorityRound::OwnershipWon {
-                        shard_id,
-                        recovery_epoch,
-                        registered_at,
-                    } => {
-                        return Entry::Founding {
-                            shard_id,
-                            recovery_epoch,
-                            registered_at: Some(registered_at),
-                        };
-                    }
-                    AuthorityRound::Wait => {}
-                }
-            }
-        }
+        let pause = match authority_round(
+            authority.as_deref_mut(),
+            port,
+            lineages,
+            &mut silence,
+            &mut search,
+            clock,
+            my_id,
+            &candidate,
+            &mut record_seen,
+            retry_interval,
+        )
+        .await
+        {
+            ControlFlow::Break(entry) => return entry,
+            ControlFlow::Continue(pause) => pause,
+        };
 
         search.end_round();
         tokio::time::sleep(pause).await;
+    }
+}
+
+/// What the cascade does after the seeds stayed silent: with no authority,
+/// found alone once the seeds have been silent long enough (`Break`) or wait
+/// out a longer pause (`Continue`); with one, consult it. `Continue` carries
+/// how long to pause before the next round.
+#[allow(clippy::too_many_arguments)]
+async fn authority_round<C: Clock, P: AskWhoLeads>(
+    authority: Option<&mut AuthorityClient>,
+    port: &mut P,
+    lineages: &mut impl LineageSource,
+    silence: &mut SeedSilence,
+    search: &mut SearchRounds,
+    clock: &C,
+    my_id: &WorkerId,
+    candidate: &ShardId,
+    record_seen: &mut Option<ShardId>,
+    retry_interval: StdDuration,
+) -> ControlFlow<Entry, StdDuration> {
+    match authority {
+        None if !search.shard_exists() => match silence.one_more(search, retry_interval) {
+            Some(longer) => ControlFlow::Continue(longer),
+            None => ControlFlow::Break(founding_alone(candidate, lineages)),
+        },
+        None => ControlFlow::Continue(retry_interval),
+        Some(calls) => {
+            let round = consult_authority(
+                calls,
+                port,
+                lineages,
+                search,
+                clock,
+                my_id,
+                candidate,
+                record_seen,
+                retry_interval,
+            )
+            .await;
+            match round.entry() {
+                Some(entry) => ControlFlow::Break(entry),
+                None => ControlFlow::Continue(retry_interval),
+            }
+        }
+    }
+}
+
+/// How many full rounds the seeds have been silent, for a worker with no
+/// authority, and how many it waits before it founds alone.
+struct SeedSilence {
+    rounds: u32,
+    bound: u32,
+    no_seeds: bool,
+}
+
+impl SeedSilence {
+    fn new(seeds: &[Multiaddr], seed_rounds: u32) -> Self {
+        SeedSilence {
+            rounds: 0,
+            bound: seed_rounds.max(1),
+            no_seeds: seeds.is_empty(),
+        }
+    }
+
+    /// One more silent round. `None` once the worker should found alone:
+    /// with no authority, silence is the only evidence that no shard
+    /// exists, and a slow seed is silent too. Founding after a bounded
+    /// number of rounds keeps a worker whose seeds are really gone from
+    /// waiting for ever, at the cost that a seed that was only slow now
+    /// leads a second shard beside this one. Nothing joins the two yet:
+    /// that needs shard merging, run when the two sides reach each other
+    /// again. Otherwise logs the wait and returns the pause before the next
+    /// round: each silent round waits twice as long as the last, so a seed
+    /// that is slow to start gets longer to answer.
+    fn one_more(
+        &mut self,
+        search: &mut SearchRounds,
+        retry_interval: StdDuration,
+    ) -> Option<StdDuration> {
+        self.rounds += 1;
+        if self.no_seeds || self.rounds >= self.bound {
+            return None;
+        }
+        search.log(WaitReason::SeedsSilent {
+            rounds: self.rounds,
+            bound: self.bound,
+        });
+        Some(retry_interval.saturating_mul(1 << (self.rounds - 1).min(16)))
+    }
+}
+
+/// Founding the shard at epoch 0 with no registration, as a worker with no
+/// authority does.
+fn founding_alone(candidate: &ShardId, lineages: &mut impl LineageSource) -> Entry {
+    Entry::Founding {
+        shard_id: candidate.clone(),
+        recovery_epoch: RecoveryEpoch::founding(0, lineages),
+        registered_at: None,
+    }
+}
+
+impl AuthorityRound {
+    /// The round that won ownership of the shard `calls` serves.
+    fn won(calls: &AuthorityClient, recovery_epoch: RecoveryEpoch, registered_at: Instant) -> Self {
+        AuthorityRound::OwnershipWon {
+            shard_id: calls.shard_id().clone(),
+            recovery_epoch,
+            registered_at,
+        }
+    }
+
+    /// How the worker enters its shard after this round, if the round
+    /// decided it.
+    fn entry(self) -> Option<Entry> {
+        match self {
+            AuthorityRound::Joined(pointer) => Some(Entry::Joining(pointer)),
+            AuthorityRound::OwnershipWon {
+                shard_id,
+                recovery_epoch,
+                registered_at,
+            } => Some(Entry::Founding {
+                shard_id,
+                recovery_epoch,
+                registered_at: Some(registered_at),
+            }),
+            AuthorityRound::Wait => None,
+        }
     }
 }
 
@@ -436,61 +523,89 @@ async fn consult_authority<C: Clock, P: AskWhoLeads>(
     loop {
         let within = matches!(stage, Stage::ReadingShard).then_some(retry_interval);
         let Some(reply) = calls.next_reply(within).await else {
-            search.log(WaitReason::AuthorityNotAnswering);
-            return AuthorityRound::Wait;
+            return wait_round(search, Some(WaitReason::AuthorityNotAnswering));
         };
-        if let (Stage::ReadingShard, AuthorityReply::RecoveryEpoch { result: Ok(held), .. }) =
-            (&stage, &reply)
-        {
-            *record_seen = held.as_ref().map(|record| record.shard_id.clone());
-        }
-        match decide_round(stage.clone(), reply, my_id, candidate, search.shard_exists(), lineages) {
+        note_record_read(&stage, &reply, record_seen);
+        match decide_round(
+            stage.clone(),
+            reply,
+            my_id,
+            candidate,
+            search.shard_exists(),
+            lineages,
+        ) {
             Decision::Ask {
                 request,
                 then,
                 serve,
             } => {
-                if let Some(shard_id) = serve {
-                    calls.serve(shard_id);
-                }
-                calls.ask(request, clock.now());
+                ask_next(calls, request, serve, clock);
                 stage = then;
             }
-            Decision::AskPeers {
-                hinted,
-                listed,
-                record,
-            } => {
-                let addresses = search.to_ask(hinted.as_ref(), &listed);
-                let found = of_shard(
-                    port.ask(&addresses, JoinFloor::none()).await,
-                    &candidate.name(),
-                    record.as_ref(),
-                );
-                return match search.heard_from_listed(found) {
-                    Some(pointer) => AuthorityRound::Joined(pointer),
-                    None => AuthorityRound::Wait,
-                };
+            Decision::AskPeers(peers) => {
+                return ask_peers(port, search, peers, &candidate.name()).await;
             }
             Decision::OwnershipWon {
                 recovery_epoch,
                 registered_at,
-            } => {
-                return AuthorityRound::OwnershipWon {
-                    shard_id: calls.shard_id().clone(),
-                    recovery_epoch,
-                    registered_at,
-                };
-            }
-            Decision::Wait(reason) => {
-                if let Some(reason) = reason {
-                    search.log(reason);
-                }
-                return AuthorityRound::Wait;
-            }
+            } => return AuthorityRound::won(calls, recovery_epoch, registered_at),
+            Decision::Wait(reason) => return wait_round(search, reason),
             Decision::Ignore => {}
         }
     }
+}
+
+/// Notes the incarnation the round's first read found under the shard's
+/// name, if it found one: the seeds' leaders must be of it too.
+fn note_record_read(stage: &Stage, reply: &AuthorityReply, record_seen: &mut Option<ShardId>) {
+    if let (
+        Stage::ReadingShard,
+        AuthorityReply::RecoveryEpoch {
+            result: Ok(held), ..
+        },
+    ) = (stage, reply)
+    {
+        *record_seen = held.as_ref().map(|record| record.shard_id.clone());
+    }
+}
+
+fn ask_next<C: Clock>(
+    calls: &mut AuthorityClient,
+    request: AuthorityRequest,
+    serve: Option<ShardId>,
+    clock: &C,
+) {
+    if let Some(shard_id) = serve {
+        calls.serve(shard_id);
+    }
+    calls.ask(request, clock.now());
+}
+
+/// Asks the hinted leader, then the listed workers, who leads: joined if
+/// one points at a leader of this shard that this worker reaches.
+async fn ask_peers<P: AskWhoLeads>(
+    port: &mut P,
+    search: &mut SearchRounds,
+    peers: PeersToAsk,
+    name: &ShardName,
+) -> AuthorityRound {
+    let addresses = search.to_ask(peers.hinted.as_ref(), &peers.listed);
+    let found = of_shard(
+        port.ask(&addresses, JoinFloor::none()).await,
+        name,
+        peers.record.as_ref(),
+    );
+    match search.heard_from_listed(found) {
+        Some(pointer) => AuthorityRound::Joined(pointer),
+        None => AuthorityRound::Wait,
+    }
+}
+
+fn wait_round(search: &mut SearchRounds, reason: Option<WaitReason>) -> AuthorityRound {
+    if let Some(reason) = reason {
+        search.log(reason);
+    }
+    AuthorityRound::Wait
 }
 
 /// Which reply a round's consultation of the authority waits for.
@@ -528,13 +643,7 @@ pub(crate) enum Decision {
     },
     /// Ask the hinted leader, if any, and then these registered workers (the
     /// hinted one among them or not), who leads.
-    AskPeers {
-        hinted: Option<LeaderHint>,
-        listed: BTreeMap<WorkerId, String>,
-        /// The incarnation the authority's record names, if it holds one: a
-        /// leader of any other is not this worker's to join.
-        record: Option<ShardId>,
-    },
+    AskPeers(PeersToAsk),
     /// This worker won the shard's record (see
     /// [`AuthorityRound::OwnershipWon`]); the incarnation is the one the
     /// client serves.
@@ -547,6 +656,16 @@ pub(crate) enum Decision {
     Wait(Option<WaitReason>),
     /// The reply answers a call the stage did not make: it changes nothing.
     Ignore,
+}
+
+/// Whom a round asks who leads, once the authority has been read.
+#[derive(Debug)]
+pub(crate) struct PeersToAsk {
+    pub(crate) hinted: Option<LeaderHint>,
+    pub(crate) listed: BTreeMap<WorkerId, String>,
+    /// The incarnation the authority's record names, if it holds one: a
+    /// leader of any other is not this worker's to join.
+    pub(crate) record: Option<ShardId>,
 }
 
 /// The cascade's decision on `reply`, the authority's answer to the call it
@@ -579,115 +698,167 @@ pub(crate) fn decide_round(
     lineages: &mut impl LineageSource,
 ) -> Decision {
     match (stage, reply) {
-        (Stage::ReadingShard, AuthorityReply::RecoveryEpoch { result, .. }) => match result {
-            Err(error) => Decision::Wait(Some(WaitReason::AuthorityUnreachable(error))),
-            // Nothing under the name: the registrations that count are the
-            // ones tagged with the id this worker would found.
-            Ok(None) => Decision::Ask {
-                request: AuthorityRequest::ReadLiveRegistrations,
-                then: Stage::ReadingRegistrations {
-                    record: None,
-                    hint: None,
-                },
-                serve: Some(candidate.clone()),
-            },
-            Ok(Some(record)) => Decision::Ask {
-                request: AuthorityRequest::ReadLeaderHint,
-                serve: Some(record.shard_id.clone()),
-                then: Stage::ReadingHint { record },
-            },
-        },
+        (Stage::ReadingShard, AuthorityReply::RecoveryEpoch { result, .. }) => {
+            decide_record_read(result, candidate)
+        }
         (Stage::ReadingHint { record }, AuthorityReply::LeaderHint { result, .. }) => {
-            // A hint only says whom to ask first: one that cannot be read, or
-            // is of another incarnation or an older epoch, is passed over.
-            let hint = result.ok().flatten().filter(|hint| {
-                hint.shard_id == record.shard_id && hint.recovery_epoch >= record.recovery_epoch
-            });
-            Decision::Ask {
-                request: AuthorityRequest::ReadLiveRegistrations,
-                then: Stage::ReadingRegistrations {
-                    record: Some(record),
-                    hint,
-                },
-                serve: None,
-            }
+            decide_hint_read(record, result)
         }
         (
             Stage::ReadingRegistrations { record, hint },
             AuthorityReply::LiveRegistrations { result, .. },
-        ) => {
-            let registrations = match result {
-                Ok(registrations) => registrations,
-                Err(error) => return Decision::Wait(Some(WaitReason::AuthorityUnreachable(error))),
-            };
-            let hinted = hint.filter(|hint| hint.leader != *my_id);
-            let listed = others_listed(&registrations, my_id);
-            // A hint is asked even while the authority warms up: that is how
-            // a worker joins a leader that republished after a flush.
-            if hinted.is_some() || !listed.is_empty() {
-                return Decision::AskPeers {
-                    hinted,
-                    listed,
-                    record: record.map(|record| record.shard_id),
-                };
-            }
-            if shard_exists {
-                return Decision::Wait(None);
-            }
-            // Until warm-up ends, an empty list may only mean the authority
-            // has not heard from the shard's workers yet.
-            if registrations.authoritative_count().is_none() {
-                return Decision::Wait(Some(WaitReason::AuthorityWarmingUp));
-            }
-            Decision::Ask {
-                request: AuthorityRequest::Register,
-                then: Stage::Registering { record },
-                serve: None,
-            }
-        }
-        (Stage::Registering { record }, AuthorityReply::Registered { sent_at, result, .. }) => {
-            if let Err(error) = result {
-                return Decision::Wait(Some(WaitReason::AuthorityUnreachable(error)));
-            }
-            match record {
-                None => Decision::Ask {
-                    request: AuthorityRequest::SwapRecoveryEpoch {
-                        expected: None,
-                        new: RecoveryEpoch::founding(0, lineages),
-                    },
-                    then: Stage::Creating {
-                        registered_at: sent_at,
-                    },
-                    serve: None,
-                },
-                Some(record) => match record.recovery_epoch.number.checked_add(1) {
-                    Some(next) => Decision::Ask {
-                        request: AuthorityRequest::SwapRecoveryEpoch {
-                            expected: Some(record.recovery_epoch),
-                            new: RecoveryEpoch::founding(next, lineages),
-                        },
-                        then: Stage::ReFounding {
-                            registered_at: sent_at,
-                        },
-                        serve: None,
-                    },
-                    // No successor epoch exists to re-found at.
-                    None => Decision::Wait(Some(WaitReason::RecoveryEpochExhausted)),
-                },
-            }
-        }
+        ) => decide_registrations_read(record, hint, result, my_id, shard_exists),
+        (
+            Stage::Registering { record },
+            AuthorityReply::Registered {
+                sent_at, result, ..
+            },
+        ) => decide_registered(record, sent_at, result, lineages),
         (
             Stage::Creating { registered_at } | Stage::ReFounding { registered_at },
             AuthorityReply::RecoveryEpochSwapped { new, result, .. },
-        ) => match result {
-            Ok(()) => Decision::OwnershipWon {
-                recovery_epoch: new,
-                registered_at,
-            },
-            // Another worker won between the read and this swap: the next
-            // round reads its record.
-            Err(error) => Decision::Wait(Some(WaitReason::OwnershipFailed(error))),
-        },
+        ) => decide_swapped(new, result, registered_at),
         _ => Decision::Ignore,
+    }
+}
+
+/// The decision on the record the round's first read found under the
+/// shard's name, if it found one.
+fn decide_record_read(
+    result: Result<Option<ShardRecord>, AuthorityError>,
+    candidate: &ShardId,
+) -> Decision {
+    match result {
+        Err(error) => Decision::Wait(Some(WaitReason::AuthorityUnreachable(error))),
+        // Nothing under the name: the registrations that count are the
+        // ones tagged with the id this worker would found.
+        Ok(None) => Decision::Ask {
+            request: AuthorityRequest::ReadLiveRegistrations,
+            then: Stage::ReadingRegistrations {
+                record: None,
+                hint: None,
+            },
+            serve: Some(candidate.clone()),
+        },
+        Ok(Some(record)) => Decision::Ask {
+            request: AuthorityRequest::ReadLeaderHint,
+            serve: Some(record.shard_id.clone()),
+            then: Stage::ReadingHint { record },
+        },
+    }
+}
+
+/// The decision on the leader hint read after `record`.
+fn decide_hint_read(
+    record: ShardRecord,
+    result: Result<Option<LeaderHint>, AuthorityError>,
+) -> Decision {
+    // A hint only says whom to ask first: one that cannot be read, or
+    // is of another incarnation or an older epoch, is passed over.
+    let hint = result.ok().flatten().filter(|hint| {
+        hint.shard_id == record.shard_id && hint.recovery_epoch >= record.recovery_epoch
+    });
+    Decision::Ask {
+        request: AuthorityRequest::ReadLiveRegistrations,
+        then: Stage::ReadingRegistrations {
+            record: Some(record),
+            hint,
+        },
+        serve: None,
+    }
+}
+
+/// The decision on the live registrations: ask the workers they list, or
+/// the hinted leader, who leads; otherwise wait, or register this worker.
+fn decide_registrations_read(
+    record: Option<ShardRecord>,
+    hint: Option<LeaderHint>,
+    result: Result<LiveRegistrations, AuthorityError>,
+    my_id: &WorkerId,
+    shard_exists: bool,
+) -> Decision {
+    let registrations = match result {
+        Ok(registrations) => registrations,
+        Err(error) => return Decision::Wait(Some(WaitReason::AuthorityUnreachable(error))),
+    };
+    let hinted = hint.filter(|hint| hint.leader != *my_id);
+    let listed = others_listed(&registrations, my_id);
+    // A hint is asked even while the authority warms up: that is how
+    // a worker joins a leader that republished after a flush.
+    if hinted.is_some() || !listed.is_empty() {
+        return Decision::AskPeers(PeersToAsk {
+            hinted,
+            listed,
+            record: record.map(|record| record.shard_id),
+        });
+    }
+    if shard_exists {
+        return Decision::Wait(None);
+    }
+    // Until warm-up ends, an empty list may only mean the authority
+    // has not heard from the shard's workers yet.
+    if registrations.authoritative_count().is_none() {
+        return Decision::Wait(Some(WaitReason::AuthorityWarmingUp));
+    }
+    Decision::Ask {
+        request: AuthorityRequest::Register,
+        then: Stage::Registering { record },
+        serve: None,
+    }
+}
+
+/// The decision on this worker's registration: create the candidate's
+/// record, or re-found the one read, one epoch on.
+fn decide_registered(
+    record: Option<ShardRecord>,
+    sent_at: Instant,
+    result: Result<Duration, AuthorityError>,
+    lineages: &mut impl LineageSource,
+) -> Decision {
+    if let Err(error) = result {
+        return Decision::Wait(Some(WaitReason::AuthorityUnreachable(error)));
+    }
+    let Some(record) = record else {
+        return Decision::Ask {
+            request: AuthorityRequest::SwapRecoveryEpoch {
+                expected: None,
+                new: RecoveryEpoch::founding(0, lineages),
+            },
+            then: Stage::Creating {
+                registered_at: sent_at,
+            },
+            serve: None,
+        };
+    };
+    let Some(next) = record.recovery_epoch.number.checked_add(1) else {
+        // No successor epoch exists to re-found at.
+        return Decision::Wait(Some(WaitReason::RecoveryEpochExhausted));
+    };
+    Decision::Ask {
+        request: AuthorityRequest::SwapRecoveryEpoch {
+            expected: Some(record.recovery_epoch),
+            new: RecoveryEpoch::founding(next, lineages),
+        },
+        then: Stage::ReFounding {
+            registered_at: sent_at,
+        },
+        serve: None,
+    }
+}
+
+/// The decision on the swap that created or re-founded the record.
+fn decide_swapped(
+    new: RecoveryEpoch,
+    result: Result<(), AuthorityError>,
+    registered_at: Instant,
+) -> Decision {
+    match result {
+        Ok(()) => Decision::OwnershipWon {
+            recovery_epoch: new,
+            registered_at,
+        },
+        // Another worker won between the read and this swap: the next
+        // round reads its record.
+        Err(error) => Decision::Wait(Some(WaitReason::OwnershipFailed(error))),
     }
 }

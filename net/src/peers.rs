@@ -261,6 +261,19 @@ impl Traffic {
             + self.reconcile_requests_received
             + self.steal_requests_received
     }
+
+    /// Counts one more of `carried`.
+    pub(crate) fn count(&mut self, carried: Carried) {
+        match carried {
+            Carried::Sent => self.messages_sent += 1,
+            Carried::Published => self.messages_published += 1,
+            Carried::JoinRequest => self.join_requests_received += 1,
+            Carried::ClaimRequest => self.claim_requests_received += 1,
+            Carried::TaskRequest => self.task_requests_received += 1,
+            Carried::ReconcileRequest => self.reconcile_requests_received += 1,
+            Carried::StealRequest => self.steal_requests_received += 1,
+        }
+    }
 }
 
 impl std::ops::Sub for Traffic {
@@ -432,80 +445,90 @@ impl Peers {
     /// Takes one observation. The only way the book changes.
     pub(crate) fn observe(&mut self, observation: Observation<'_>, now: Instant) {
         match observation {
-            Observation::ExternalAddress(address) => {
-                self.external = true;
-                self.local_addr.send_replace(Some(address));
-            }
-            Observation::ListeningOn(_) if self.external => {}
-            Observation::ListeningOn(address) => {
-                // A later address replaces the recorded one unless that would
-                // swap a non-loopback address for loopback.
-                self.local_addr.send_modify(|recorded| {
-                    let previous = recorded.take();
-                    *recorded = preferred_address(std::iter::once(address).chain(previous));
-                });
-            }
+            Observation::ExternalAddress(address) => self.set_external_address(address),
+            Observation::ListeningOn(address) => self.listening_on(address),
             Observation::ConnectionOpened {
                 peer,
                 side,
                 address,
-            } => {
-                if self.connected.insert(peer) {
-                    self.redial.reconnected(&peer);
-                }
-                // The two sides of a connection observe different addresses:
-                // only the dialing side's is dialable. Both are recorded,
-                // ranked, so an Identify exchange on this same connection can
-                // supersede either, but neither can displace a better one.
-                let source = match side {
-                    Side::Dialer => AddressSource::DialedAddress,
-                    Side::Listener => AddressSource::InboundRemote,
-                };
-                self.record_address(peer, address, source);
-            }
-            Observation::ConnectionClosed(peer) => {
-                // Judged against the mesh as last observed: by the time gossipsub
-                // reports the drop, it has already taken the peer out of it.
-                if self.connected.remove(&peer)
-                    && self.mesh.contains(&peer)
-                    && let Some(known) = self.addresses.get(&peer)
-                {
-                    self.redial.dropped(peer, known.addr.clone(), now);
-                }
-            }
+            } => self.connection_opened(peer, side, address),
+            Observation::ConnectionClosed(peer) => self.connection_closed(peer, now),
             Observation::Identified {
                 peer,
                 listen_addresses,
-            } => {
-                if let Some(address) = preferred_address(listen_addresses) {
-                    self.record_address(peer, address, AddressSource::Identify);
-                }
-            }
-            Observation::MessageArrived(input) => {
-                self.record_stamped_address(input);
-                self.traffic.messages_received += 1;
-            }
-            Observation::Dialed { address, outcome } => match outcome {
-                Some(peer) => {
-                    self.asked.insert(address, peer);
-                }
-                None => {
-                    self.asked.remove(&address);
-                }
-            },
+            } => self.identified(peer, listen_addresses),
+            Observation::MessageArrived(input) => self.message_arrived(input),
+            Observation::Dialed { address, outcome } => self.dialed(address, outcome),
             Observation::Gossip { mesh, subscribers } => {
                 self.mesh = mesh;
                 self.subscribers = subscribers;
             }
-            Observation::Carried(carried) => match carried {
-                Carried::Sent => self.traffic.messages_sent += 1,
-                Carried::Published => self.traffic.messages_published += 1,
-                Carried::JoinRequest => self.traffic.join_requests_received += 1,
-                Carried::ClaimRequest => self.traffic.claim_requests_received += 1,
-                Carried::TaskRequest => self.traffic.task_requests_received += 1,
-                Carried::ReconcileRequest => self.traffic.reconcile_requests_received += 1,
-                Carried::StealRequest => self.traffic.steal_requests_received += 1,
-            },
+            Observation::Carried(carried) => self.traffic.count(carried),
+        }
+    }
+
+    fn set_external_address(&mut self, address: Multiaddr) {
+        self.external = true;
+        self.local_addr.send_replace(Some(address));
+    }
+
+    fn listening_on(&mut self, address: Multiaddr) {
+        if self.external {
+            return;
+        }
+        // A later address replaces the recorded one unless that would
+        // swap a non-loopback address for loopback.
+        self.local_addr.send_modify(|recorded| {
+            let previous = recorded.take();
+            *recorded = preferred_address(std::iter::once(address).chain(previous));
+        });
+    }
+
+    fn connection_opened(&mut self, peer: PeerId, side: Side, address: Multiaddr) {
+        if self.connected.insert(peer) {
+            self.redial.reconnected(&peer);
+        }
+        // The two sides of a connection observe different addresses:
+        // only the dialing side's is dialable. Both are recorded,
+        // ranked, so an Identify exchange on this same connection can
+        // supersede either, but neither can displace a better one.
+        let source = match side {
+            Side::Dialer => AddressSource::DialedAddress,
+            Side::Listener => AddressSource::InboundRemote,
+        };
+        self.record_address(peer, address, source);
+    }
+
+    fn connection_closed(&mut self, peer: PeerId, now: Instant) {
+        // Judged against the mesh as last observed: by the time gossipsub
+        // reports the drop, it has already taken the peer out of it.
+        if self.connected.remove(&peer)
+            && self.mesh.contains(&peer)
+            && let Some(known) = self.addresses.get(&peer)
+        {
+            self.redial.dropped(peer, known.addr.clone(), now);
+        }
+    }
+
+    fn identified(&mut self, peer: PeerId, listen_addresses: Vec<Multiaddr>) {
+        if let Some(address) = preferred_address(listen_addresses) {
+            self.record_address(peer, address, AddressSource::Identify);
+        }
+    }
+
+    fn message_arrived(&mut self, input: &Input) {
+        self.record_stamped_address(input);
+        self.traffic.messages_received += 1;
+    }
+
+    fn dialed(&mut self, address: Multiaddr, outcome: Option<PeerId>) {
+        match outcome {
+            Some(peer) => {
+                self.asked.insert(address, peer);
+            }
+            None => {
+                self.asked.remove(&address);
+            }
         }
     }
 

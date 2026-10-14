@@ -203,6 +203,14 @@ pub(crate) struct Held {
     pub(crate) abort_by: Option<HostAbort>,
 }
 
+impl Held {
+    /// Whether the executor offers a place to claim into: it is not gone,
+    /// it offered one, and no abort deadline stands.
+    fn offers_room(&self) -> bool {
+        !self.gone && self.credits > 0 && self.abort_by.is_none()
+    }
+}
+
 /// An abort deadline the node reported, with what its clock and this host's
 /// monotonic clock read when it did, so each run's deadline can be turned
 /// into an instant the executor can wait for.
@@ -397,12 +405,17 @@ impl<'n> Executing<'n> {
     /// place is offered, a claim is under way, one found nothing too
     /// recently, or an abort deadline stands. The caller claims them at once.
     pub(crate) fn places_to_claim(&mut self) -> Option<u32> {
-        let held = &mut self.endpoint.held;
-        let busy = self.discovering.is_some() || self.found.is_some() || self.own_claim.is_some();
-        if held.gone || held.credits == 0 || busy || self.next_claim_at.is_some() || held.abort_by.is_some() {
+        if self.claim_under_way()
+            || self.next_claim_at.is_some()
+            || !self.endpoint.held.offers_room()
+        {
             return None;
         }
-        Some(std::mem::take(&mut held.credits))
+        Some(std::mem::take(&mut self.endpoint.held.credits))
+    }
+
+    fn claim_under_way(&self) -> bool {
+        self.discovering.is_some() || self.found.is_some() || self.own_claim.is_some()
     }
 
     /// Claims `places` from `leader`, a remote leader, through discovery

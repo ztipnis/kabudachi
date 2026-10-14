@@ -100,41 +100,69 @@ impl RedisAuthority {
                         read => read?,
                     };
                     let step = body(&view).unwrap_or_else(|error| Step::answer(Err(error)));
-                    let repair = view.repair();
-                    // Even a call with nothing to write ends in EXEC: a nil
-                    // reply says a watched key changed since it was read.
-                    let mut pipe = redis::pipe();
-                    pipe.atomic();
-                    if !repair.is_empty() {
-                        let hset = pipe.cmd("HSET").arg(keys.sentinel());
-                        for (field, value) in &repair {
-                            hset.arg(field).arg(value);
-                        }
-                        hset.ignore();
-                    }
-                    for write in &step.writes {
-                        write.queue(&mut pipe, &keys);
-                    }
-                    // MULTI, each command's QUEUED, then EXEC.
-                    let count = pipe.len() + 2;
-                    let replies = round_trip(connection, &deadline, &pipe, count)?;
-                    match replies.last() {
-                        Some(redis::Value::Nil) => {}
-                        Some(redis::Value::Array(results)) => {
-                            if results
-                                .iter()
-                                .any(|result| matches!(result, redis::Value::ServerError(_)))
-                            {
-                                tracing::warn!("the server refused a command inside a transaction");
-                                return Err(Failure::Server);
-                            }
-                            return Ok(step.answer);
-                        }
-                        _ => return Err(Failure::Corrupt),
+                    if let Some(answer) = commit(connection, &deadline, &keys, &view, step)? {
+                        return Ok(answer);
                     }
                 }
                 Err(Failure::Contended)
             })?
+    }
+}
+
+/// Writes the sentinel's repair `view` asks for and `step`'s writes in one
+/// `MULTI`/`EXEC`, and returns the step's answer once they are applied;
+/// `None` when a watched key changed since `view` was read, for the caller
+/// to read again. Even a call with nothing to write ends in `EXEC`: its
+/// reply is what says whether a watched key changed.
+fn commit<T>(
+    connection: &mut redis::Connection,
+    deadline: &Deadline,
+    keys: &Keys,
+    view: &View,
+    step: Step<T>,
+) -> Result<Option<Result<T, AuthorityError>>, Failure> {
+    let pipe = transaction_pipe(keys, &view.repair(), &step.writes);
+    // MULTI, each command's QUEUED, then EXEC.
+    let count = pipe.len() + 2;
+    let replies = round_trip(connection, deadline, &pipe, count)?;
+    Ok(exec_outcome(&replies)?.then_some(step.answer))
+}
+
+fn transaction_pipe(
+    keys: &Keys,
+    repair: &[(&'static str, String)],
+    writes: &[Write],
+) -> redis::Pipeline {
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+    if !repair.is_empty() {
+        let hset = pipe.cmd("HSET").arg(keys.sentinel());
+        for (field, value) in repair {
+            hset.arg(field).arg(value);
+        }
+        hset.ignore();
+    }
+    for write in writes {
+        write.queue(&mut pipe, keys);
+    }
+    pipe
+}
+
+/// Whether `EXEC` applied the transaction (`false`: a watched key changed,
+/// and nothing was applied), from the replies of its round trip.
+fn exec_outcome(replies: &[redis::Value]) -> Result<bool, Failure> {
+    match replies.last() {
+        Some(redis::Value::Nil) => Ok(false),
+        Some(redis::Value::Array(results))
+            if results
+                .iter()
+                .any(|result| matches!(result, redis::Value::ServerError(_))) =>
+        {
+            tracing::warn!("the server refused a command inside a transaction");
+            Err(Failure::Server)
+        }
+        Some(redis::Value::Array(_)) => Ok(true),
+        _ => Err(Failure::Corrupt),
     }
 }
 

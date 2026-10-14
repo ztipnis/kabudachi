@@ -169,6 +169,33 @@ impl TaskRecordStore {
     }
 }
 
+/// The task record `record` holds, with its task, if it is a well-formed
+/// record stored under its own task's key; refused otherwise (see the
+/// store's doc on refusals).
+fn task_record_under_its_key(record: &kad::Record) -> kad::store::Result<(TaskId, TaskRecord)> {
+    let decoded = TaskRecord::decode(&record.value[..]).map_err(|error| {
+        tracing::debug!(%error, "refusing a value that is not a task record");
+        kad::store::Error::ValueTooLarge
+    })?;
+    match identify(&decoded) {
+        Ok((task, _)) if record_key(&task) == record.key => Ok((task, decoded)),
+        _ => {
+            tracing::debug!("refusing a record that is malformed or stored under another key");
+            Err(kad::store::Error::ValueTooLarge)
+        }
+    }
+}
+
+/// A record with a publisher is a draining worker's hand-off; one without
+/// came from the leader.
+fn origin_of(record: &kad::Record) -> Origin {
+    if record.publisher.is_some() {
+        Origin::HandOff
+    } else {
+        Origin::Leader
+    }
+}
+
 impl kad::store::RecordStore for TaskRecordStore {
     type RecordsIter<'a> = std::vec::IntoIter<Cow<'a, kad::Record>>;
     type ProvidedIter<'a> = std::iter::Empty<Cow<'a, kad::ProviderRecord>>;
@@ -184,26 +211,12 @@ impl kad::store::RecordStore for TaskRecordStore {
             tracing::debug!(bytes = record.value.len(), "refusing a record past the size limit");
             return Err(kad::store::Error::ValueTooLarge);
         }
-        let decoded = match TaskRecord::decode(&record.value[..]) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                tracing::debug!(%error, "refusing a value that is not a task record");
-                return Err(kad::store::Error::ValueTooLarge);
-            }
-        };
-        let task = match identify(&decoded) {
-            Ok((task, _)) if record_key(&task) == record.key => task,
-            _ => {
-                tracing::debug!("refusing a record that is malformed or stored under another key");
-                return Err(kad::store::Error::ValueTooLarge);
-            }
-        };
-        let origin = if record.publisher.is_some() {
-            Origin::HandOff
-        } else {
-            Origin::Leader
-        };
-        match self.held.lock().put_from(decoded, origin, self.held.clock.now()) {
+        let (task, decoded) = task_record_under_its_key(&record)?;
+        match self
+            .held
+            .lock()
+            .put_from(decoded, origin_of(&record), self.held.clock.now())
+        {
             Ok(_) => Ok(()),
             Err(refusal) => {
                 tracing::debug!(task = task.as_str(), %refusal, "refusing a record");

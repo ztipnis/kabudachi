@@ -160,54 +160,57 @@ impl SearchRounds {
         hinted: Option<&LeaderHint>,
         peers: &BTreeMap<WorkerId, String>,
     ) -> Vec<Multiaddr> {
-        let mut first: Vec<Multiaddr> = Vec::new();
-        let mut rest: Vec<Multiaddr> = Vec::new();
-        if let Some(hint) = hinted {
-            match hint.address.parse() {
-                Ok(address) => first.push(address),
-                Err(error) => self.log.log(WaitReason::UnparseableAddress {
-                    worker: hint.leader.clone(),
-                    address: hint.address.clone(),
-                    error: error.to_string(),
-                }),
-            }
-        }
-        let others = peers
-            .iter()
-            .filter(|(worker, _)| hinted.is_none_or(|hint| hint.leader != **worker));
-        for (worker, address) in others {
-            match address.parse() {
-                Ok(address) => rest.push(address),
-                Err(error) => self.log.log(WaitReason::UnparseableAddress {
-                    worker: worker.clone(),
-                    address: address.clone(),
-                    error: error.to_string(),
-                }),
-            }
-        }
-        if first.is_empty() && rest.is_empty() {
-            // No one else listed is not an address problem: stay quiet.
-            if !peers.is_empty() {
-                self.log.log(WaitReason::NoRegisteredAddressParses {
-                    peers: peers.keys().cloned().collect(),
-                });
-            }
-            self.listed.clear();
-            return Vec::new();
-        }
-        self.listed = peers
-            .keys()
-            .cloned()
-            .chain(hinted.map(|hint| hint.leader.clone()))
-            .collect::<BTreeSet<_>>()
+        let first: Vec<Multiaddr> = hinted
+            .and_then(|hint| self.parsed(&hint.leader, &hint.address))
             .into_iter()
             .collect();
+        let mut rest: Vec<Multiaddr> = peers
+            .iter()
+            .filter(|(worker, _)| hinted.is_none_or(|hint| hint.leader != **worker))
+            .filter_map(|(worker, address)| self.parsed(worker, address))
+            .collect();
+        if first.is_empty() && rest.is_empty() {
+            self.nothing_to_ask(peers);
+            return Vec::new();
+        }
+        self.listed = listed_workers(hinted, peers);
+        self.rotate(&mut rest);
+        [first, rest].concat()
+    }
+
+    /// `address` parsed; `None`, logged against `worker`, if it does not
+    /// parse.
+    fn parsed(&mut self, worker: &WorkerId, address: &str) -> Option<Multiaddr> {
+        match address.parse() {
+            Ok(address) => Some(address),
+            Err(error) => {
+                self.log.log(WaitReason::UnparseableAddress {
+                    worker: worker.clone(),
+                    address: address.to_owned(),
+                    error: error.to_string(),
+                });
+                None
+            }
+        }
+    }
+
+    /// No address to ask this round. No one else listed is not an address
+    /// problem, so only a listing none of whose addresses parse is logged.
+    fn nothing_to_ask(&mut self, peers: &BTreeMap<WorkerId, String>) {
+        if !peers.is_empty() {
+            self.log.log(WaitReason::NoRegisteredAddressParses {
+                peers: peers.keys().cloned().collect(),
+            });
+        }
+        self.listed.clear();
+    }
+
+    /// A rejoin starts each round one listed worker further along.
+    fn rotate(&self, rest: &mut [Multiaddr]) {
         if self.mode == Mode::Rejoin && !rest.is_empty() {
             let len = rest.len();
             rest.rotate_left(self.round % len);
         }
-        first.extend(rest);
-        first
     }
 
     /// What an ask of [`Self::to_ask`]'s addresses found: the pointer, if any.
@@ -253,6 +256,20 @@ impl SearchRounds {
         self.log.end_round();
         self.round += 1;
     }
+}
+
+/// Every worker `peers` lists and the hinted leader, once each, in order.
+fn listed_workers(
+    hinted: Option<&LeaderHint>,
+    peers: &BTreeMap<WorkerId, String>,
+) -> Vec<WorkerId> {
+    peers
+        .keys()
+        .cloned()
+        .chain(hinted.map(|hint| hint.leader.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// The workers `registrations` lists other than `my_id`, at their registered
@@ -430,21 +447,14 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
             return;
         }
         let Some(client) = client else {
-            if self.next_round_at.is_some_and(|due| now >= due) {
-                self.next_round_at = None;
-                self.ask_seeds_or_end(now);
-            }
+            self.round_without_listing(now);
             return;
         };
-        if let Some(read) = &mut self.read
-            && let Some(bound) = read.bound
-            && now >= bound
-        {
-            read.bound = None;
+        if self.give_up_overdue_read(now) {
             self.end_round_unanswered(now);
             return;
         }
-        if !self.next_round_at.is_some_and(|due| now >= due) {
+        if !self.round_due(now) {
             return;
         }
         if let Some(read) = &mut self.read {
@@ -453,24 +463,78 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
             self.next_round_at = None;
             return;
         }
-        match client.ask(AuthorityRequest::ReadLiveRegistrations, sent_at) {
-            Some(token) => {
-                self.read = Some(PendingRead {
-                    token,
-                    bound: Some(now + self.retry_interval),
-                });
-                self.next_round_at = None;
-                // Left unasked when the kind is busy: a later round asks again.
-                if self.reads_epoch {
-                    self.ask_epoch(client, sent_at, now);
-                }
-                if self.hint_read.is_none() {
-                    self.hint_read = client.ask(AuthorityRequest::ReadLeaderHint, sent_at);
-                }
-            }
-            // Busy with a call this rejoin did not ask.
-            None => self.end_round_unanswered(now),
+        self.read_listing(client, sent_at, now);
+    }
+
+    fn round_due(&self, now: Instant) -> bool {
+        self.next_round_at.is_some_and(|due| now >= due)
+    }
+
+    /// A due round with no authority client to read a listing from asks the
+    /// seeds alone.
+    fn round_without_listing(&mut self, now: Instant) {
+        if self.round_due(now) {
+            self.next_round_at = None;
+            self.ask_seeds_or_end(now);
         }
+    }
+
+    /// Stops the round's wait on its listing read once the read is past its
+    /// bound; the read stays pending for a later round. Whether it did.
+    fn give_up_overdue_read(&mut self, now: Instant) -> bool {
+        match &mut self.read {
+            Some(read) if read.bound.is_some_and(|bound| now >= bound) => {
+                read.bound = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Starts a round by asking `client` for the listing, and beside it the
+    /// epoch (unless this search skips it) and the leader hint.
+    fn read_listing(
+        &mut self,
+        client: &mut AuthorityClient,
+        sent_at: kabudachi_core::time::Instant,
+        now: Instant,
+    ) {
+        let Some(token) = client.ask(AuthorityRequest::ReadLiveRegistrations, sent_at) else {
+            // Busy with a call this rejoin did not ask.
+            self.end_round_unanswered(now);
+            return;
+        };
+        self.read = Some(PendingRead {
+            token,
+            bound: Some(now + self.retry_interval),
+        });
+        self.next_round_at = None;
+        // Left unasked when the kind is busy: a later round asks again.
+        if self.reads_epoch {
+            self.ask_epoch(client, sent_at, now);
+        }
+        if self.hint_read.is_none() {
+            self.hint_read = client.ask(AuthorityRequest::ReadLeaderHint, sent_at);
+        }
+    }
+
+    /// This search's part of a batch for a node in `state`: a node `Joining`
+    /// on a pointer it took validates it against the authority's epoch, which
+    /// is what confirms it; any other runs its round. Returns the epoch read
+    /// asked since the last call (see [`Self::take_asked_epoch_read`]).
+    pub(crate) fn follow_node(
+        &mut self,
+        state: WorkerState,
+        client: Option<&mut AuthorityClient>,
+        sent_at: kabudachi_core::time::Instant,
+        now: Instant,
+    ) -> Option<ReplyToken> {
+        if state != WorkerState::Joining {
+            self.tick(client, sent_at, now);
+        } else if let Some(client) = client {
+            self.validate(client, sent_at, now);
+        }
+        self.take_asked_epoch_read()
     }
 
     /// For a node `Joining` on a pointer it took: asks `client` for the
@@ -544,36 +608,13 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         floor: JoinFloor,
     ) -> Option<(ReplyToken, ShardRecord)> {
         if reply.token().kind == CallKind::ReadLeaderHint {
-            // The hint read of this rejoin sets the hint; any other (one given
-            // up on) only frees its kind.
-            if self.hint_read == Some(reply.token()) {
-                self.hint_read = None;
-                self.hint = match reply {
-                    AuthorityReply::LeaderHint {
-                        result: Ok(Some(hint)),
-                        ..
-                    } if hint.shard_id == self.shard_id
-                        && hint.leader != self.search.my_id
-                        && floor.epoch().is_none_or(|floor| hint.recovery_epoch >= floor) =>
-                    {
-                        Some(hint)
-                    }
-                    _ => None,
-                };
-            }
+            self.take_hint(reply, floor);
             return None;
         }
         if let Some(read) = self.epoch_read
             && read.token == reply.token()
         {
-            self.epoch_read = None;
-            self.epoch_ask_due = read.bound;
-            return match reply {
-                AuthorityReply::RecoveryEpoch { token, result: Ok(Some(held)), .. } => {
-                    Some((token, held))
-                }
-                _ => None,
-            };
+            return self.epoch_answered(read, reply);
         }
         if reply.token().kind == CallKind::ReadRecoveryEpoch {
             // A read this rejoin gave up on, or the cascade's: it frees its
@@ -581,47 +622,97 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
             self.epoch_ask_due = now;
             return None;
         }
+        self.listing_answered(reply, now, floor);
+        None
+    }
+
+    /// The hint read of this rejoin sets the hint; any other (one given up
+    /// on) only frees its kind.
+    fn take_hint(&mut self, reply: AuthorityReply, floor: JoinFloor) {
+        if self.hint_read != Some(reply.token()) {
+            return;
+        }
+        self.hint_read = None;
+        self.hint = match reply {
+            AuthorityReply::LeaderHint {
+                result: Ok(Some(hint)),
+                ..
+            } if self.hint_is_current(&hint, floor) => Some(hint),
+            _ => None,
+        };
+    }
+
+    /// Whether `hint` names a leader of this shard's incarnation, other than
+    /// this worker, at no older epoch than `floor`.
+    fn hint_is_current(&self, hint: &LeaderHint, floor: JoinFloor) -> bool {
+        hint.shard_id == self.shard_id
+            && hint.leader != self.search.my_id
+            && floor
+                .epoch()
+                .is_none_or(|floor| hint.recovery_epoch >= floor)
+    }
+
+    /// Takes `reply` to this rejoin's pending epoch `read`: the recovery epoch
+    /// the authority holds, with the read's token, if it holds one.
+    fn epoch_answered(
+        &mut self,
+        read: PendingEpochRead,
+        reply: AuthorityReply,
+    ) -> Option<(ReplyToken, ShardRecord)> {
+        self.epoch_read = None;
+        self.epoch_ask_due = read.bound;
+        match reply {
+            AuthorityReply::RecoveryEpoch {
+                token,
+                result: Ok(Some(held)),
+                ..
+            } => Some((token, held)),
+            _ => None,
+        }
+    }
+
+    /// Takes `reply` if it answers this rejoin's pending listing read, and
+    /// starts the round's ask from it while its round still waits on it.
+    fn listing_answered(&mut self, reply: AuthorityReply, now: Instant, floor: JoinFloor) {
         if self.read.as_ref().map(|read| read.token) != Some(reply.token()) {
-            return None;
+            return;
         }
         self.read = None;
         let AuthorityReply::LiveRegistrations { result, .. } = reply else {
-            return None;
+            return;
         };
         if self.asking.is_some() {
             // A late reply: the round gave up on this read and is asking the
             // seeds alone, and that ask is the round's.
-            return None;
+            return;
         }
-        let was_in_round = self.next_round_at.is_none();
+        // A reply whose round already ended is late: the next round is paced
+        // by the retry interval, not by this reply.
+        let in_round = self.next_round_at.is_none();
         match result {
-            Err(error) => {
-                if was_in_round {
-                    self.search.log(WaitReason::AuthorityUnreachable(error));
-                    self.floor = floor;
-                    self.ask_seeds_or_end(now);
-                }
-            }
-            Ok(registrations) => {
-                if !was_in_round {
-                    // A late reply: its round already ended, and the next is
-                    // paced by the retry interval, not by this reply.
-                    return None;
-                }
-                self.next_round_at = None;
+            Err(error) if in_round => {
+                self.search.log(WaitReason::AuthorityUnreachable(error));
                 self.floor = floor;
-                let peers = self.search.others_in(&registrations);
-                let mut addresses = self.search.to_ask(self.hint.as_ref(), &peers);
-                let seeds = self.search.seeds().to_vec();
-                for seed in seeds {
-                    if !addresses.contains(&seed) {
-                        addresses.push(seed);
-                    }
-                }
-                self.ask(addresses, now, false);
+                self.ask_seeds_or_end(now);
+            }
+            Ok(registrations) if in_round => self.ask_listed(&registrations, now, floor),
+            Err(_) | Ok(_) => {}
+        }
+    }
+
+    /// Starts the round's ask of the workers `registrations` lists, then the
+    /// seeds not among them.
+    fn ask_listed(&mut self, registrations: &LiveRegistrations, now: Instant, floor: JoinFloor) {
+        self.next_round_at = None;
+        self.floor = floor;
+        let peers = self.search.others_in(registrations);
+        let mut addresses = self.search.to_ask(self.hint.as_ref(), &peers);
+        for seed in self.search.seeds() {
+            if !addresses.contains(seed) {
+                addresses.push(seed.clone());
             }
         }
-        None
+        self.ask(addresses, now, false);
     }
 
     /// Waits for the round's ask, for ever while none runs. Cancel-safe.
@@ -876,13 +967,39 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> DrivenSearch<'a, P> {
         sent_at: CoreInstant,
         now: Instant,
     ) {
-        // A fenced node that found its shard recovered without it went back
-        // to `Bootstrapping` to join again. Only a node with an authority
-        // fences itself, and that authority lists whom to ask. A stranded node
-        // searches too, for a leader to reconnect to, and a stranded search
-        // restarts each time the watch fires, once per suspicion timeout. The
-        // authority's leader hint survives a restart, along with the read that
-        // would name it, so a short timeout cannot keep discarding it.
+        let replaced = self.watch_stranded(state, sent_at);
+        let purpose = search_purpose(
+            state,
+            self.authority_present,
+            !self.seeds.is_empty(),
+            self.stranded_search,
+        );
+        let Some(purpose) = purpose else {
+            self.running = None;
+            return;
+        };
+        let asked = self
+            .running_for(purpose, replaced, now)
+            .follow_node(state, client, sent_at, now);
+        if purpose == SearchFor::Rejoin {
+            self.epoch_read_asked = asked.or(self.epoch_read_asked);
+        }
+    }
+
+    /// A fenced node that found its shard recovered without it went back
+    /// to `Bootstrapping` to join again. Only a node with an authority
+    /// fences itself, and that authority lists whom to ask. A stranded node
+    /// searches too, for a leader to reconnect to, and a stranded search
+    /// restarts each time the watch fires, once per suspicion timeout. The
+    /// authority's leader hint survives a restart, along with the read that
+    /// would name it, so a short timeout cannot keep discarding it: the
+    /// restarted leader search is handed the replaced one, which is taken out
+    /// of the running slot here and returned.
+    fn watch_stranded(
+        &mut self,
+        state: WorkerState,
+        sent_at: CoreInstant,
+    ) -> Option<Rejoin<'a, P>> {
         let mut replaced = None;
         if self.stranded.observe(state, sent_at) {
             self.stranded_search = true;
@@ -893,49 +1010,35 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> DrivenSearch<'a, P> {
         if !matches!(state, WorkerState::RollCall | WorkerState::NoQuorum) {
             self.stranded_search = false;
         }
-        let purpose = search_purpose(
-            state,
-            self.authority_present,
-            !self.seeds.is_empty(),
-            self.stranded_search,
-        );
-        match purpose {
-            Some(purpose) => {
-                if self.running.as_ref().map(|(running, _)| *running) != Some(purpose) {
-                    let rejoin = Rejoin::new(
-                        &self.shard_id,
-                        self.my_id.clone(),
-                        self.port.clone(),
-                        self.seeds.clone(),
-                        self.retry_interval,
-                        now,
-                    );
-                    self.running = Some((
-                        purpose,
-                        if purpose == SearchFor::Leader {
-                            rejoin.for_leader_search().carrying_hint_of(replaced)
-                        } else {
-                            rejoin
-                        },
-                    ));
-                }
-                let (_, running) = self.running.as_mut().expect("set above");
-                if state == WorkerState::Joining {
-                    // `Joining` on a pointer it took: the authority's epoch
-                    // is what confirms it.
-                    if let Some(client) = client {
-                        running.validate(client, sent_at, now);
-                    }
-                } else {
-                    running.tick(client, sent_at, now);
-                }
-                let asked = running.take_asked_epoch_read();
-                if purpose == SearchFor::Rejoin {
-                    self.epoch_read_asked = asked.or(self.epoch_read_asked);
-                }
-            }
-            None => self.running = None,
+        replaced
+    }
+
+    /// The search running for `purpose`, started afresh if another or none
+    /// runs. A new leader search carries the hint of `replaced`.
+    fn running_for(
+        &mut self,
+        purpose: SearchFor,
+        replaced: Option<Rejoin<'a, P>>,
+        now: Instant,
+    ) -> &mut Rejoin<'a, P> {
+        if self.running.as_ref().map(|(running, _)| *running) != Some(purpose) {
+            let rejoin = Rejoin::new(
+                &self.shard_id,
+                self.my_id.clone(),
+                self.port.clone(),
+                self.seeds.clone(),
+                self.retry_interval,
+                now,
+            );
+            let rejoin = if purpose == SearchFor::Leader {
+                rejoin.for_leader_search().carrying_hint_of(replaced)
+            } else {
+                rejoin
+            };
+            self.running = Some((purpose, rejoin));
         }
+        let (_, running) = self.running.as_mut().expect("set above");
+        running
     }
 
     /// When the running search's next round or read bound is due.
