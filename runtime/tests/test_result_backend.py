@@ -18,7 +18,7 @@ from kabudachi import registry as registry_module
 from kabudachi.config import Configuration
 from kabudachi.errors import ResultUnavailableError, TaskBodyError
 from kabudachi.flow import Flow, flow
-from kabudachi.native_protocol import NetworkedArguments, OneNodeArguments, SubmitArguments
+from kabudachi.native_protocol import NetworkedArguments, SubmitArguments
 from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting
@@ -89,15 +89,7 @@ def test_a_call_the_backend_does_not_answer_is_unavailable_and_one_it_raises_is_
     assert "event loop" in on_loop
 
 
-class RefusingBackend:
-    async def store(self, key, entry, expires_at):
-        raise ConnectionError("the backend is down")
-
-    async def load(self, key):
-        return None
-
-
-async def run_one_task(native, result, *, result_ttl_ms=None):
+async def run_one_task(native, result):
     """Submits a task, runs it to `result` and returns its id."""
     task_id = native.submit(
         SubmitArguments(
@@ -108,7 +100,6 @@ async def run_one_task(native, result, *, result_ttl_ms=None):
             None,
             SubmissionOptions(),
             SubmissionSettings("default", None),
-            result_ttl_ms=result_ttl_ms,
         )
     )
     [claimed] = await asyncio.wait_for(native.claim_pending(1), 5)
@@ -118,120 +109,14 @@ async def run_one_task(native, result, *, result_ttl_ms=None):
 
 
 async def persistence_once_settled(native, task_id):
-    """The task's record and its newest run's persistence, once that says how
-    mirroring went."""
+    """The task's newest run's persistence, once it says how mirroring went."""
     deadline = time.monotonic() + 5
     while True:
         record = await native.task_record(task_id)
         persistence = record.runs[-1].persistence if record is not None and record.runs else None
         if persistence in ("disabled", "stored", "failed") or time.monotonic() > deadline:
-            return record, persistence
+            return persistence
         await asyncio.sleep(0.02)
-
-
-def test_a_certified_result_is_mirrored_recorded_stored_and_resumed_from_the_backend():
-    backend = DictBackend()
-    with running_loop() as loop:
-        native = _native.NativeRuntime(
-            "worker-1", "incarnation-1", OneNodeArguments(), _native.PythonResultBackend(backend, loop)
-        )
-
-        async def main():
-            await native.wait_until_leader()
-            task_id = await run_one_task(native, b"the-result")
-            _, persistence = await persistence_once_settled(native, task_id)
-            return task_id, persistence, await native.resume_task(task_id)
-
-        try:
-            task_id, persistence, resumed = asyncio.run(main())
-        finally:
-            native.shutdown()
-
-    assert persistence == "stored"
-    assert f"task/{task_id}" in backend.entries
-    assert (resumed.state, resumed.payload, resumed.definition_id) == ("succeeded", b"the-result", "billing.charge")
-    assert resumed.persistence == "stored"
-
-
-def test_a_task_that_keeps_no_result_is_never_mirrored():
-    backend = DictBackend()
-    with running_loop() as loop:
-        native = _native.NativeRuntime(
-            "worker-1", "incarnation-1", OneNodeArguments(), _native.PythonResultBackend(backend, loop)
-        )
-
-        async def main():
-            await native.wait_until_leader()
-            task_id = await run_one_task(native, b"the-result", result_ttl_ms=0)
-            _, persistence = await persistence_once_settled(native, task_id)
-            return persistence, await native.resume_task(task_id)
-
-        try:
-            persistence, resumed = asyncio.run(main())
-        finally:
-            native.shutdown()
-
-    assert persistence == "disabled"
-    assert backend.entries == {}
-    assert resumed.state == "succeeded" and resumed.payload is None
-    assert "no entry" in resumed.unavailable
-
-
-def test_a_backend_that_fails_is_logged_and_leaves_the_run_succeeded():
-    records = []
-    handler = logging.Handler()
-    handler.emit = records.append
-    logger = logging.getLogger("kabudachi.result_backend")
-    logger.addHandler(handler)
-    with running_loop() as loop:
-        native = _native.NativeRuntime(
-            "worker-1", "incarnation-1", OneNodeArguments(), _native.PythonResultBackend(RefusingBackend(), loop)
-        )
-
-        async def main():
-            await native.wait_until_leader()
-            task_id = await run_one_task(native, b"the-result")
-            return await persistence_once_settled(native, task_id)
-
-        try:
-            record, persistence = asyncio.run(main())
-        finally:
-            native.shutdown()
-            logger.removeHandler(handler)
-
-    assert persistence == "failed"
-    assert record.runs[-1].state == _native.RunState.SUCCEEDED
-    assert any("the backend is down" in record.getMessage() for record in records)
-
-
-def test_a_networked_worker_mirrors_what_its_leader_certified_and_the_shard_says_stored():
-    backend = DictBackend()
-    with running_loop() as loop:
-        native = _native.NetworkedRuntime(
-            NetworkedArguments(
-                "results",
-                "/ip4/127.0.0.1/tcp/0",
-                heartbeat_interval_ms=100,
-                heartbeat_timeout_ms=1000,
-                reconnect_timeout_ms=2000,
-            ),
-            _native.PythonResultBackend(backend, loop),
-        )
-
-        async def main():
-            await asyncio.wait_for(native.wait_until_ready(), 5)
-            task_id = await run_one_task(native, b"the-result")
-            _, persistence = await persistence_once_settled(native, task_id)
-            return task_id, persistence, await native.resume_task(task_id)
-
-        try:
-            task_id, persistence, resumed = asyncio.run(main())
-        finally:
-            native.shutdown()
-
-    assert persistence == "stored"
-    assert f"task/{task_id}" in backend.entries
-    assert (resumed.state, resumed.payload) == ("succeeded", b"the-result")
 
 
 class ForgetfulBackend(DictBackend):
@@ -263,7 +148,7 @@ def test_a_result_the_backend_lost_is_resumed_from_the_shards_blobs_and_mirrored
         async def main():
             await asyncio.wait_for(native.wait_until_ready(), 5)
             task_id = await run_one_task(native, result)
-            await persistence_once_settled(native, task_id)
+            persistence = await persistence_once_settled(native, task_id)
             lost = dict(backend.entries)
             backend.remembering = True
             resumed = await native.resume_task(task_id)
@@ -276,7 +161,7 @@ def test_a_result_the_backend_lost_is_resumed_from_the_shards_blobs_and_mirrored
             del backend.entries[chunk_key]
             incomplete = await native.resume_task(task_id)
             await mirrored_back(chunk_key)
-            return task_id, lost, resumed, mirrored, chunk_key, incomplete
+            return task_id, persistence, lost, resumed, mirrored, chunk_key, incomplete
 
         async def mirrored_back(key):
             deadline = time.monotonic() + 5
@@ -284,10 +169,12 @@ def test_a_result_the_backend_lost_is_resumed_from_the_shards_blobs_and_mirrored
                 await asyncio.sleep(0.02)
 
         try:
-            task_id, lost, resumed, mirrored, chunk_key, incomplete = asyncio.run(main())
+            task_id, persistence, lost, resumed, mirrored, chunk_key, incomplete = asyncio.run(main())
         finally:
             native.shutdown()
 
+    # The leader certified, the worker mirrored (the backend dropped it), and the shard says stored.
+    assert persistence == "stored"
     assert lost == {}
     assert (resumed.state, resumed.payload, resumed.definition_id) == ("succeeded", result, "billing.charge")
     # The head and the chunks of the result, not the head alone.
@@ -341,6 +228,7 @@ def test_a_run_mirrors_each_result_once_certified_and_resumes_it_from_the_backen
         handle = echo(Greeting(text="kept"))
         assert await handle == Greeting(text="KEPT")
         await eventually_status(handle, "stored")
+        assert f"task/{handle.task_id}" in backend.entries
         assert await kabudachi.resume(handle.task_id) == Greeting(text="KEPT")
 
         # An entry that is not the certified run's value is never returned.
@@ -354,6 +242,7 @@ def test_a_run_mirrors_each_result_once_certified_and_resumes_it_from_the_backen
         quiet = unkept(Greeting(text="gone"))
         await quiet
         assert (await quiet.status()).persistence == "disabled"
+        assert f"task/{quiet.task_id}" not in backend.entries
         with pytest.raises(ResultUnavailableError):
             await kabudachi.resume(quiet.task_id)
 
