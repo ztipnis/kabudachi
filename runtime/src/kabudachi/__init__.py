@@ -7,6 +7,7 @@ from pkgutil import extend_path
 __path__ = extend_path(__path__, __name__)
 
 from kabudachi.composites import FlowHandle, GroupHandle
+from kabudachi.client import client
 from kabudachi.config import QueueOptions, configure
 from kabudachi.errors import (
     DurabilityUnavailableError,
@@ -39,6 +40,7 @@ __all__ = [
     "after_run",
     "before_run",
     "coalescing_task",
+    "client",
     "CompositeStatus",
     "configure",
     "current_context",

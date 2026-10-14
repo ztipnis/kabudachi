@@ -76,8 +76,8 @@ class Event(Protocol):
     """For `EventKind.OUTCOME` and `EventKind.COMPOSITE_FINISHED`: the
     error's type name, when the run or composite failed."""
     failure_message: str
-    """For `EventKind.COMPOSITE_FINISHED`: the error's message, when the
-    composite failed."""
+    """For `EventKind.OUTCOME` and `EventKind.COMPOSITE_FINISHED`: the recorded
+    error message."""
     failure_task_id: str | None
     """For `EventKind.COMPOSITE_FINISHED`: the task whose run raised the error
     that ended the composite, when a run did."""

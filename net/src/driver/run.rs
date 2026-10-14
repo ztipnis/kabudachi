@@ -243,6 +243,9 @@ where
     }
 
     async fn answer_requests(&mut self, local: &mut Local) {
+        for page in self.net.take_fetched_pages() {
+            self.stepper.scheduler.republish_item_page(page);
+        }
         respond_to_join_requests(self.stepper.node, self.net).await;
         let mut deciding = self.stepper.deciding();
         respond_to_claim_requests(&mut deciding, local);

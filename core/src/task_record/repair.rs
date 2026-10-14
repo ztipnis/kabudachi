@@ -70,6 +70,11 @@ impl Written {
 }
 
 impl Repair {
+    /// Tries a repair again after a backing page has had time to be fetched.
+    pub(crate) fn fetching(&mut self, key: RecordKey, now: Instant) {
+        self.retries.insert(key, now + self.retry_after);
+    }
+
     /// A repair that publishes a record whose write was refused again
     /// `retry_after` later.
     pub fn new(retry_after: Duration) -> Self {

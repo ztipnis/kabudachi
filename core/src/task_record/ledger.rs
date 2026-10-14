@@ -23,8 +23,9 @@ pub enum Waits {
 /// stored gates nothing, because the stored one supersedes it.
 ///
 /// A refused task is published again by `Repair`, and a stored outcome
-/// clears its refusal; one whose retry is dropped stays gated for as long as
-/// the scheduler leads. The ledger is dropped with
+/// clears its refusal. A record no longer retained by the scheduler has no
+/// decision left to protect, so its refusal is forgotten with its retry.
+/// The ledger is dropped with
 /// [`clear`](WriteLedger::clear) when the scheduler stops leading.
 #[derive(Debug, Default)]
 pub struct WriteLedger {
@@ -38,6 +39,10 @@ pub struct WriteLedger {
 }
 
 impl WriteLedger {
+    pub(crate) fn forget_unheld(&mut self, holds: impl Fn(&RecordKey) -> bool) {
+        self.refused.retain(|write| holds(&write.key));
+    }
+
     /// `writes` were made and await their outcomes.
     pub fn made(&mut self, writes: &[Write]) {
         self.pending.extend(writes.iter().cloned());

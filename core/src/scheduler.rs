@@ -458,6 +458,23 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
     }
 
+    /// Whether repairing `key` needs an item page the leader released after
+    /// its write was stored. The page remains part of the retained reduce.
+    pub(crate) fn needs_item_page(&self, key: &RecordKey) -> bool {
+        let RecordKey::Page(id, page) = key else {
+            return false;
+        };
+        self.composites.held.get(id).is_some_and(|composite| {
+            composite.is_item_page_of_items(*page)
+                && !composite.holds_item_page(*page)
+                && !self.composites.is_finished(id)
+        })
+    }
+
+    pub(crate) fn retains_record(&self, key: &RecordKey) -> bool {
+        self.holds(key) || self.needs_item_page(key)
+    }
+
     /// How many tasks are queued to be claimed, including generations their
     /// coalescing key holds back. A delayed task counts once it is due.
     pub fn pending_len(&self) -> usize {

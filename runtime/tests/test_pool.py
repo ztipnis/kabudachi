@@ -15,6 +15,7 @@ from datetime import timedelta
 import pytest
 
 import kabudachi
+from worker_run import run_with_worker
 import pool_tasks
 from kabudachi import _native, ipc
 from kabudachi import config as config_module
@@ -90,7 +91,7 @@ def test_bodies_run_in_task_processes_spread_over_the_pool_and_send_back_results
             await pool_tasks.refuses(Greeting(text="this"))
         return first.times, second.times, len(large.text)
 
-    first, second, size = kabudachi.run(main)
+    first, second, size = run_with_worker(main)
 
     assert os.getpid() not in (first, second)
     assert first != second, "with one place per process, the second body went to the other one"
@@ -111,7 +112,7 @@ def test_a_pool_starts_and_runs_a_task_when_the_router_is_a_lambda():
     async def main():
         return await pool_tasks.where_async(Greeting(text="0.5"))
 
-    result = kabudachi.run(main)
+    result = run_with_worker(main)
 
     assert result.times != os.getpid()
     assert routed == ["pool.where_async"]
@@ -145,7 +146,7 @@ def test_a_task_or_hook_declared_in_the_script_being_run_is_refused_before_anyth
     kabudachi.configure(processes=1)
 
     with pytest.raises(TaskDefinitionError, match=named):
-        kabudachi.run(nothing)
+        run_with_worker(nothing)
 
 
 def declare_only_here():
@@ -197,7 +198,7 @@ def test_task_processes_that_cannot_find_every_task_stop_the_start_with_the_reas
     arrange()
 
     with pytest.raises(StartupError, match=reason):
-        kabudachi.run(nothing)
+        run_with_worker(nothing)
 
 
 def test_a_long_chain_is_compacted_in_a_task_process(markers):
@@ -211,7 +212,7 @@ def test_a_long_chain_is_compacted_in_a_task_process(markers):
         handles = [pool_tasks.refresh(Greeting(text=text)) for text in texts]
         return (await held).text, (await handles[-1]).text
 
-    held, newest = kabudachi.run(main)
+    held, newest = run_with_worker(main)
 
     assert held == "held until folded", "a compaction folded while the key was busy"
     assert int((markers / "folded-in").read_text()) != os.getpid(), "the merge ran in a task process"
@@ -263,7 +264,7 @@ def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_pla
     async def main():
         return await pool_tasks.calls_others(Greeting(times=0))
 
-    result = kabudachi.run(main)
+    result = run_with_worker(main)
 
     assert result.times == 1 + 2 + 11 + 21
     assert result.text == "True cancelled ValueError UnknownTaskError IN_MEMORY:succeeded:1:succeeded:2"
@@ -285,7 +286,7 @@ def test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_
             after = await pool_tasks.where_async(Greeting())
             return replayed.times, after.times
 
-    replayed, after = kabudachi.run(main)
+    replayed, after = run_with_worker(main)
 
     assert os.getpid() not in (replayed, after)
     assert replayed != after, "the ephemeral body's death replaced the process again"
@@ -305,7 +306,7 @@ def test_a_body_past_its_hard_limit_settles_at_once_and_its_process_is_replaced_
             failed_after = loop.time() - started
             return failed_after, await neighbour, await retried
 
-    failed_after, neighbour, retried = kabudachi.run(main)
+    failed_after, neighbour, retried = run_with_worker(main)
 
     # Settled at its hard limit (0.3 s + 0.2 s), not when the process died.
     assert failed_after < 1.2
@@ -343,7 +344,7 @@ def test_a_cancelled_body_stops_when_asked_and_one_that_will_not_costs_its_proce
             replaced = (await pool_tasks.where_async(Greeting())).times
             return kept, outcomes, replaced
 
-    kept, outcomes, replaced = kabudachi.run(main)
+    kept, outcomes, replaced = run_with_worker(main)
 
     assert (markers / "cancelled-c").exists(), "the body was cancelled in its process"
     assert kept == int((markers / "started-c").read_text()), "a body that stopped cost nothing"
@@ -569,7 +570,7 @@ def test_a_task_process_is_replaced_after_its_run_limit_and_after_a_recycling_ta
             counting.cancel()
             return pids
 
-    pids = kabudachi.run(main)
+    pids = run_with_worker(main)
 
     # The recycling run returning the second process's id shows the drain was
     # graceful: a killed process would have lost it, and its replay would
@@ -601,7 +602,7 @@ def test_lifecycle_hooks_prepare_each_run_in_its_task_process_and_a_failed_clean
             after = await pool_tasks.hooked(Greeting())
             return sync, in_loop, retried, spoiled, after
 
-    sync, in_loop, retried, spoiled, after = kabudachi.run(main)
+    sync, in_loop, retried, spoiled, after = run_with_worker(main)
 
     assert sync.times != os.getpid()
     assert (sync.text, in_loop.text) == ("pool.hooked 1 True", "pool.hooked_async 1 True")
@@ -647,7 +648,7 @@ def test_a_body_raising_system_exit_or_keyboard_interrupt_fails_its_run_and_cost
             after = (await pool_tasks.where_async(Greeting())).times
             return outcomes, finished, after
 
-    outcomes, neighbour, after = kabudachi.run(main)
+    outcomes, neighbour, after = run_with_worker(main)
 
     assert [(type(outcome), getattr(outcome, "kind", None)) for outcome in outcomes] == [
         (TaskBodyError, "SystemExit"),
@@ -666,7 +667,7 @@ def test_a_body_in_a_task_process_sees_its_run_in_context_variables_async_or_syn
         results = await asyncio.gather(*handles)
         return [(handle.task_id, json.loads(result.text)) for handle, result in zip(handles, results)]
 
-    for (task_id, seen), name in zip(kabudachi.run(main), ("pool.context_async", "pool.context_sync")):
+    for (task_id, seen), name in zip(run_with_worker(main), ("pool.context_async", "pool.context_sync")):
         assert seen["task_id"] == task_id
         assert seen["task_name"] == name
         assert seen["attempt"] == 1

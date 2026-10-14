@@ -30,6 +30,7 @@ SERVE_PROGRAM = textwrap.dedent(
     import asyncio
 
     import kabudachi
+    from worker_run import run_with_worker
     from kabudachi import session
     from proto_messages import Greeting
 
@@ -225,6 +226,7 @@ POOL_PROGRAM = textwrap.dedent(
     sys.path[:0] = json.loads(sys.argv[1])
 
     import kabudachi
+    from worker_run import run_with_worker
     import pool_tasks
     from kabudachi import session
     from proto_messages import Greeting
@@ -373,6 +375,7 @@ SERVE_SLOW_START_PROGRAM = textwrap.dedent(
     sys.path[:0] = json.loads(sys.argv[1])
 
     import kabudachi
+    from worker_run import run_with_worker
     import kabudachi.runner as runner
     from faulting_runtime import FaultingNative
 
@@ -448,6 +451,7 @@ INTERRUPT_PROGRAM = textwrap.dedent(
     import asyncio
 
     import kabudachi
+    from worker_run import run_with_worker
 
 
     async def waits_to_be_interrupted():
@@ -460,11 +464,11 @@ INTERRUPT_PROGRAM = textwrap.dedent(
 
 
     try:
-        kabudachi.run(waits_to_be_interrupted)
+        run_with_worker(waits_to_be_interrupted)
     except KeyboardInterrupt:
         print("interrupted", flush=True)
 
-    print(kabudachi.run(finishes), flush=True)
+    print(run_with_worker(finishes), flush=True)
     """
 )
 
@@ -503,6 +507,7 @@ INTERRUPT_BEFORE_LEADERSHIP_PROGRAM = textwrap.dedent(
     sys.path[:0] = json.loads(sys.argv[1])
 
     import kabudachi
+    from worker_run import run_with_worker
     import kabudachi.runner as runner
     from faulting_runtime import FaultingNative
 
@@ -530,11 +535,11 @@ INTERRUPT_BEFORE_LEADERSHIP_PROGRAM = textwrap.dedent(
 
     runner._native = SimpleNamespace(NativeRuntime=SlowToLead)
     try:
-        kabudachi.run(never_runs)
+        run_with_worker(never_runs)
     except KeyboardInterrupt:
         print("interrupted", flush=True)
     runner._native = real_native
-    print(kabudachi.run(finishes), flush=True)
+    print(run_with_worker(finishes), flush=True)
     """
 )
 

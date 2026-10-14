@@ -645,7 +645,9 @@ fn handle_behaviour_event(
 /// Takes one event of the shard's records `kad`, and ends the query it says
 /// has done its work: the rest of a blob lookup that found its copy is wasted.
 fn records_event(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, event: kad::Event, inbound: &Inbound) {
-    let Some(done) = pending.records.on_event(event, inbound) else {
+    let done = pending.records.on_event(event, inbound);
+    pending.records.advance_writes(swarm, inbound);
+    let Some(done) = done else {
         return;
     };
     let records = swarm.behaviour_mut().records.as_mut();

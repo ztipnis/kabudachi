@@ -10,6 +10,7 @@ pub mod blobs;
 pub mod bootstrap;
 pub mod claim;
 pub mod claimed_runs;
+pub mod client;
 pub mod codec;
 pub mod composites;
 pub mod discovery;

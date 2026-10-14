@@ -1,4 +1,4 @@
-"""`kabudachi.run(main)` end to end: a real native runtime, a real worker
+"""`run_with_worker(main)` end to end: a real native runtime, a real worker
 loop, tasks called from `main` and their results awaited."""
 
 import asyncio
@@ -15,6 +15,7 @@ from datetime import timedelta
 import pytest
 
 import kabudachi
+from worker_run import run_with_worker
 from kabudachi import config as config_module
 from kabudachi import lifecycle as lifecycle_module
 from kabudachi import logging as kabudachi_logging
@@ -66,7 +67,7 @@ def test_a_one_node_worker_serves_health_and_is_ready_once_it_leads():
             statuses.append(await asyncio.to_thread(_status, f"http://{address}{path}"))
         return statuses
 
-    assert kabudachi.run(main) == [200, 200, 404]
+    assert run_with_worker(main) == [200, 200, 404]
 
 
 def _status(url: str) -> int:
@@ -85,7 +86,7 @@ def test_a_synchronous_task_is_run_and_its_result_awaited():
     async def main():
         return await greet(Greeting(text="world", times=1))
 
-    assert kabudachi.run(main) == Greeting(text="hello world", times=2)
+    assert run_with_worker(main) == Greeting(text="hello world", times=2)
 
 
 def test_tasks_take_the_processes_retries_and_timeout_unless_they_choose_their_own():
@@ -127,7 +128,7 @@ def test_tasks_take_the_processes_retries_and_timeout_unless_they_choose_their_o
         )
         return await patient(Greeting(text="waited"))
 
-    assert kabudachi.run(main) == Greeting(text="waited")
+    assert run_with_worker(main) == Greeting(text="waited")
     assert attempts == ["again", "again"]
     assert folds == ["b", "b"]
 
@@ -149,7 +150,7 @@ def test_a_handle_says_how_durable_its_task_is_and_reads_its_status_from_its_rec
         await handle
         return handle.durability, len(refusals), await handle.status()
 
-    durability, refused, after = kabudachi.run(main)
+    durability, refused, after = run_with_worker(main)
 
     assert durability is Durability.IN_MEMORY
     assert refused == 2
@@ -206,7 +207,7 @@ def test_a_flow_and_a_group_report_their_stages_and_members():
         await grouped
         return in_flight, (await flowed.status(), await grouped.status())
 
-    (flowing, grouping), (flowed, grouped) = kabudachi.run(main)
+    (flowing, grouping), (flowed, grouped) = run_with_worker(main)
 
     assert (flowing.kind, flowing.state, flowing.stage, dict(flowing.counts)) == (
         "flow",
@@ -243,7 +244,7 @@ def test_a_task_that_returns_nothing_gives_none():
     async def main():
         return await note(Greeting(text="noted"))
 
-    assert kabudachi.run(main) is None
+    assert run_with_worker(main) is None
     assert seen == ["noted"]
 
 
@@ -255,7 +256,7 @@ def test_a_list_of_messages_goes_through_a_task_and_back():
     async def main():
         return await double([Greeting(text="a", times=1), Greeting(text="b", times=2)])
 
-    assert [g.times for g in kabudachi.run(main)] == [2, 4]
+    assert [g.times for g in run_with_worker(main)] == [2, 4]
 
 
 def test_many_tasks_called_together_each_get_their_own_result():
@@ -267,7 +268,7 @@ def test_many_tasks_called_together_each_get_their_own_result():
         handles = [square(Greeting(times=n)) for n in range(50)]
         return [g.times for g in await asyncio.gather(*handles)]
 
-    assert kabudachi.run(main) == [n * n for n in range(50)]
+    assert run_with_worker(main) == [n * n for n in range(50)]
 
 
 def test_calling_a_task_returns_a_handle_before_it_has_run():
@@ -282,7 +283,7 @@ def test_calling_a_task_returns_a_handle_before_it_has_run():
         await handle
         return handle, before, handle.done(), handle.task_id, handle.shard_id
 
-    handle, before, after, task_id, shard = kabudachi.run(main)
+    handle, before, after, task_id, shard = run_with_worker(main)
 
     assert isinstance(handle, kabudachi.TaskHandle)
     assert (before, after) == (False, True)
@@ -304,7 +305,7 @@ def test_a_task_that_raises_fails_its_handle_and_others_still_work():
             return_exceptions=True,
         )
 
-    bad, good = kabudachi.run(main)
+    bad, good = run_with_worker(main)
 
     assert isinstance(bad, ValueError) and "bad" in str(bad)
     assert good == Greeting(text="good")
@@ -350,7 +351,7 @@ def test_no_more_tasks_run_at_once_than_configured(is_async):
     async def main():
         return await asyncio.gather(*(slow(Greeting(text=str(n))) for n in range(8)))
 
-    results = kabudachi.run(main)
+    results = run_with_worker(main)
 
     assert [result.text for result in results] == [str(n) for n in range(8)]
     assert peak == 2
@@ -379,7 +380,7 @@ def test_run_limits_a_queue_to_its_max_running_whatever_the_concurrency():
     async def main():
         return await asyncio.gather(*(limited(Greeting(text=str(n))) for n in range(4)))
 
-    results = kabudachi.run(main)
+    results = run_with_worker(main)
 
     assert [result.text for result in results] == ["0", "1", "2", "3"]
     assert peak == 1
@@ -401,7 +402,7 @@ def test_a_synchronous_task_can_call_another_task():
         await outer(Greeting())
         return await handles[0]
 
-    assert kabudachi.run(main).times == 99
+    assert run_with_worker(main).times == 99
 
 
 def test_run_waits_for_tasks_main_started_but_did_not_await():
@@ -417,7 +418,7 @@ def test_run_waits_for_tasks_main_started_but_did_not_await():
         for n in range(3):
             slow(Greeting(text=str(n)))
 
-    kabudachi.run(main)
+    run_with_worker(main)
 
     assert sorted(done) == ["0", "1", "2"]
 
@@ -443,7 +444,7 @@ def test_an_error_in_main_propagates_and_run_does_not_wait_for_queued_tasks():
         raise KeyError("main failed")
 
     with pytest.raises(KeyError, match="main failed"):
-        kabudachi.run(main)
+        run_with_worker(main)
 
     assert started == ["0"]
     assert finished == ["0"]
@@ -457,7 +458,7 @@ def test_a_task_cannot_be_called_after_run_has_finished():
     async def main():
         return None
 
-    kabudachi.run(main)
+    run_with_worker(main)
 
     with pytest.raises(RuntimeNotStartedError):
         greet(Greeting())
@@ -474,10 +475,10 @@ def test_run_can_be_used_again_after_it_finishes_or_its_main_failed():
     async def broken():
         raise RuntimeError("main fails")
 
-    assert kabudachi.run(main) == "again"
+    assert run_with_worker(main) == "again"
     with pytest.raises(RuntimeError, match="main fails"):
-        kabudachi.run(broken)
-    assert kabudachi.run(main) == "again"
+        run_with_worker(broken)
+    assert run_with_worker(main) == "again"
 
 
 def test_run_cannot_start_inside_a_running_event_loop():
@@ -485,7 +486,7 @@ def test_run_cannot_start_inside_a_running_event_loop():
         async def inner():
             return None
 
-        kabudachi.run(inner)
+        run_with_worker(inner)
 
     with pytest.raises(RuntimeError, match="from a running event loop"):
         asyncio.run(main())
@@ -507,10 +508,10 @@ def test_run_cannot_be_nested_and_does_not_start_a_second_runtime(monkeypatch):
 
     async def main():
         with pytest.raises(RuntimeError, match="already running"):
-            await asyncio.get_running_loop().run_in_executor(None, kabudachi.run, inner)
+            await asyncio.get_running_loop().run_in_executor(None, run_with_worker, inner)
         return "outer finished"
 
-    assert kabudachi.run(main) == "outer finished"
+    assert run_with_worker(main) == "outer finished"
     assert len(created) == 1
 
 
@@ -527,7 +528,7 @@ def test_run_refuses_to_start_if_a_task_cannot_work():
         calls.append("main ran")
 
     with pytest.raises(TaskDefinitionError, match="not-registered"):
-        kabudachi.run(main)
+        run_with_worker(main)
 
     assert calls == []
 
@@ -545,7 +546,7 @@ def test_a_worker_thread_can_call_a_task_and_hand_back_its_handle():
         thread.join()
         return (await box[0]).text
 
-    assert kabudachi.run(main) == "threaded"
+    assert run_with_worker(main) == "threaded"
 
 
 def test_a_task_that_fails_is_retried_through_the_real_runtime_and_finally_succeeds():
@@ -561,7 +562,7 @@ def test_a_task_that_fails_is_retried_through_the_real_runtime_and_finally_succe
     async def main():
         return await flaky(Greeting(text="x"))
 
-    assert kabudachi.run(main).text == "done after 3"
+    assert run_with_worker(main).text == "done after 3"
     assert calls == ["x", "x", "x"], "every attempt saw the same input"
 
 
@@ -578,7 +579,7 @@ def test_a_delayed_task_does_not_start_before_its_delay_has_passed():
         await stamp.options(delay=timedelta(milliseconds=100))(Greeting())
         return started_at[0] - submitted
 
-    assert kabudachi.run(main) >= 0.1
+    assert run_with_worker(main) >= 0.1
 
 
 def test_a_task_that_times_out_is_retried_and_can_then_succeed():
@@ -594,7 +595,7 @@ def test_a_task_that_times_out_is_retried_and_can_then_succeed():
     async def main():
         return await slow_once(Greeting())
 
-    assert kabudachi.run(main).text == "second try"
+    assert run_with_worker(main).text == "second try"
     assert len(calls) == 2
 
 
@@ -619,7 +620,7 @@ def test_a_running_generation_is_never_cancelled_and_the_next_one_waits_for_it()
         newer = refresh(Greeting(text="two"))
         return await running, await newer
 
-    one, two = kabudachi.run(main)
+    one, two = run_with_worker(main)
 
     assert (one.text, two.text) == ("one", "two")
     assert order == ["start one", "end one", "start two", "end two"]
@@ -644,7 +645,7 @@ def test_different_keys_run_side_by_side():
         ]
         return await asyncio.gather(*handles)
 
-    kabudachi.run(main)
+    run_with_worker(main)
 
     assert peak == 3
 
@@ -657,7 +658,7 @@ def test_an_ephemeral_task_runs_and_returns_like_a_task_in_one_process():
     async def main():
         return await ephemeral_greet(Greeting(text="there"))
 
-    assert kabudachi.run(main).text == "hi there"
+    assert run_with_worker(main).text == "hi there"
 
 
 def test_a_flow_runs_its_stages_one_after_another_and_a_group_runs_side_by_side_through_the_real_runtime():
@@ -676,7 +677,7 @@ def test_a_flow_runs_its_stages_one_after_another_and_a_group_runs_side_by_side_
         group_handle = kabudachi.group(shout, count)(Greeting(text="hi", times=5))
         return flow_handle, group_handle, await flow_handle, await group_handle
 
-    flow_handle, group_handle, flowed, grouped = kabudachi.run(main)
+    flow_handle, group_handle, flowed, grouped = run_with_worker(main)
 
     assert isinstance(flow_handle, kabudachi.FlowHandle)
     assert isinstance(group_handle, kabudachi.GroupHandle)
@@ -696,7 +697,7 @@ def test_a_bound_task_is_called_like_a_task():
     async def main():
         return await shout.bind(Greeting(text="fixed"))()
 
-    assert kabudachi.run(main).text == "FIXED"
+    assert run_with_worker(main).text == "FIXED"
 
 
 def test_a_submission_past_the_hard_memory_limit_raises_backpressure_error():
@@ -714,7 +715,7 @@ def test_a_submission_past_the_hard_memory_limit_raises_backpressure_error():
                 hold(Greeting(text="x" * 40))
         return refused.value
 
-    refused = kabudachi.run(main)
+    refused = run_with_worker(main)
 
     # A kabudachi error and a RuntimeError, as the pure-Python class was.
     assert isinstance(refused, KabudachiError)
@@ -737,7 +738,7 @@ def test_a_payload_larger_than_one_message_goes_through_a_task_and_back_and_one_
             echo(Greeting(text="y" * (hard + 1)))
         return echoed, refused.value
 
-    echoed, refused = kabudachi.run(main)
+    echoed, refused = run_with_worker(main)
     assert echoed == Greeting(text=big)
     # Not transient: a serialization error, never a backpressure one.
     assert isinstance(refused, SerializationError)
@@ -780,7 +781,7 @@ def test_a_long_chain_is_compacted_while_its_key_is_busy_and_folds_in_order():
         await held
         return await handles[-1]
 
-    newest = kabudachi.run(main)
+    newest = run_with_worker(main)
 
     expected = functools.reduce(fold_left, [Greeting(text=text) for text in texts])
     assert newest.text == expected.text
@@ -820,7 +821,7 @@ def test_a_merge_that_fails_ends_its_compaction_and_fails_the_newest_generation_
         with pytest.raises(ValueError, match="cannot be merged"):
             await handles[-1]
 
-    kabudachi.run(main)
+    run_with_worker(main)
 
     assert merge_failed_while_held.is_set(), "the compaction ran the merge while the key was busy"
 
@@ -864,7 +865,7 @@ def test_lifecycle_hooks_run_in_this_process_around_the_runs_of_their_queues(cap
         return await hooked(Greeting()), await plain(Greeting(text="untouched"))
 
     with caplog.at_level(logging.WARNING, logger="kabudachi"):
-        hooked_result, plain_result = kabudachi.run(main)
+        hooked_result, plain_result = run_with_worker(main)
 
     assert seen == [
         "init",
@@ -923,7 +924,7 @@ def test_a_body_or_hook_that_raises_system_exit_or_keyboard_interrupt_or_cancels
             )
             return outcomes, (await neighbour).text
 
-    outcomes, neighbour = kabudachi.run(main)
+    outcomes, neighbour = run_with_worker(main)
 
     assert [(type(outcome), getattr(outcome, "kind", None)) for outcome in outcomes] == [
         (TaskBodyError, "SystemExit"),
@@ -949,7 +950,7 @@ def test_a_body_whose_error_cannot_be_turned_into_text_still_fails_its_run():
         async with asyncio.timeout(10):
             return await asyncio.gather(breaks(Greeting()), return_exceptions=True)
 
-    (outcome,) = kabudachi.run(main)
+    (outcome,) = run_with_worker(main)
 
     assert type(outcome) is Unprintable
 
@@ -981,10 +982,10 @@ def test_off_the_main_thread_what_is_not_an_exception_fails_only_what_raised_it(
         failed = []
         for _ in range(3):
             try:
-                kabudachi.run(main)
+                run_with_worker(main)
             except StartupError as error:
                 failed.append(str(error))
-        return failed, kabudachi.run(main)
+        return failed, run_with_worker(main)
 
     with concurrent.futures.ThreadPoolExecutor(1) as thread:
         failed, outcome = thread.submit(run_three_failed_starts_then_one_run).result(timeout=30)
@@ -1032,7 +1033,7 @@ def test_a_context_filter_puts_the_running_task_on_each_record_its_body_logs():
         return first.task_id, second.task_id
 
     try:
-        first, second = kabudachi.run(main)
+        first, second = run_with_worker(main)
     finally:
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
@@ -1054,7 +1055,7 @@ def test_native_events_reach_python_logging_under_kabudachi_native(caplog):
     async def main():
         return None
 
-    kabudachi.run(main)
+    run_with_worker(main)
 
     def leads():
         return [

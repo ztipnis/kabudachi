@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 
 import kabudachi
+from worker_run import run_with_worker
 from faulting_runtime import FaultingNative
 from kabudachi import config as config_module
 from kabudachi import registry as registry_module
@@ -120,9 +121,9 @@ def test_a_networked_run_stops_taking_and_waits_for_its_reports_however_main_end
 
     if fails:
         with pytest.raises(KeyError):
-            kabudachi.run(main)
+            run_with_worker(main)
     else:
-        assert kabudachi.run(main) == "done"
+        assert run_with_worker(main) == "done"
 
     native = only_native()
     assert native.calls == ["ready", "stop_taking", "reported", "drain"]
@@ -161,7 +162,7 @@ def test_a_networked_run_whose_node_never_finishes_leaving_still_returns(monkeyp
         return "done"
 
     results = []
-    thread = threading.Thread(target=lambda: results.append(kabudachi.run(main)), daemon=True)
+    thread = threading.Thread(target=lambda: results.append(run_with_worker(main)), daemon=True)
     with caplog.at_level(logging.WARNING, logger=runner_module.__name__):
         thread.start()
         thread.join(timeout=30)
@@ -176,7 +177,7 @@ def test_a_run_that_completes_shuts_the_native_runtime_down_and_ends_the_session
     async def main():
         return "done"
 
-    assert kabudachi.run(main) == "done"
+    assert run_with_worker(main) == "done"
 
     assert only_native().shutdowns == 1
     assert session_module.active_session() is None
@@ -190,7 +191,7 @@ def test_a_run_that_completes_refuses_late_submissions_to_its_session():
     async def main():
         return session_module.active_session()
 
-    session = kabudachi.run(main)
+    session = run_with_worker(main)
 
     with pytest.raises(RunStoppedError):
         session.submit(echo.definition, Greeting())
@@ -202,7 +203,7 @@ def test_a_main_that_raises_or_is_cancelled_still_shuts_down_and_ends_the_sessio
         raise error
 
     with pytest.raises(type(error)):
-        kabudachi.run(main)
+        run_with_worker(main)
 
     assert only_native().shutdowns == 1
     assert session_module.active_session() is None
@@ -221,7 +222,7 @@ def test_a_runtime_that_never_becomes_leader_is_shut_down_and_the_error_raised(m
         raise AssertionError("main must not start without a leader")
 
     with pytest.raises(RuntimeError, match="no leader"):
-        kabudachi.run(main)
+        run_with_worker(main)
 
     assert only_native().shutdowns == 1
     assert session_module.active_session() is None
@@ -246,7 +247,7 @@ def test_a_worker_that_dies_cancels_main_and_raises_its_error(monkeypatch):
 
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="the runtime broke"):
-        kabudachi.run(main)
+        run_with_worker(main)
 
     assert time.monotonic() - started < 5
     assert cancelled == [True]
@@ -266,7 +267,7 @@ def test_a_worker_that_dies_while_run_waits_for_tasks_is_reported():
         native.claim_error = RuntimeError("the runtime broke later")
 
     with pytest.raises(RuntimeError, match="the runtime broke later"):
-        kabudachi.run(main)
+        run_with_worker(main)
 
     assert only_native().shutdowns == 1
 
@@ -293,7 +294,7 @@ def test_the_configured_result_ttl_is_given_to_the_native_runtime_in_millisecond
     async def main():
         return None
 
-    kabudachi.run(main)
+    run_with_worker(main)
 
     assert only_native().arguments.result_ttl_ms == 5000
 
@@ -674,8 +675,8 @@ def test_the_readme_example_runs_and_prints_what_it_says(monkeypatch, capsys):
     )
     messages.Receipt = make_message_class("ExampleReceipt", [("ok", "bool"), ("total", "int64")])
     monkeypatch.setitem(sys.modules, "myapp_pb2", messages)
-    source = example_source()
+    source = example_source().replace("kabudachi.run(main)", "run_with_worker(main)")
 
-    exec(compile(source, str(README), "exec"), {"__name__": "readme_example"})
+    exec(compile(source, str(README), "exec"), {"__name__": "readme_example", "run_with_worker": run_with_worker})
 
     assert capsys.readouterr().out.strip() == "(500, [100, 250])"

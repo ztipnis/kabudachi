@@ -151,6 +151,10 @@ impl RecordPorts for NetRecords<'_> {
     fn refuse(&mut self, write: Write) {
         self.net.refuse_write(write);
     }
+
+    fn fetch_item_page(&mut self, key: RecordKey) {
+        self.net.fetch_item_page(key);
+    }
 }
 
 /// Performs the node's authority calls through its client, or, with none,

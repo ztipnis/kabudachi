@@ -12,6 +12,7 @@ import _kabudachi_contract
 import pytest
 
 import kabudachi
+from worker_run import run_with_worker
 from kabudachi import _native
 from kabudachi import config as config_module
 from kabudachi import registry as registry_module
@@ -279,7 +280,7 @@ def test_a_run_mirrors_each_result_once_certified_and_resumes_it_from_the_backen
         with pytest.raises(ResultUnavailableError):
             await kabudachi.resume("no-such-task")
 
-    kabudachi.run(main)
+    run_with_worker(main)
 
     # A backend that fails changes no outcome; the failure is logged.
     configuration.configure(result_backend=FailingBackend())
@@ -290,7 +291,7 @@ def test_a_run_mirrors_each_result_once_certified_and_resumes_it_from_the_backen
         await eventually_status(handle, "failed")
 
     with caplog.at_level(logging.WARNING, logger="kabudachi.result_backend"):
-        kabudachi.run(failing)
+        run_with_worker(failing)
     assert any("the store is down" in record.getMessage() for record in caplog.records)
 
 
@@ -321,14 +322,14 @@ def test_a_maps_results_are_resumed_from_the_backend_by_a_later_run_whose_shard_
         results = await handle
         return (await handle.status()).composite_id, results
 
-    composite_id, expected = kabudachi.run(first)
+    composite_id, expected = run_with_worker(first)
     assert any(key.startswith(f"composite/{composite_id}/page/1") for key in backend.entries), "several pages"
     assert any("/chunk/" in key for key in backend.entries), "a value in chunks"
 
     async def later():
         return await asyncio.wait_for(kabudachi.resume(composite_id), 10)
 
-    resumed = kabudachi.run(later)
+    resumed = run_with_worker(later)
     # The first run's handle gave back the error its own process raised; a
     # later run has only the failure's kind and message.
     assert isinstance(expected[7], ValueError)

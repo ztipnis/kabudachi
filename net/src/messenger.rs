@@ -191,7 +191,7 @@
 mod record_queries;
 mod swarm_task;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -558,6 +558,8 @@ pub(crate) struct Inbound {
     /// made then, so it is dropped (and its asker told) at once.
     own_tasks: Mutex<Option<VecDeque<OwnTask>>>,
     writes: Mutex<VecDeque<WriteOutcome>>,
+    fetching_pages: Mutex<BTreeSet<RecordKey>>,
+    fetched_pages: Mutex<VecDeque<CompositePage>>,
     arrived: Notify,
     results: Mutex<VecDeque<Asked<ResultCodec>>>,
     /// Result messages this worker sent itself, as a client of its own task.
@@ -578,6 +580,8 @@ impl Default for Inbound {
             steals: Mutex::default(),
             own_tasks: Mutex::new(Some(VecDeque::new())),
             writes: Mutex::default(),
+            fetching_pages: Mutex::default(),
+            fetched_pages: Mutex::default(),
             arrived: Notify::new(),
             results: Mutex::default(),
             own_results: Mutex::default(),
@@ -783,7 +787,7 @@ impl Net {
     /// than the production default to stay fast and deterministic, doesn't
     /// have to change what every other `Net::new` caller gets.
     pub fn new_with_redial_policy(redial_policy: RedialPolicy) -> Self {
-        Self::build(redial_policy, None, None)
+        Self::build(redial_policy, None, None, false)
     }
 
     /// A `Net` for a worker of the shard `name`: besides everything [`Self::new`]
@@ -795,16 +799,32 @@ impl Net {
         name: ShardName,
         retention: Option<kabudachi_core::time::Duration>,
     ) -> Self {
-        Self::build(RedialPolicy::default(), Some(name), retention)
+        Self::build(RedialPolicy::default(), Some(name), retention, false)
+    }
+
+    /// A caller can query the shard's records without advertising itself as
+    /// a record holder or a peer from which workers should try to steal work.
+    pub(crate) fn for_caller(
+        name: ShardName,
+        retention: Option<kabudachi_core::time::Duration>,
+    ) -> Self {
+        Self::build(RedialPolicy::default(), Some(name), retention, true)
     }
 
     fn build(
         redial_policy: RedialPolicy,
         records_shard: Option<ShardName>,
         retention: Option<kabudachi_core::time::Duration>,
+        caller: bool,
     ) -> Self {
         let held = HeldRecords::new(retention);
-        let (swarm, identify_config) = build_swarm(records_shard.as_ref(), held.clone());
+        let (mut swarm, identify_config) = build_swarm(records_shard.as_ref(), held.clone());
+        if caller {
+            swarm.behaviour_mut().kad.set_mode(Some(libp2p::kad::Mode::Client));
+            if let Some(records) = swarm.behaviour_mut().records.as_mut() {
+                records.set_mode(Some(libp2p::kad::Mode::Client));
+            }
+        }
         let local_worker_id = WorkerId::new(swarm.local_peer_id().to_string());
         let (commands, command_rx) = mpsc::unbounded_channel();
         let inbound = Arc::new(Inbound::default());
@@ -813,7 +833,7 @@ impl Net {
         let named_leader = watch::Sender::new(NamedLeader::default());
 
         let driver = tokio::spawn(swarm_task::drive(swarm, identify_config, command_rx, inbound.clone(), peers));
-        let tending = records_shard.is_some().then(|| {
+        let tending = (records_shard.is_some() && !caller).then(|| {
             let leader = LeaderLine {
                 local: local_worker_id.clone(),
                 commands: commands.clone(),
@@ -1288,6 +1308,28 @@ impl Net {
         look_up_through(&self.commands, key).await
     }
 
+    pub(crate) fn fetch_item_page(&self, key: RecordKey) {
+        const MAX_PAGE_FETCHES: usize = 64;
+        let mut fetching = self.inbound.fetching_pages.lock().unwrap_or_else(PoisonError::into_inner);
+        if fetching.len() >= MAX_PAGE_FETCHES || !fetching.insert(key.clone()) {
+            return;
+        }
+        drop(fetching);
+        let commands = self.commands.clone();
+        let inbound = Arc::clone(&self.inbound);
+        tokio::spawn(async move {
+            if let RecordLookup::Found(ShardRecord::Page(page)) = look_up_through(&commands, key.clone()).await {
+                inbound.fetched_pages.lock().unwrap_or_else(PoisonError::into_inner).push_back(page);
+            }
+            inbound.fetching_pages.lock().unwrap_or_else(PoisonError::into_inner).remove(&key);
+            inbound.arrived.notify_one();
+        });
+    }
+
+    pub(crate) fn take_fetched_pages(&self) -> Vec<CompositePage> {
+        self.inbound.fetched_pages.lock().unwrap_or_else(PoisonError::into_inner).drain(..).collect()
+    }
+
     /// Like [`Self::get_record`], but says whether a miss is because the
     /// record is held nowhere ([`RecordLookup::NotFound`]) or because the
     /// lookup could not tell ([`RecordLookup::Unanswered`]).
@@ -1342,21 +1384,22 @@ impl Net {
     }
 
     /// The bytes of the blob `digest` names, which `owner` stored. Looked
-    /// for, in turn, in this worker's own store; at the holders of `owner`'s
-    /// record, asked directly and all at once; and, if they all miss, by the
-    /// kad lookup of the blob's key. Every answer is checked against the
-    /// digest. `None` if no one reachable holds it.
+    /// for in this worker's own store, then by its immutable key, then at
+    /// the holders of `owner`'s record. The key lookup ends on the first
+    /// checked copy; reading a mutable owner record first would wait for
+    /// every peer for each chunk of a remote composite's results.
+    /// `None` if no one reachable holds it.
     pub async fn get_blob(&self, owner: BlobOwner, digest: &Digest) -> Option<Vec<u8>> {
         let key = BlobKey::from(digest);
         if let Some(here) = self.held.blob(&key) {
             return Some(here.value);
         }
-        if let Some(found) = self.ask_holders_of(&owner, digest, &key).await {
+        let (respond_to, answer) = oneshot::channel();
+        self.commands.send(Command::LookUpBlob { key: key.clone(), respond_to }).ok()?;
+        if let Some(found) = answer.await.ok().flatten() {
             return Some(found);
         }
-        let (respond_to, answer) = oneshot::channel();
-        self.commands.send(Command::LookUpBlob { key, respond_to }).ok()?;
-        answer.await.ok().flatten()
+        self.ask_holders_of(&owner, digest, &key).await
     }
 
     /// The blob `key` names, from the first holder of `owner`'s record to

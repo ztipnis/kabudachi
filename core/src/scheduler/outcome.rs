@@ -22,6 +22,8 @@ pub struct Outcome {
     pub result_digest: Option<Digest>,
     /// The error's type name, when the run failed.
     pub failure_kind: String,
+    /// The recorded error message, when the run failed.
+    pub failure_message: String,
     /// The newer generation that replaced it, when it was superseded.
     pub superseded_by: Option<TaskId>,
     /// The run's result reached the task's client before the run was
@@ -94,6 +96,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 .as_ref()
                 .and_then(|digest| Digest::try_from(digest).ok()),
             failure_kind: run.failure_kind.clone(),
+            failure_message: run.failure_message.clone(),
             superseded_by: self
                 .links
                 .get(task_id)
