@@ -786,9 +786,9 @@ A worker that cannot run a Task's source version does not claim it: discovery's 
 
 Mixed code versions during a rolling deployment are handled by this same migration schema. A migration may explicitly refuse an incompatible boundary by raising `MigrateRejectError`; with `raise_on_failed_migration=True` the Task then stays queued for a worker that can execute it. Rollout policy beyond this (batch sizes, minimum shard size, election budgets) is left to the application and deployment tooling.
 
-Open (mixed-version clusters, owner Release hardening, §27.2): a result of an older class of a family reaches a stage that takes a newer class as the producer's class, not converted; a protobuf stage input is migrated from the version of the member Task that takes it, not the producer's.
+Open: the mixed-version gaps in migration are listed with their owner (Release hardening) in the Phase 6 notes in §27.
 
-Open (owner post-implementation testing): the leader remembers blocked Tasks only in memory, so after a leader change a worker may be handed a blocked Task once more and block it again; a compaction refuses a chain whose payloads are below the worker's version and fails it with `MigrationError`, and the leader skips that key until the waiting generation is replaced or the leader rebuilds.
+Open: the leader's in-memory blocked set and the compaction refusal of old chains are listed with their owner (post-implementation testing) in the Phase 6 notes in §27.
 
 ---
 
@@ -1015,7 +1015,7 @@ A certified result carries its content digest the same way, so a reader can chec
 
 **Version order.** Records compare by recovery epoch first, number and then lineage, so of two lineages at one number exactly one is newer, whatever the terms. Within one epoch the leader term decides, then the revision. The store refuses an older revision, and refuses a revision of the same version that is not identical, with two exceptions. A revision of the same version that differs only in its placement or prior placements (a leader re-place) is accepted and replaces a stub. A leader write that leaves the holder out of its placement is acknowledged by that holder as a stub. So an acknowledgement means the record was stored, or kept as a stub where the record moved away, and a writer that counts acknowledgements counts holders.
 
-**Placement.** A record is written to the `r` placeable voters nearest its key by XOR distance (`r` defaults to 3 and is capped at the voters known), and a write counts once a majority of them has stored it. Any later read of `r - w + 1` of them then meets a holder of the newest revision. Records travel on a per-shard records protocol that only the shard's workers speak, so a record never lands in another shard.
+**Placement.** A record is written to the `r` placeable voters nearest its key by XOR distance (`r` defaults to 3 and is capped at the voters known), and a write counts once a majority of them has stored it. Any later read of `r - w + 1` of them then meets a holder of the newest revision. Use an odd `r`: a majority of an even `r` tolerates no more loss than the odd factor below it. Records travel on a per-shard records protocol that only the shard's workers speak, so a record never lands in another shard.
 
 **Retention.** A finished record, composite or page is dropped after its `result_ttl`; an unfinished one never expires.
 
@@ -1078,9 +1078,7 @@ Non-retriable tasks require conservative handling because the old execution may 
 
 ### 9.3 Result backend
 
-Result retention is optional.
-
-If enabled, certified results are mirrored into a queryable backend for:
+A result backend is optional. If enabled, certified results are mirrored into a queryable backend for:
 
 - inspection;
 - later result lookup;
@@ -1088,7 +1086,7 @@ If enabled, certified results are mirrored into a queryable backend for:
 - recovery of completed result values;
 - operational tooling.
 
-A result backend is optional. kabudachi defines the `ResultBackend` interface (`store`, `load`) and ships an in-memory backend and a Redis/Valkey backend. Nothing is forgotten by hand: each entry carries its own expiry, which every backend enforces. A Python object is a custom backend when it has `async store(key: str, entry: bytes, expires_at: datetime) -> None` and `async load(key: str) -> bytes | None`. It stores opaque bytes, and kabudachi decodes and checks them. `result_backend=` on `configure` selects one: a `redis://` URL or an object.
+kabudachi defines the `ResultBackend` interface (`store`, `load`) and ships an in-memory backend and a Redis/Valkey backend. Nothing is forgotten by hand: each entry carries its own expiry, which every backend enforces. A Python object is a custom backend when it has `async store(key: str, entry: bytes, expires_at: datetime) -> None` and `async load(key: str) -> bytes | None`. It stores opaque bytes, and kabudachi decodes and checks them. `result_backend=` on `configure` selects one: a `redis://` URL or an object.
 
 After its report is certified, the worker that ran the task mirrors the task id, run id, digest, value (as chunks when large) and expiry to the backend. A composite's client mirrors the composite's resolved results when it finishes: each member's value or failure, in order, as pages when large.
 
@@ -1207,12 +1205,12 @@ It:
 
 - stops requesting new work;
 - becomes ineligible for leadership;
-- no longer casts ordinary votes;
+- casts no ordinary votes, though a leader handing over still answers roll calls and votes (§18.2);
 - emits irreversible `SELF_REMOVE`;
 - may finish existing work;
 - hands off the Task records it holds (§18.1).
 
-A draining leader hands leadership to its freshest voter first (§18.2). A node with no leader (`LEADER_SUSPECT`, `ROLL_CALL`, `NO_QUORUM`) drains too: it waits at most `drain_wait_limit` for a leader, then leaves and logs every record it could not hand off.
+A draining leader hands leadership to the voter that confirmed its ack most recently, the lowest id on a tie (§18.2). A node with no leader (`LEADER_SUSPECT`, `ROLL_CALL`, `NO_QUORUM`) drains too: it waits at most `drain_wait_limit` for a leader, then leaves and logs every record it could not hand off.
 
 #### `FENCED`
 
@@ -1932,7 +1930,7 @@ A leader hands off proactively instead of waiting for a timeout:
 LEADER
     -> stop granting claims
     -> ack every follower with leader_draining
-    -> TransferLeadership to the voter heard from most recently
+    -> TransferLeadership to the voter that confirmed its ack most recently (ties to the lowest id)
 successor stands at once; voters that saw leader_draining vote for it
     -> old leader stays reachable for reconciliation and record hand-off
     -> once the successor is authoritative: SELF_REMOVE through it, hand off records
@@ -3143,9 +3141,9 @@ Defects found and fixed during the phase:
 - Repair retry starvation: repair retried refused writes in key order, so a composite's write starved behind Task retries and its refusal stayed in the ledger. Retries now go oldest due first.
 - An O(N^2) store sweep: expiry now comes from indexes (1,000 items took 1.5 s and now take 0.30 s; 4,000 items took 28 s and now take 1.22 s).
 - Result pages stamped unfinished and never rewritten, so holders could not retire them. A composite's end now rewrites every page as finished.
-- Test races: a results step in the first result-delivery test, a joiner race in the `led_shard` Redis end-to-end test, a wall-clock bound in the Phase 1 cancel-grace test and a placement race in `test_networked`.
+- Test races: a results step in the first result-delivery test, a joiner race in the `led_shard` Redis end-to-end test, a wall-clock bound in the Phase 1 cancel-grace test (`//runtime/tests:test_session::test_cancel_grace_comes_from_the_process_unless_the_task_chose_its_own`) and a placement race in `test_networked`.
 
-Known flake: `//runtime/tests:test_session::test_cancel_grace_comes_from_the_process_unless_the_task_chose_its_own` measured 0.265 s against a 0.2 s wall-clock bound with 18 targets running in parallel. The bound is a harness timing, not a product limit. Owner: post-implementation testing.
+That cancel-grace test once measured 0.265 s against a 0.2 s wall-clock bound with 18 targets running in parallel. The bound was a harness timing, not a product limit. The test now compares a 50 ms process grace against a task's own one-second grace, so a loaded host has twenty times the margin; it is fixed, and no open flake remains for it.
 
 The Open notes below each name an owner. Owners are post-implementation testing (load, engineered and flaky cases), Phase 8, or release hardening (the next section).
 
