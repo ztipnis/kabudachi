@@ -14,6 +14,7 @@ use crate::reconcile::{ANSWER_IN_FLIGHT, ReportedRun, ReportedState, WorkerRuns}
 use crate::time::{Clock, WallTime};
 
 use super::super::composite::Step;
+use super::super::reports::Recorded;
 use super::super::{Claim, Completion, HeldCancel, Observer, Scheduler};
 use super::Adopted;
 
@@ -162,15 +163,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 delivered,
             } => {
                 let completion = continuation.map_or(Completion::Final, Completion::Continues);
-                if let Ok(certified) = self.certify_owned(
-                    worker,
-                    run_id,
-                    result_digest,
-                    completion,
+                let recorded = Recorded {
                     delivered,
-                    None,
-                    None,
-                ) {
+                    persistence: None,
+                    result_manifest: None,
+                };
+                if let Ok(certified) =
+                    self.certify_owned(worker, run_id, result_digest, completion, recorded)
+                {
                     out.certified.push(certified);
                 }
             }

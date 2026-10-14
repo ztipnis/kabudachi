@@ -61,6 +61,17 @@ impl Default for Reported {
     }
 }
 
+/// What certifying a run records on it besides its digest.
+pub(super) struct Recorded {
+    pub(super) delivered: bool,
+    /// What the run records about mirroring its result; `None` leaves it
+    /// unspecified, as when a rebuild adopts a result and cannot know whether
+    /// its worker mirrors.
+    pub(super) persistence: Option<PersistenceState>,
+    /// Recorded only for a final run.
+    pub(super) result_manifest: Option<Digest>,
+}
+
 /// Why a worker's report about a run was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ReportRejection {
@@ -207,32 +218,28 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             persistence,
             result_manifest,
         } = reported;
-        self.certify_owned(
-            worker,
-            run_id,
-            result_digest,
-            completion,
+        let recorded = Recorded {
             delivered,
-            Some(persistence),
+            persistence: Some(persistence),
             result_manifest,
-        )
+        };
+        self.certify_owned(worker, run_id, result_digest, completion, recorded)
     }
 
-    /// Certifies `worker`'s running run. `persistence` is what the run records
-    /// about mirroring its result; `None` leaves it unspecified, as when a
-    /// rebuild adopts a result and cannot know whether its worker mirrors.
-    /// `result_manifest` is recorded only for a final run.
-    #[allow(clippy::too_many_arguments)]
+    /// Certifies `worker`'s running run, recording `recorded` on it.
     pub(super) fn certify_owned(
         &mut self,
         worker: &WorkerId,
         run_id: &TaskRunId,
         result_digest: Digest,
         completion: Completion,
-        delivered: bool,
-        persistence: Option<PersistenceState>,
-        result_manifest: Option<Digest>,
+        recorded: Recorded,
     ) -> Result<Certification, ReportRejection> {
+        let Recorded {
+            delivered,
+            persistence,
+            result_manifest,
+        } = recorded;
         let now = self.clock.now();
         let stamped_at = WallTime::now(&self.clock);
         self.owned_run(worker, run_id, TaskRunState::Running)?;

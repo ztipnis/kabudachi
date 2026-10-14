@@ -601,16 +601,12 @@ class Session:
         """What a handle fails with when the composite `event` names failed:
         the error of the member that ended it if this process ran that member,
         else an error of the kind and message the leader gives."""
-        kind, message = event.failure_kind, event.failure_message
         held = self._tasks.member_error(event.failure_task_id)
         if held is not None:
             return held
-        if kind == "MigrationError":
-            return _failure_error(event.failure_task_id or subject, kind, message or None)
-        known = _KNOWN_FAILURES.get(kind)
-        if known is not None:
-            return known(message or f"{subject} failed with {kind}")
-        return TaskBodyError(message or f"{subject} failed with {kind}", kind)
+        return _leader_failure(
+            subject, event.failure_task_id, event.failure_kind, event.failure_message
+        )
 
     def decode_resolved(self, resolved: Any, *, own_errors: bool = False) -> Any:
         """The value a stage's `resolved` result stands for, each value decoded
@@ -1602,9 +1598,8 @@ def _outcome_error(event: Any, reason: str | None = None) -> BaseException:
     if event.state == RunState.FAILED:
         return _failure_error(task_id, event.failure_kind, reason)
     if event.state == RunState.SUPERSEDED:
-        return TaskSupersededError(
-            f"task {task_id} was superseded by {event.superseded_by}", event.superseded_by
-        )
+        newer = f" by {event.superseded_by}" if event.superseded_by else ""
+        return TaskSupersededError(f"task {task_id} was superseded{newer}", event.superseded_by)
     plain = _PLAIN_ENDINGS.get(event.state)
     if plain is None:
         return ResultUnavailableError(f"task {task_id} ended as {event.state!r} with no result", task_id)
@@ -1622,20 +1617,36 @@ _RESUMED_ENDINGS = {
 }
 
 
+def _leader_failure(subject: str, task_id: str | None, kind: str, message: str) -> BaseException:
+    """The error of a task or composite that failed, by the kind and message
+    its leader recorded: kabudachi's own kinds as their classes, any other as
+    a `TaskBodyError` naming the kind."""
+    if kind == "MigrationError":
+        return _failure_error(task_id or subject, kind, message or None)
+    known = _KNOWN_FAILURES.get(kind)
+    if known is not None:
+        return known(message or f"{subject} failed with {kind}")
+    return TaskBodyError(message or f"{subject} failed with {kind}", kind)
+
+
 def _concluded_error(result_id: str, resumed: Any) -> BaseException:
-    """The error awaiting the handle of `result_id` would have raised, for a
-    task or composite whose `Resumed` says it ended without a value."""
+    """An error of the kind a task or composite that ended without a value
+    would raise in another process, for a `Resumed` that says so: what is in
+    its record, so a failure has the leader's message, and not the exception
+    object its own process raised."""
     state = _RESUMED_ENDINGS.get(resumed.state)
     if state is None:
         return ResultUnavailableError(
             f"{result_id} ended as {resumed.state!r} with no result", result_id
         )
+    if state == RunState.FAILED:
+        return _leader_failure(result_id, None, resumed.failure_kind, resumed.failure_message)
     return _outcome_error(
         SimpleNamespace(
             task_id=result_id,
             state=state,
             failure_kind=resumed.failure_kind,
-            superseded_by="",
+            superseded_by=resumed.superseded_by,
         )
     )
 

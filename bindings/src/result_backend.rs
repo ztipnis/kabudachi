@@ -278,6 +278,8 @@ pub(crate) enum Resumption {
         state: generated::TaskRunState,
         failure_kind: String,
         failure_message: String,
+        /// The newer generation that replaced a superseded task.
+        superseded_by: Option<String>,
     },
     /// A task's value, read from the backend and checked against its record.
     Value {
@@ -354,7 +356,12 @@ pub(crate) async fn resume_task(
                 .and_then(|record| record.runs.last())
                 .map(|run| run.failure_message.clone())
                 .unwrap_or_default();
-            (None, Resumption::Ended { state, failure_kind, failure_message })
+            let superseded_by = record
+                .as_ref()
+                .and_then(|record| record.link.as_ref())
+                .and_then(|link| link.superseded_by.clone())
+                .map(|newer| TaskId::from(newer).as_str().to_owned());
+            (None, Resumption::Ended { state, failure_kind, failure_message, superseded_by })
         }
         TaskStanding::Continued(composite) => {
             let resumption = resume_composite(composite.clone(), source, backend).await;
@@ -380,7 +387,16 @@ pub(crate) async fn resume_task(
                     };
                     match shard {
                         Some(payload) => {
-                            // A result kept for no time is not put back.
+                            // The value is served from the shard whatever the
+                            // task's retention, but a result kept for no time
+                            // (`result_ttl` of `Some(0)`) is not put back. Putting
+                            // it back is a detached task, which the runtime may
+                            // drop at shutdown; it is idempotent, since
+                            // `store_unless_complete` never rewrites a complete
+                            // result, so the next resume simply tries again. The
+                            // entry expires `keep_for` from now, not from when the
+                            // run was certified: a resumer extends the expiry by
+                            // design.
                             if let (Some(backend), true) = (backend, task_ttl_ms != Some(0)) {
                                 let mirror_back = Mirror {
                                     task,
@@ -445,6 +461,7 @@ pub(crate) async fn resume_composite(
                     state,
                     failure_kind: failure.kind,
                     failure_message: failure.message,
+                    superseded_by: None,
                 };
             }
             _ => return Resumption::Unfinished,
@@ -486,6 +503,9 @@ pub struct PyResumed {
     failure_kind: String,
     #[pyo3(get)]
     failure_message: String,
+    /// The newer generation that replaced a superseded task.
+    #[pyo3(get)]
+    superseded_by: Option<String>,
     /// The definition that produced a task's value, whose serializer decodes it.
     #[pyo3(get)]
     definition_id: Option<String>,
@@ -534,6 +554,7 @@ impl PyResumed {
             persistence: None,
             failure_kind: String::new(),
             failure_message: String::new(),
+            superseded_by: None,
             definition_id: None,
             payload: None,
             results: None,
@@ -558,9 +579,10 @@ impl<'py> IntoPyObject<'py> for ResumedValue {
         let mut resumed = match resumption {
             Resumption::Unknown => PyResumed::of("unknown"),
             Resumption::Unfinished => PyResumed::of("unfinished"),
-            Resumption::Ended { state, failure_kind, failure_message } => PyResumed {
+            Resumption::Ended { state, failure_kind, failure_message, superseded_by } => PyResumed {
                 failure_kind,
                 failure_message,
+                superseded_by,
                 ..PyResumed::of(run_state_name(state))
             },
             Resumption::Value { definition, payload, persistence } => PyResumed {

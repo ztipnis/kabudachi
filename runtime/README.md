@@ -564,8 +564,9 @@ was stored with.
 
 - A task that did not succeed raises an error of the kind a task run in another process would raise
   (`TaskCancelledError`, `TaskExpiredError`, `TaskLostError`, `TaskOrphanedError`, a failure as
-  kabudachi's own error of its kind or else `TaskBodyError` naming the kind); a failed flow or group
-  raises with the failure message of the member that ended it.
+  kabudachi's own error of its kind or else `TaskBodyError` naming the kind, with the message the leader
+  recorded; for a flow or group, that of the member that ended it). The exception object the task raised
+  in its own process is not kept.
 - It raises `ResultUnavailableError` when the shard has forgotten the id, when no backend is configured
   or it holds no entry (the task kept nothing, the entry expired, or its worker died before mirroring), or
   when the entry does not match the record: a result is never returned unless it matches what the leader

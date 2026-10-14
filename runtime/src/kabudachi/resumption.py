@@ -12,7 +12,9 @@ async def resume(result_id: str) -> Any:
 
     Waits while it is still running, or while its value is being mirrored;
     bound the wait with `asyncio.wait_for`. A task that did not succeed raises
-    what awaiting its handle would have raised.
+    an error of the kind a task run in another process would raise, built
+    from its record: a failure has the leader's message, not the exception
+    its own process raised.
 
     Raises:
         ResultUnavailableError: The shard does not know `result_id`, no result

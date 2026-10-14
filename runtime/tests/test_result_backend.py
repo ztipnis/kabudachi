@@ -267,19 +267,33 @@ def test_a_result_the_backend_lost_is_resumed_from_the_shards_blobs_and_mirrored
             lost = dict(backend.entries)
             backend.remembering = True
             resumed = await native.resume_task(task_id)
+            await mirrored_back(f"task/{task_id}")
+            mirrored = dict(backend.entries)
+            # A chunk the backend then loses makes its entry incomplete: the
+            # next resume still gives the whole result, from the shard, and
+            # puts the chunk back.
+            chunk_key = next(key for key in mirrored if "/chunk/" in key)
+            del backend.entries[chunk_key]
+            incomplete = await native.resume_task(task_id)
+            await mirrored_back(chunk_key)
+            return task_id, lost, resumed, mirrored, chunk_key, incomplete
+
+        async def mirrored_back(key):
             deadline = time.monotonic() + 5
-            while f"task/{task_id}" not in backend.entries and time.monotonic() < deadline:
+            while key not in backend.entries and time.monotonic() < deadline:
                 await asyncio.sleep(0.02)
-            return task_id, lost, resumed
 
         try:
-            task_id, lost, resumed = asyncio.run(main())
+            task_id, lost, resumed, mirrored, chunk_key, incomplete = asyncio.run(main())
         finally:
             native.shutdown()
 
     assert lost == {}
     assert (resumed.state, resumed.payload, resumed.definition_id) == ("succeeded", result, "billing.charge")
-    assert f"task/{task_id}" in backend.entries
+    # The head and the chunks of the result, not the head alone.
+    assert f"task/{task_id}" in mirrored and len(mirrored) > 1
+    assert incomplete.payload == result
+    assert chunk_key in backend.entries
 
 
 class FailingBackend(DictBackend):
@@ -319,6 +333,10 @@ def test_a_run_mirrors_each_result_once_certified_and_resumes_it_from_the_backen
     def relay(request: Greeting) -> Flow:
         return flow(echo.bind(request), echo)
 
+    @kabudachi.task(name="tests.explode")
+    def explode(request: Greeting) -> Flow:
+        return flow(echo.bind(request), broken)
+
     async def main():
         handle = echo(Greeting(text="kept"))
         assert await handle == Greeting(text="KEPT")
@@ -342,10 +360,18 @@ def test_a_run_mirrors_each_result_once_certified_and_resumes_it_from_the_backen
         failed = broken(Greeting())
         with pytest.raises(ValueError):
             await failed
-        # Only the failure's kind is in the record, as for a task another process ran.
+        # Only the failure's kind and message are in the record, as for a task another process ran.
         with pytest.raises(TaskBodyError) as raised:
             await kabudachi.resume(failed.task_id)
-        assert raised.value.kind == "ValueError"
+        assert raised.value.kind == "ValueError" and str(raised.value) == "no"
+
+        # So are a failed flow's, which ends with the message of the stage that failed.
+        exploded = explode(Greeting(text="x"))
+        with pytest.raises(ValueError):
+            await exploded
+        with pytest.raises(TaskBodyError) as raised:
+            await asyncio.wait_for(kabudachi.resume(exploded.task_id), 5)
+        assert raised.value.kind == "ValueError" and str(raised.value) == "no"
 
         relayed = relay(Greeting(text="twice"))
         # A task that returned a flow resolves to its stages' results, and so does resuming it.
