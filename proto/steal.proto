@@ -12,9 +12,12 @@ message StealRequest {
   // Whether the asker runs compaction runs. A record of one is offered only
   // to an asker that does.
   bool runs_compaction = 2;
+  // The queues the asker takes work from. Empty: every queue.
+  repeated string queues = 3;
 }
 
-// Task ids, oldest submission first.
+// Task ids, most urgent first by the answering peer's queue policy, then
+// oldest submission.
 message StealResponse {
   repeated TaskId task_ids = 1;
 }

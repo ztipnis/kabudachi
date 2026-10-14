@@ -387,13 +387,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             })
             .collect();
         let model = &self.tasks[waiting];
+        let queue = model.queue.clone();
         let mut new = NewTask::new(
             mint_task_id(&self.ids),
             stamped_at,
             model.task_definition_id(),
             model.source_version,
             Vec::new(),
-            model.queue.clone(),
+            queue.clone(),
         );
         // A lost compaction is not replayed: the check that made it runs again.
         new.ephemeral = true;
@@ -411,7 +412,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.input_digests
             .insert(task_id.clone(), Digest::blake3(&[]));
         self.tasks.insert(task_id.clone(), task);
-        self.waiting.admit(&task_id, None, None);
+        self.waiting
+            .admit(&task_id, &queue, self.clock.now(), None, None);
         self.mark_current_decided(&task_id);
         self.occupancy.begin_compaction(key, &task_id);
     }

@@ -13,10 +13,11 @@ import pytest
 
 from kabudachi._native import EventKind, RunState, result_digest
 from kabudachi.concurrency_places import ConcurrencyPlaces
-from kabudachi.config import Configuration
+from kabudachi.config import Configuration, QueueOptions
 from kabudachi.errors import (
     CertificationError,
     CoalescedPayloadTooLargeError,
+    ConfigurationError,
     PayloadTooLargeError,
     ResultTooLargeError,
     ResultUnavailableError,
@@ -1808,11 +1809,14 @@ def tiny_reconnect(request: Greeting) -> Greeting:
 
 def test_a_run_carries_its_tasks_reconnect_timeout_or_else_its_queues():
     world = World()
-    timeouts = {"slow": 90, "tiny": 1e-9}
-    world.configuration.configure(reconnect_timeouts=timeouts)
+    options = {
+        "slow": QueueOptions(reconnect_timeout=timedelta(seconds=90)),
+        "tiny": QueueOptions(reconnect_timeout=timedelta(microseconds=1)),
+    }
+    world.configuration.configure(queue_options=options)
     # Changing the mapping after configuring it changes nothing, even once
     # another setting is configured.
-    timeouts["slow"] = 1
+    options["slow"] = QueueOptions(reconnect_timeout=timedelta(seconds=1))
     world.configuration.configure(result_ttl=60)
     own = Task(
         quick_reconnect,
@@ -1850,3 +1854,70 @@ def test_a_run_carries_its_tasks_reconnect_timeout_or_else_its_queues():
         "tests.queue_reconnect": 90_000,
         "tests.tiny_reconnect": 1,
     }
+
+
+def routed(request: Greeting) -> Greeting:
+    return request
+
+
+def pinned(request: Greeting) -> Greeting:
+    return request
+
+
+def test_a_router_picks_the_queue_of_a_task_that_names_none_where_it_is_submitted():
+    world = World(routed)
+    pinned_task = Task(
+        pinned,
+        registry=world.registry,
+        serializers=world.serializers,
+        name="tests.pinned",
+        queue="pinned",
+    )
+    seen = []
+
+    def router(name, value):
+        seen.append((name, value.text))
+        return {"gpu": "gpu", "none": None, "number": 7}.get(value.text, "")
+
+    world.configuration.configure(router=router, queue="fallback")
+    world.call("routed", Greeting(text="gpu"))
+    world.call("routed", Greeting(text="none"))
+    world.session.submit(pinned_task.definition, Greeting(text="gpu"))
+    # A body in a task process submits its input encoded; it is decoded here
+    # for the router.
+    world.session.submit_serialized(
+        "tests.routed", Greeting(text="gpu").SerializeToString(), SubmissionOptions()
+    )
+    for refused in ("bad", "number"):
+        with pytest.raises(ConfigurationError, match="router"):
+            world.call("routed", Greeting(text=refused))
+
+    assert [queue for *_, queue in world.runtime.submitted] == ["gpu", "fallback", "pinned", "gpu"]
+    assert seen == [
+        ("tests.routed", "gpu"),
+        ("tests.routed", "none"),
+        ("tests.routed", "gpu"),
+        ("tests.routed", "bad"),
+        ("tests.routed", "number"),
+    ]
+
+
+def test_an_input_past_the_payload_limit_is_refused_without_running_the_router():
+    hard = 10_000
+    world = World(routed, memory_soft_limit=hard // 2, memory_hard_limit=hard)
+    routed_values = []
+
+    def router(name, value):
+        routed_values.append(name)
+        return "gpu"
+
+    world.configuration.configure(router=router)
+    oversized = Greeting(text="x" * (hard * 2))
+
+    with pytest.raises(PayloadTooLargeError):
+        world.call("routed", oversized)
+    with pytest.raises(PayloadTooLargeError):
+        world.session.submit_serialized("tests.routed", oversized.SerializeToString(), SubmissionOptions())
+
+    assert routed_values == []
+    assert world.runtime.submitted == []

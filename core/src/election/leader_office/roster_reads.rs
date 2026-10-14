@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::configuration::Tally;
 use crate::protocol::ids::WorkerId;
+use crate::queues::Subscription;
 use crate::reconcile::Answered;
 
 use super::LeaderOffice;
@@ -43,6 +44,12 @@ impl LeaderOffice {
     /// latest heartbeat.
     pub(crate) fn member_capacities(&self) -> BTreeMap<WorkerId, u32> {
         self.reports.capacities(&self.roster)
+    }
+
+    /// The queues each member and pending member said in its latest heartbeat
+    /// that it takes.
+    pub(crate) fn subscriptions(&self) -> BTreeMap<WorkerId, Subscription> {
+        self.reports.subscriptions(&self.roster)
     }
 
     /// The voters of the committed configuration this office knows by id,

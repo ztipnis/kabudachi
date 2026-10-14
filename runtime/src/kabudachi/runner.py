@@ -19,7 +19,12 @@ from kabudachi._native import refresh_logging
 from kabudachi.config import Configuration, Settings, authority_parts, process_configuration
 from kabudachi.execution import Executor, InProcessExecutor
 from kabudachi.lifecycle import default_hooks
-from kabudachi.native_protocol import AuthorityArguments, NetworkedArguments, OneNodeArguments
+from kabudachi.native_protocol import (
+    AuthorityArguments,
+    NetworkedArguments,
+    OneNodeArguments,
+    QueueOptionsArgument,
+)
 from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
@@ -130,6 +135,20 @@ def _optional_millis(duration: timedelta | None) -> int | None:
     return None if duration is None else _millis(duration)
 
 
+def _queue_options(settings: Settings) -> tuple[QueueOptionsArgument, ...]:
+    """Each queue's options as the native runtime takes them."""
+    return tuple(
+        (
+            queue,
+            options.priority,
+            options.weight,
+            options.max_running,
+            None if options.starvation_age is None else max(1, _millis(options.starvation_age)),
+        )
+        for queue, options in settings.queue_options.items()
+    )
+
+
 def _native_runtime(settings: Settings) -> Any:
     """A one-node shard of this process's own, or, with `listen` set, a
     worker of the networked shard `settings.shard`."""
@@ -142,6 +161,8 @@ def _native_runtime(settings: Settings) -> Any:
                 memory_soft_limit=settings.memory_soft_limit,
                 memory_hard_limit=settings.memory_hard_limit,
                 health_listen=settings.health_listen,
+                queues=None if settings.queues is None else tuple(settings.queues),
+                queue_options=_queue_options(settings),
             ),
         )
     authority = None
@@ -168,6 +189,8 @@ def _native_runtime(settings: Settings) -> Any:
             roll_call_deadline_ms=_optional_millis(settings.roll_call_deadline),
             routing_refresh_ms=_optional_millis(settings.routing_refresh),
             health_listen=settings.health_listen,
+            queues=tuple(settings.queues or (settings.queue,)),
+            queue_options=_queue_options(settings),
         )
     )
 

@@ -22,7 +22,8 @@ use libp2p::kad::{KBucketDistance, KBucketKey};
 use crate::support::deadline::within_deadline;
 use crate::support::net::wait_until_registered;
 use crate::support::records::{
-    ThreeVoters, Voters, claimed, plain_with, submitted_through, submitted_with, wait_until_held,
+    ThreeVoters, Voters, claimed, plain_with, submitted_through, submitted_with, takes,
+    wait_until_held,
 };
 
 /// Each record is written to one voter only, so who holds what differs from
@@ -196,12 +197,12 @@ async fn a_worker_claims_its_own_records_nearest_first_and_then_steals_nearer_pe
                 for (task, holder) in [near, far] {
                     wait_until_held(held_by(&holder), vec![task]).await;
                 }
-                let own = nets[worker].discover(ids[leader].clone(), mine.len(), now(), false, None).await;
+                let own = nets[worker].discover(ids[leader].clone(), mine.len(), now(), &takes(false), None).await;
                 let before = steals_received(&nets).await;
-                let near = nets[worker].discover(ids[leader].clone(), 1, now(), false, None).await;
+                let near = nets[worker].discover(ids[leader].clone(), 1, now(), &takes(false), None).await;
                 let after = steals_received(&nets).await;
                 let asked: Vec<u64> = before.iter().zip(&after).map(|(before, after)| after - before).collect();
-                let far = nets[worker].discover(ids[leader].clone(), 100, now(), false, None).await;
+                let far = nets[worker].discover(ids[leader].clone(), 100, now(), &takes(false), None).await;
                 (own, near, far, asked)
             })
             .await;
@@ -280,7 +281,7 @@ async fn a_claim_the_workers_stale_record_suggested_is_refused_and_discovery_mov
                 client.write_records(vec![PlacedWrite::new(lagging, 1)]);
                 wait_until_held(nets[worker].clone(), vec![task]).await;
 
-                nets[worker].discover(ids[leader].clone(), 1, now(), false, None).await
+                nets[worker].discover(ids[leader].clone(), 1, now(), &takes(false), None).await
             })
             .await;
 
@@ -310,7 +311,7 @@ async fn a_worker_that_knows_no_peers_asks_the_leader_for_the_oldest_tasks() {
             .drive_until(async {
                 let first = submitted_through(&nets[submitter], &ids[leader], plain_with(b"first")).await;
                 let second = submitted_through(&nets[submitter], &ids[leader], plain_with(b"second")).await;
-                let found = bare.discover(ids[leader].clone(), 5, now(), false, None).await;
+                let found = bare.discover(ids[leader].clone(), 5, now(), &takes(false), None).await;
                 (vec![first, second], found)
             })
             .await;

@@ -7,7 +7,7 @@ from pkgutil import extend_path
 __path__ = extend_path(__path__, __name__)
 
 from kabudachi.composites import FlowHandle, GroupHandle
-from kabudachi.config import configure
+from kabudachi.config import QueueOptions, configure
 from kabudachi.errors import (
     DurabilityUnavailableError,
     PayloadTooLargeError,
@@ -47,6 +47,7 @@ __all__ = [
     "GroupHandle",
     "PayloadTooLargeError",
     "process_init",
+    "QueueOptions",
     "register_serializer",
     "ResultTooLargeError",
     "ResultUnavailableError",

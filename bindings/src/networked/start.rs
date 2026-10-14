@@ -19,6 +19,7 @@ use pyo3::prelude::*;
 use tokio::runtime::{Builder, Runtime};
 
 use crate::arguments::memory_limits;
+use crate::queues::{QueueOptionsArgument, queue_policy, subscription};
 
 /// The default roll-call deadline, unless a quarter of the suspicion
 /// timeout is shorter: a roll call must close well inside it.
@@ -43,6 +44,8 @@ pub(super) struct NetworkedArguments {
     seed_rounds: u32,
     routing_refresh_ms: Option<u64>,
     pub(super) health_listen: Option<String>,
+    queues: Option<Vec<String>>,
+    queue_options: Vec<QueueOptionsArgument>,
 }
 
 /// The shard's coordination authority: a `redis://` or `rediss://` server.
@@ -103,7 +106,8 @@ impl NetworkedArguments {
 
     /// The worker's config, its driver's end of the executor seam included.
     /// Raises `ValueError` for an address that cannot be read, only one
-    /// memory limit, or an authority that cannot be used.
+    /// memory limit, an authority that cannot be used, or queues or queue
+    /// options that are refused.
     pub(super) fn worker_config(&self, executor: ExecutorEndpoint) -> PyResult<WorkerConfig> {
         let mut config = WorkerConfig::new(
             ShardName::new(self.shard.as_str()),
@@ -121,7 +125,9 @@ impl NetworkedArguments {
         .with_replication_factor(ReplicationFactor::new(
             NonZeroUsize::new(self.replication_factor).expect("refused by check when zero"),
         ))
-        .with_executor(executor);
+        .with_executor(executor)
+        .with_queues(subscription(self.queues.clone())?)
+        .with_queue_policy(queue_policy(self.queue_options.clone())?);
         if let Some(period) = self.routing_refresh_ms {
             config = config.with_routing_refresh_period(StdDuration::from_millis(period));
         }

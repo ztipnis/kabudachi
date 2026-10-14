@@ -68,7 +68,7 @@ use libp2p::futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 
-use crate::discovery::{Found, IdleBackoff};
+use crate::discovery::{Found, IdleBackoff, Takes};
 use crate::messenger::Net;
 use crate::task_exchange::{self, TaskFailure, refused_for_now, rejection, reported_run};
 
@@ -269,6 +269,8 @@ pub(crate) struct Executing<'n> {
     retry_after: Duration,
     /// The shard's reconnect timeout, for a claim that names none.
     default_reconnect: CoreDuration,
+    /// What this worker takes when it looks for work.
+    takes: Takes,
     /// A discovery under way at a remote leader, with the places it reserved.
     discovering: Option<(u32, BoxFuture<'n, Found>)>,
     /// Places this leader's own claim reserved, until its answer settles.
@@ -295,12 +297,14 @@ impl<'n> Executing<'n> {
         net: &'n Net,
         retry_after: Duration,
         default_reconnect: CoreDuration,
+        takes: Takes,
     ) -> Self {
         let mut executing = Executing {
             endpoint,
             net,
             retry_after,
             default_reconnect,
+            takes,
             discovering: None,
             own_claim: None,
             idle: IdleBackoff::default(),
@@ -440,9 +444,18 @@ impl<'n> Executing<'n> {
     /// worker has room for (see `PayloadMemory::room`).
     pub(crate) fn discover(&mut self, leader: WorkerId, places: u32, now: WallTime) {
         let limit = usize::try_from(places).unwrap_or(usize::MAX);
-        let room = self.net.payload_memory().room();
-        let discovery = self.net.discover(leader, limit, now, true, room);
-        self.discovering = Some((places, Box::pin(discovery)));
+        let net = self.net;
+        let takes = self.takes.clone();
+        let room = net.payload_memory().room();
+        self.discovering = Some((
+            places,
+            Box::pin(async move { net.discover(leader, limit, now, &takes, room).await }),
+        ));
+    }
+
+    /// What this worker takes when it looks for work.
+    pub(crate) fn takes(&self) -> &Takes {
+        &self.takes
     }
 
     /// This worker leads: the `places` just reserved are claimed from its own

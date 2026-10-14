@@ -1,14 +1,18 @@
 //! How workers claim tasks: the oldest pending ones in a batch, or one by name,
 //! and what a claim carries.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::blob::BlobKey;
 use crate::manifest::{InvalidManifest, Manifest, Unresolved};
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::Task;
 use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
-use crate::time::{Clock, Duration, WallTime};
+use crate::queues::{QueuePolicy, Subscription};
+use crate::time::{Clock, Duration, Instant, WallTime};
 
+use super::fairness::Front;
 use super::{Observer, Scheduler};
 
 /// A worker's permission to run a task: the Task itself and the run it now
@@ -75,34 +79,102 @@ pub enum ClaimRejection {
     /// runs them.
     #[error("the worker does not run compaction")]
     CannotRun,
+    /// The task's queue is not one the claiming worker takes.
+    #[error("the task's queue is not one the worker takes")]
+    NotSubscribed,
+    /// The task's queue already has as many tasks claimed or running as its
+    /// `max_running` allows.
+    #[error("the task's queue is full")]
+    QueueFull,
 }
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
-    /// A worker asks for up to `limit` of the oldest pending tasks at once.
-    /// Fewer, or none, are returned if fewer are pending.
+    /// Replaces what the scheduler knows of each worker's queues. A worker with
+    /// no entry is not limited: it may take any queue.
+    pub fn set_subscriptions(&mut self, subscriptions: BTreeMap<WorkerId, Subscription>) {
+        self.subscriptions = subscriptions;
+    }
+
+    /// The queues `worker` takes: every queue if it has no entry.
+    fn subscription_of(&self, worker: &WorkerId) -> Subscription {
+        self.subscriptions
+            .get(worker)
+            .cloned()
+            .unwrap_or(Subscription::Every)
+    }
+
+    /// Whether the current state of `run` is claimed or running.
+    fn is_active(&self, run: &TaskRunId) -> bool {
+        self.runs.get(run).is_some_and(|run| {
+            matches!(
+                run.current_state(),
+                TaskRunState::Claimed | TaskRunState::Running
+            )
+        })
+    }
+
+    /// Counts the current run of `task_id`, if it is not a compaction, as one
+    /// of its queue's runs, and drops the finished ones.
+    pub(super) fn count_running(&mut self, task_id: &TaskId) {
+        if self.is_compaction(task_id) {
+            return;
+        }
+        let queue = self.tasks[task_id].queue.clone();
+        let run = self.current_run[task_id].clone();
+        let mut runs = self.running.remove(&queue).unwrap_or_default();
+        runs.retain(|run| self.is_active(run));
+        runs.insert(run);
+        self.running.insert(queue, runs);
+    }
+
+    /// Whether `queue` has as many runs claimed or running as its
+    /// `max_running` allows.
+    fn queue_is_full(&self, queue: &str) -> bool {
+        let Some(max) = self.queue_policy.options(queue).max_running else {
+            return false;
+        };
+        let running = self.running.get(queue).map_or(0, |runs| {
+            runs.iter().filter(|run| self.is_active(run)).count()
+        });
+        running >= max.get() as usize
+    }
+
+    /// How this scheduler orders and limits each queue while it leads. Every
+    /// worker of a shard should give the same policy: the leader's decides.
+    pub fn set_queue_policy(&mut self, policy: QueuePolicy) {
+        self.queue_policy = policy;
+    }
+
+    /// A worker asks for up to `limit` pending tasks at once, in queue order
+    /// (see [`Self::claim_oldest_fitting`]). Fewer, or none, are returned if
+    /// fewer are pending.
     pub fn claim_oldest(
         &mut self,
         worker: &WorkerId,
         limit: usize,
     ) -> Result<Vec<Claim>, ClaimRejection> {
-        self.claim_oldest_fitting(worker, limit, |_| true)
+        self.claim_oldest_fitting(worker, &Subscription::Every, limit, |_| true)
     }
 
-    /// Like [`Self::claim_oldest`], but each candidate, oldest first, is
-    /// shown to `fits` before it is claimed. The first one `fits` refuses
-    /// ends the batch and stays pending, first in line for the next call;
-    /// except that one refused while nothing is claimed yet, which would
-    /// never fit, is passed over so the tasks behind it still go out. No
-    /// claim outgrows a frame, so that last rule only guards a caller whose
-    /// limit is smaller. It is how a caller that must deliver the claims
-    /// keeps them within what it can deliver.
+    /// Like [`Self::claim_oldest`], from the queues `asked` names. Each next
+    /// task is the front of the most urgent queue: a task past its queue's
+    /// starvation age first (oldest first), then the highest priority, and
+    /// among queues of one priority each in turn by weight (see
+    /// `fairness::Turns`). Each candidate is shown to `fits` before it is
+    /// claimed. The first one `fits` refuses ends the batch and stays pending,
+    /// first in line for the next call; except that one refused while nothing
+    /// is claimed yet, which would never fit, is passed over so the tasks
+    /// behind it still go out. No claim outgrows a frame, so that last rule
+    /// only guards a caller whose limit is smaller. It is how a caller that
+    /// must deliver the claims keeps them within what it can deliver.
     pub fn claim_oldest_fitting(
         &mut self,
         worker: &WorkerId,
+        asked: &Subscription,
         limit: usize,
         fits: impl FnMut(&Claim) -> bool,
     ) -> Result<Vec<Claim>, ClaimRejection> {
-        let outcome = self.claim_while_fitting(worker, limit, fits);
+        let outcome = self.claim_while_fitting(worker, asked, limit, fits);
         self.end_call();
         outcome
     }
@@ -110,6 +182,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     fn claim_while_fitting(
         &mut self,
         worker: &WorkerId,
+        asked: &Subscription,
         limit: usize,
         mut fits: impl FnMut(&Claim) -> bool,
     ) -> Result<Vec<Claim>, ClaimRejection> {
@@ -118,36 +191,94 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         self.release_due();
         let mut claims = Vec::new();
-        let mut after = None;
+        let mut passed = BTreeSet::new();
         // Time is only allowed to take effect once per call: each candidate
         // is claimed as it is, whatever the clock has done since.
         while claims.len() < limit {
-            let Some((position, task_id)) = self.next_unblocked_after(after) else {
+            let Some(task_id) = self.next_to_claim(worker, asked, &passed) else {
                 break;
             };
-            after = Some(position);
-            if self.is_compaction(&task_id) && !self.may_claim_compaction(worker, &task_id) {
-                continue;
-            }
             let claim = self.claim_to_be(&task_id);
             if fits(&claim) {
                 self.mark_claimed(worker, &task_id);
+                self.turns.charge();
                 claims.push(claim);
-            } else if !claims.is_empty() {
+            } else if claims.is_empty() {
+                passed.insert(task_id);
+            } else {
                 break;
             }
         }
+        let waiting = &self.waiting;
+        self.turns.forget_empty(|queue| waiting.has_queued(queue));
         Ok(claims)
     }
 
-    /// The oldest queued task, past queue position `after` if given, that
-    /// no other generation of its coalescing key holds back, and whose key is
-    /// not held back for want of knowing one of its generations.
-    fn next_unblocked_after(&self, after: Option<u64>) -> Option<(u64, TaskId)> {
-        self.waiting
-            .queued_after(after)
-            .find(|(_, task_id)| !self.is_blocked(task_id) && !self.is_held_back(task_id))
-            .map(|(position, task_id)| (position, task_id.clone()))
+    /// The task `worker` should be handed next from the queues `asked` names,
+    /// skipping `passed`. Its queue's turn is spent by `fairness::Turns::charge` once
+    /// it is claimed.
+    fn next_to_claim(
+        &mut self,
+        worker: &WorkerId,
+        asked: &Subscription,
+        passed: &BTreeSet<TaskId>,
+    ) -> Option<TaskId> {
+        let now = self.clock.now();
+        let wanted = self.subscription_of(worker).narrowed_to(asked);
+        let queues: Vec<String> = self
+            .waiting
+            .queues()
+            .filter(|queue| wanted.includes(queue))
+            .map(str::to_owned)
+            .collect();
+        let mut fronts = Vec::new();
+        for queue in &queues {
+            if let Some((ticket, since, task_id)) = self.first_claimable_in(worker, queue, passed) {
+                fronts.push((queue.as_str(), ticket, now - since, task_id));
+            }
+        }
+        let waiting = &self.waiting;
+        self.turns.forget_empty(|queue| waiting.has_queued(queue));
+        let views: Vec<Front<'_>> = fronts
+            .iter()
+            .map(|(queue, ticket, waited, _)| Front {
+                queue,
+                ticket: *ticket,
+                waited: *waited,
+            })
+            .collect();
+        let chosen = self.turns.pick(&self.queue_policy, &views)?;
+        Some(fronts.swap_remove(chosen).3)
+    }
+
+    /// The oldest task of `queue` that `worker` could be handed now, with its
+    /// ticket and when it started waiting: not passed over, not held back by
+    /// another generation of its coalescing key or for want of knowing one,
+    /// and a compaction only for a worker that may run it. In a full queue
+    /// only a compaction qualifies, as it does not count against the limit.
+    fn first_claimable_in(
+        &mut self,
+        worker: &WorkerId,
+        queue: &str,
+        passed: &BTreeSet<TaskId>,
+    ) -> Option<(u64, Instant, TaskId)> {
+        let full = self.queue_is_full(queue);
+        let mut after = None;
+        loop {
+            let (ticket, since, task_id) = self.waiting.queued_in_after(queue, after)?;
+            after = Some(ticket);
+            if full && !self.is_compaction(&task_id) {
+                continue;
+            }
+            if passed.contains(&task_id) || self.is_blocked(&task_id) || self.is_held_back(&task_id)
+            {
+                continue;
+            }
+            if self.is_compaction(&task_id) && !self.may_claim_compaction(worker, &task_id) {
+                continue;
+            }
+            return Some((ticket, since, task_id));
+        }
     }
 
     /// A worker asks for `task_id`. Of several workers asking for the same
@@ -178,8 +309,18 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         match self.runs[&run_id].current_state() {
             TaskRunState::Queued if self.is_held_back(task_id) => Err(ClaimRejection::NotReady),
             TaskRunState::Queued if self.is_blocked(task_id) => Err(ClaimRejection::KeyBusy),
+            TaskRunState::Queued
+                if !self
+                    .subscription_of(worker)
+                    .includes(&self.tasks[task_id].queue) =>
+            {
+                Err(ClaimRejection::NotSubscribed)
+            }
             TaskRunState::Queued if self.is_compaction(task_id) => {
                 self.claim_compaction(worker, task_id)
+            }
+            TaskRunState::Queued if self.queue_is_full(&self.tasks[task_id].queue) => {
+                Err(ClaimRejection::QueueFull)
             }
             TaskRunState::Queued => Ok(self.claim_queued(worker, task_id)),
             TaskRunState::Scheduled => Err(ClaimRejection::NotReady),
@@ -252,5 +393,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.occupancy.compaction_claimed(&key, task_id);
         }
         self.mark_decided(&run_id);
+        self.count_running(task_id);
     }
 }

@@ -5,6 +5,7 @@ use crate::protocol::ids::{TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{LeaderHeartbeatAck, WorkerHeartbeat, election_message};
 use crate::protocol::worker_state::WorkerState;
+use crate::queues::Subscription;
 use crate::reconcile::ReconcileTerm;
 use crate::time::{Clock, Instant};
 
@@ -19,6 +20,7 @@ fn member_report(heartbeat: &Checked<WorkerHeartbeat>) -> MemberReport {
         admission: heartbeat.admission_generation(),
         runs_compaction: heartbeat.runs_compaction,
         available_capacity: heartbeat.available_capacity,
+        queues: Subscription::from_names(&heartbeat.queues),
     }
 }
 

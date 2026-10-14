@@ -6,7 +6,7 @@ use kabudachi_core::scheduler::Submission;
 use kabudachi_core::time::{Clock, Duration, RealClock, WallTime};
 
 use crate::support::deadline::within_deadline;
-use crate::support::records::{ThreeVoters, plain_with, submitted_with, wait_until_held};
+use crate::support::records::{ThreeVoters, plain_with, submitted_with, takes, wait_until_held};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_answers_a_steal_with_the_waiting_tasks_it_holds_oldest_first_up_to_the_limit() {
@@ -34,8 +34,8 @@ async fn a_peer_answers_a_steal_with_the_waiting_tasks_it_holds_oldest_first_up_
                 };
                 let far = submitted_with(&asker_net, &leader_id, ("far", at(0)), later).await;
                 wait_until_held(holder_net, vec![first.clone(), second.clone(), far]).await;
-                let answer = asker_net.steal(holder_id.clone(), 10, false).await;
-                let one = asker_net.steal(holder_id, 1, false).await;
+                let answer = asker_net.steal(holder_id.clone(), 10, &takes(false)).await;
+                let one = asker_net.steal(holder_id, 1, &takes(false)).await;
                 (answer, one, (first, second))
             })
             .await;

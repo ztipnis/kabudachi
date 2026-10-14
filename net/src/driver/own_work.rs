@@ -1,5 +1,6 @@
 use kabudachi_core::protocol::ids::{IdGenerator, WorkerId};
 use kabudachi_core::protocol::messages::{ClaimOldest, claim_request};
+use kabudachi_core::queues::Subscription;
 use kabudachi_core::task_record::Settled;
 use kabudachi_core::time::{Clock, WallTime};
 use tokio::time::Instant as TokioInstant;
@@ -87,7 +88,7 @@ fn claim_more<C: Clock, I: IdGenerator>(
     match to {
         OwnLeader::Itself => {
             executing.claiming_own(places);
-            decide_own_claim(places, deciding, local);
+            decide_own_claim(places, &executing.takes().queues, deciding, local);
         }
         OwnLeader::Remote(leader) => {
             executing.discover(leader.clone(), places, WallTime::now(clock))
@@ -134,17 +135,19 @@ fn decide_own_report<C: Clock, I: IdGenerator>(
     );
 }
 
-/// Claims up to `places` of the oldest pending tasks for this worker's own
+/// Claims up to `places` of the oldest pending tasks in `queues` for this worker's own
 /// executor from its own scheduler, as [`super::answers::respond_to_claim_requests`] decides
 /// a remote worker's claim, and holds the answer until the writes it made
 /// are stored.
 fn decide_own_claim<C: Clock, I: IdGenerator>(
     places: u32,
+    queues: &Subscription,
     deciding: &mut Deciding<'_, C, I>,
     local: &mut Local,
 ) {
     let request = claim_request::Request::Oldest(ClaimOldest {
         limit: places,
+        queues: queues.names(),
         input_room: deciding.net.payload_memory().room(),
     });
     let response = claim::answer(

@@ -23,6 +23,7 @@ use kabudachi_core::protocol::ids::{
 };
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{ClaimRejectReason, ClaimResponse, claim_response};
+use kabudachi_core::queues::Subscription;
 use kabudachi_core::scheduler::{MAX_SUBMISSION_BYTES, Scheduler, Submission};
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::{Duration, RealClock};
@@ -215,7 +216,7 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
                     let (b_names, c_names) = (named[0].clone(), named[1].clone());
                     let claimed = until_a_member(|| net_b.request_claim(b_names.clone(), taken.clone())).await;
                     let refused = until_a_member(|| net_c.request_claim(c_names.clone(), taken.clone())).await;
-                    let oldest = || net_c.claim_oldest(c_names.clone(), 2, None);
+                    let oldest = || net_c.claim_oldest(c_names.clone(), 2, &Subscription::Every, None);
                     let batch = until_a_member(oldest).await;
                     let first_huge = until_a_member(oldest).await;
                     let second_huge = until_a_member(oldest).await;

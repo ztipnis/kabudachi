@@ -12,6 +12,7 @@ another is started in its place.
 
 import asyncio
 import concurrent.futures
+import dataclasses
 import itertools
 import logging
 import multiprocessing
@@ -418,7 +419,9 @@ class ProcessPool:
         number = next(self._numbers)
         process = self._context.Process(
             target=_child.main,
-            args=(child_end, self._settings, self._modules),
+            # The router runs where tasks are submitted from, in this process;
+            # a body's own calls come back here to be routed.
+            args=(child_end, dataclasses.replace(self._settings, router=None), self._modules),
             name=f"kabudachi-task-{number}",
         )
         try:

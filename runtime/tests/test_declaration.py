@@ -22,7 +22,7 @@ from kabudachi import coalescing_task, ephemeral_task, task
 from kabudachi import config as config_module
 from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
-from kabudachi.config import UNSET, Configuration, Settings, authority_parts
+from kabudachi.config import UNSET, Configuration, QueueOptions, Settings, authority_parts
 from kabudachi.errors import (
     ConfigurationError,
     DuplicateTaskError,
@@ -711,14 +711,13 @@ def test_an_unknown_setting_is_refused():
         ({"process_start_timeout": timedelta(0)}, "process_start_timeout"),
         ({"max_runs_per_process": 0}, "max_runs_per_process"),
         ({"max_runs_per_process": True}, "max_runs_per_process"),
-        ({"reconnect_timeouts": {"slow": 0}}, "reconnect_timeouts"),
-        ({"reconnect_timeouts": {"slow": -1}}, "reconnect_timeouts"),
-        ({"reconnect_timeouts": {"slow": True}}, "reconnect_timeouts"),
-        ({"reconnect_timeouts": {"slow": "90"}}, "reconnect_timeouts"),
-        ({"reconnect_timeouts": {"slow": float("inf")}}, "reconnect_timeouts"),
-        ({"reconnect_timeouts": {"slow": 1e300}}, "reconnect_timeouts"),
-        ({"reconnect_timeouts": {"": 5}}, "reconnect_timeouts"),
-        ({"reconnect_timeouts": [("slow", 5)]}, "reconnect_timeouts"),
+        ({"queues": "gpu"}, "queues"),
+        ({"queues": ()}, "queues"),
+        ({"queues": ("gpu", " ")}, "queues"),
+        ({"queue_options": {"gpu": "fast"}}, "queue_options"),
+        ({"queue_options": {"": QueueOptions()}}, "queue_options"),
+        ({"queue_options": [("gpu", QueueOptions())]}, "queue_options"),
+        ({"router": "app.route"}, "router"),
         # A networked worker must be able to kill a body at its abort deadline.
         ({"listen": "/ip4/127.0.0.1/tcp/0", "processes": 0}, "processes"),
         ({"seeds": "/ip4/127.0.0.1/tcp/4001"}, "seeds"),
@@ -770,6 +769,28 @@ def test_an_invalid_value_is_refused_and_changes_nothing(settings, refused):
     assert configuration.resolve("queue") == "emails"
 
 
+@pytest.mark.parametrize(
+    "options, refused",
+    [
+        ({"priority": 1.5}, "priority"),
+        ({"priority": True}, "priority"),
+        ({"priority": 2**31}, "priority"),
+        ({"weight": 0}, "weight"),
+        ({"weight": 2**32}, "weight"),
+        ({"max_running": 0}, "max_running"),
+        ({"max_running": True}, "max_running"),
+        ({"reconnect_timeout": timedelta(0)}, "reconnect_timeout"),
+        ({"reconnect_timeout": 5}, "reconnect_timeout"),
+        ({"starvation_age": timedelta(seconds=-1)}, "starvation_age"),
+        ({"result_ttl": timedelta(0)}, "result_ttl"),
+        ({"result_ttl": 60}, "result_ttl"),
+    ],
+)
+def test_queue_options_of_the_wrong_kind_or_range_are_refused(options, refused):
+    with pytest.raises(ValueError, match=refused):
+        QueueOptions(**options)
+
+
 def test_a_call_with_one_bad_setting_applies_none_of_them():
     configuration = Configuration()
 
@@ -808,8 +829,8 @@ def test_configure_wins_over_the_environment(monkeypatch):
     "setting, raw",
     [
         ("concurrency", "many"),
-        # A queue named twice: which of its timeouts was meant is unknowable.
-        ("reconnect_timeouts", "slow=90, slow=5"),
+        # Per-queue options have no text form.
+        ("queue_options", "gpu=5"),
     ],
 )
 def test_an_invalid_environment_value_is_a_configuration_error(monkeypatch, setting, raw):
@@ -922,7 +943,7 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_IMPORTS", "app.tasks, app.more_tasks")
     monkeypatch.setenv("KABUDACHI_PROCESS_START_TIMEOUT", "2.5")
     monkeypatch.setenv("KABUDACHI_MAX_RUNS_PER_PROCESS", "50")
-    monkeypatch.setenv("KABUDACHI_RECONNECT_TIMEOUTS", "slow=90, gpu=2.5")
+    monkeypatch.setenv("KABUDACHI_QUEUES", "gpu, default")
     monkeypatch.setenv("KABUDACHI_LISTEN", "/ip4/0.0.0.0/tcp/4001")
     monkeypatch.setenv("KABUDACHI_SEEDS", "/ip4/10.0.0.1/tcp/4001, /dns4/seed.example/tcp/4001")
     monkeypatch.setenv("KABUDACHI_AUTHORITY", "rediss://user:secret@cache.example:6380/3?key_prefix=app:&ttl=2.5")
@@ -940,7 +961,7 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         "imports",
         "process_start_timeout",
         "max_runs_per_process",
-        "reconnect_timeouts",
+        "queues",
         "listen",
         "seeds",
         "shard",
@@ -958,7 +979,7 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         ("app.tasks", "app.more_tasks"),
         timedelta(seconds=2.5),
         50,
-        {"slow": 90.0, "gpu": 2.5},
+        ("gpu", "default"),
         "/ip4/0.0.0.0/tcp/4001",
         ("/ip4/10.0.0.1/tcp/4001", "/dns4/seed.example/tcp/4001"),
         "default",

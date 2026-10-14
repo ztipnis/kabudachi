@@ -5,6 +5,7 @@ use crate::protocol::ids::{ShardId, TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{AckEcho, LeaderHeartbeatAck, WorkerHeartbeat, election_message};
 use crate::protocol::worker_state::WorkerState;
+use crate::queues::Subscription;
 use crate::time::{Clock, Instant};
 
 use super::super::EpochOrder;
@@ -253,6 +254,7 @@ where
             routing_crawled: self.routing_crawled(),
             admission_generation: self.standing.admission().map(Into::into),
             runs_compaction: self.report.runs_compaction,
+            queues: self.report.queues.names(),
         }
     }
 
@@ -289,5 +291,11 @@ where
     /// heartbeat it sends from now on says.
     pub fn set_available_capacity(&mut self, places: u32) {
         self.report.available_capacity = places;
+    }
+
+    /// The queues this worker takes work from, which every heartbeat it sends
+    /// from now on says.
+    pub fn set_queues(&mut self, queues: Subscription) {
+        self.report.queues = queues;
     }
 }

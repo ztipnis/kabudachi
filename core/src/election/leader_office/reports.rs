@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::configuration::{Generation, Roster};
 use crate::protocol::ids::WorkerId;
+use crate::queues::Subscription;
 
 use super::MemberReport;
 
@@ -17,6 +18,8 @@ pub(super) struct MemberReports {
     compaction_runners: BTreeSet<WorkerId>,
     /// Each worker's free places, by its latest heartbeat.
     capacities: BTreeMap<WorkerId, u32>,
+    /// The queues each worker's latest heartbeat said it takes.
+    subscriptions: BTreeMap<WorkerId, Subscription>,
 }
 
 impl MemberReports {
@@ -35,6 +38,8 @@ impl MemberReports {
             self.compaction_runners.remove(from);
         }
         self.capacities.insert(from.clone(), report.available_capacity);
+        self.subscriptions
+            .insert(from.clone(), report.queues.clone());
         match report.admission.filter(|_| report.routing_crawled) {
             Some(admission) if Some(admission) == counted_by => {
                 self.crawled.insert(from.clone(), admission);
@@ -68,6 +73,16 @@ impl MemberReports {
             .iter()
             .filter(|worker| roster.holds(worker))
             .cloned()
+            .collect()
+    }
+
+    /// The queues each worker `roster` holds said in its latest heartbeat that
+    /// it takes.
+    pub(super) fn subscriptions(&self, roster: &Roster) -> BTreeMap<WorkerId, Subscription> {
+        self.subscriptions
+            .iter()
+            .filter(|(worker, _)| roster.holds(worker))
+            .map(|(worker, queues)| (worker.clone(), queues.clone()))
             .collect()
     }
 }

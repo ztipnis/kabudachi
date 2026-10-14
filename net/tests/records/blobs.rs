@@ -14,6 +14,7 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{ShardId, TaskDefinitionId, TaskId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::messages::{TaskRejectReason, claim_response, task_response};
+use kabudachi_core::queues::Subscription;
 use kabudachi_core::scheduler::{Claim, MemoryLimits, Submission, Submitted, mint};
 use kabudachi_core::task_record::{Placement, RecordVersion};
 use kabudachi_core::time::RealClock;
@@ -386,7 +387,7 @@ async fn a_large_input_reaches_its_claimant_and_a_drained_holder_hands_its_blobs
                 // the task stays pending; one with room gets it.
                 let room = Some(MIB as u64);
                 let small = nets[claimant]
-                    .claim_oldest(leader_id.clone(), 1, room)
+                    .claim_oldest(leader_id.clone(), 1, &Subscription::Every, room)
                     .await;
                 let small = small.expect("answered");
                 assert!(

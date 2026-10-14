@@ -310,6 +310,35 @@ def test_no_more_tasks_run_at_once_than_configured(is_async):
     assert peak == 2
 
 
+def test_run_limits_a_queue_to_its_max_running_whatever_the_concurrency():
+    running = 0
+    peak = 0
+
+    @declare
+    async def limited(request: Greeting) -> Greeting:
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.05)
+        running -= 1
+        return request
+
+    kabudachi.configure(
+        concurrency=4,
+        queue="limited",
+        queues=("limited",),
+        queue_options={"limited": kabudachi.QueueOptions(max_running=1)},
+    )
+
+    async def main():
+        return await asyncio.gather(*(limited(Greeting(text=str(n))) for n in range(4)))
+
+    results = kabudachi.run(main)
+
+    assert [result.text for result in results] == ["0", "1", "2", "3"]
+    assert peak == 1
+
+
 def test_a_synchronous_task_can_call_another_task():
     handles = []
 

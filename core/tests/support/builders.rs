@@ -178,6 +178,7 @@ pub fn heartbeat(sender: &WorkerId, newest_accepted_ack: Option<AckEcho>) -> Wor
         routing_crawled: false,
         admission_generation: None,
         runs_compaction: false,
+        queues: Vec::new(),
     }
 }
 

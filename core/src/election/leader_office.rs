@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 
 use crate::configuration::{Configuration, Generation, Roster};
 use crate::protocol::ids::WorkerId;
+use crate::queues::Subscription;
 use crate::time::Instant;
 
 use super::ElectionTimings;
@@ -69,6 +70,9 @@ pub(crate) struct MemberReport {
     pub(crate) runs_compaction: bool,
     /// The places it has free to run tasks in.
     pub(crate) available_capacity: u32,
+    /// The queues it takes work from, which the leader reads to claim only
+    /// those for it.
+    pub(crate) queues: Subscription,
 }
 
 /// What one ack carries of the configuration the office leads. A joiner the

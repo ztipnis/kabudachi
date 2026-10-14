@@ -5,6 +5,7 @@ use kabudachi_core::protocol::messages::{
 };
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::queues::QueuePolicy;
 use kabudachi_core::scheduler::{Conclusion, Scheduler};
 use kabudachi_core::task_record::{LeaderRecords, RecordOutbox, Settled, Write};
 use kabudachi_core::time::{Clock, WallTime};
@@ -259,10 +260,11 @@ pub(super) fn respond_to_reconcile_requests<C: Clock>(node: &WorkerNode<C>, net:
 }
 
 /// Answers every inbound `/kabudachi/steal/1` request queued on `net` with
-/// the tasks this worker holds records of that look claimable. Every worker
-/// answers: it needs no leadership and decides nothing, since a task it names
-/// must still be claimed from the leader.
-pub(super) fn respond_to_steal_requests<C: Clock>(net: &Net, clock: &C) {
+/// the tasks this worker holds records of that look claimable in the asker's
+/// queues, most urgent first by `policy`. Every worker answers: it needs no
+/// leadership and decides nothing, since a task it names must still be
+/// claimed from the leader.
+pub(super) fn respond_to_steal_requests<C: Clock>(net: &Net, clock: &C, policy: &QueuePolicy) {
     let now = WallTime::now(clock);
     for handle in net.poll_steal_requests() {
         let task_ids = candidates_for_steal(
@@ -270,6 +272,8 @@ pub(super) fn respond_to_steal_requests<C: Clock>(net: &Net, clock: &C) {
             now,
             handle.limit(),
             handle.runs_compaction(),
+            &handle.queues(),
+            policy,
         );
         net.respond_steal(handle, task_ids);
     }
