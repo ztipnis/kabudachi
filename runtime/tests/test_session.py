@@ -848,7 +848,6 @@ def test_ten_thousand_expiries_decided_together_reach_every_waiting_handle():
     async def body():
         handles = [submit_expiring(world, str(n)) for n in range(BURST)]
         outcomes = await asyncio.gather(*handles, return_exceptions=True)
-        assert len(outcomes) == BURST
         unexpected = [outcome for outcome in outcomes if not isinstance(outcome, TaskExpiredError)]
         assert unexpected == []
         await world.session.wait_until_idle()

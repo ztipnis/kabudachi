@@ -90,7 +90,6 @@ async fn runs(executor: &mut FakeExecutor, count: usize) -> Vec<(Stage, TaskId)>
     runs
 }
 
-
 /// Which voter, by index, plays which part.
 #[derive(Debug, Clone, Copy)]
 struct Roles {

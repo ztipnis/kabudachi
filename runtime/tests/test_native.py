@@ -312,7 +312,6 @@ UNFINISHED_RUN_PROGRAM = textwrap.dedent(
     import asyncio
     import json
     import sys
-    import tempfile
     import textwrap
     import threading
 
@@ -325,7 +324,7 @@ UNFINISHED_RUN_PROGRAM = textwrap.dedent(
 
     if sys.argv[2] == "one-node":
         # Declared in a module, which the task process can import.
-        module_directory = tempfile.mkdtemp()
+        module_directory = sys.argv[3]
         with open(module_directory + "/unfinished_tasks.py", "w") as module:
             module.write(
                 textwrap.dedent(
@@ -348,6 +347,8 @@ UNFINISHED_RUN_PROGRAM = textwrap.dedent(
 
         async def main():
             call = forever(Greeting(text="never done"))
+            # A best-effort settle, so the task process has started by the time
+            # the script exits.
             await asyncio.sleep(1)
             running.set()
             await call
@@ -379,10 +380,10 @@ EXIT_SECONDS = 15
     ],
 )
 def test_the_interpreter_exits_cleanly_while_run_and_its_native_threads_still_run(
-    kind, environment
+    kind, environment, tmp_path
 ):
     process = subprocess.Popen(
-        [sys.executable, "-c", UNFINISHED_RUN_PROGRAM, json.dumps(sys.path), kind],
+        [sys.executable, "-c", UNFINISHED_RUN_PROGRAM, json.dumps(sys.path), kind, str(tmp_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
