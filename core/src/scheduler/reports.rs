@@ -314,6 +314,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .expect("a Running run can always succeed");
         certified.result_digest = Some(result_digest.clone().into());
         certified.continuation = Some(step.into());
+        // Certifying a step records that nothing of it is mirrored.
+        certified.persistence = generated::PersistenceState::from(PersistenceState::Disabled) as i32;
         record.encoded_len() as u64 > Self::record_limit()
     }
 
