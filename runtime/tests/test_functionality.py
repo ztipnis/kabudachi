@@ -101,6 +101,19 @@ async def wait_for(description, probe, timeout=60):
     return value
 
 
+async def finish(handle, timeout, cluster):
+    try:
+        return await asyncio.wait_for(handle, timeout)
+    except TimeoutError:
+        print("timed out:", handle.task_id, await handle.status(), flush=True)
+        for task in asyncio.all_tasks():
+            if "_send_members" in str(task.get_coro()):
+                task.print_stack()
+        for worker in cluster.live():
+            print("worker", worker.pid, worker.error_lines()[-20:], flush=True)
+        raise
+
+
 def new_stage(markers, before, cluster, exclude=()):
     for marker in set(markers.glob("reduce-start.*")) - before:
         holder = next(worker for worker in cluster.workers if worker.pid == int(marker.read_text()))
@@ -229,16 +242,7 @@ def test_the_phase6_library_works_for_an_independent_caller_across_workers_and_l
             assert len({value.times for value in values}) >= 2
             assert (await mapped.status()).state == "succeeded"
             pages = echo.map([Greeting(text=f"{index},") for index in range(1100)])
-            try:
-                paged = await asyncio.wait_for(pages, 180)
-            except TimeoutError:
-                print("map status:", await pages.status(), flush=True)
-                for task in asyncio.all_tasks():
-                    if "_send_members" in str(task.get_coro()):
-                        task.print_stack()
-                for worker in cluster.live():
-                    print("worker", worker.pid, worker.error_lines()[-20:], flush=True)
-                raise
+            paged = await finish(pages, 180, cluster)
             assert [value.text for value in paged] == [f"{index}," for index in range(1100)]
             collected = await kabudachi.group(echo, refuse, on_error="collect_all")(Greeting(text="collect"))
             assert collected[0] == Greeting(text="collect")
@@ -281,7 +285,7 @@ def test_the_phase6_library_works_for_an_independent_caller_across_workers_and_l
             victim = await wait_for("a reducer on a follower", lambda: new_stage(tmp_path, before, cluster, (leader,)))
             victim.kill()
             (tmp_path / "reduce.go").touch()
-            assert (await asyncio.wait_for(reducing, 120)).text == "".join(value.text for value in paged)
+            assert (await finish(reducing, 120, cluster)).text == "".join(value.text for value in paged)
             records = await certified_records(tmp_path, claims, runtime)
             assert records and any(any(run.state == RunState.LOST for run in record.runs) for record in records)
 
@@ -290,7 +294,7 @@ def test_the_phase6_library_works_for_an_independent_caller_across_workers_and_l
             continuing = plan(Greeting(text="recovered"))
             await wait_for("a returned continuation to start", lambda: set(tmp_path.glob("shout.*")) - before)
             leader.kill()
-            recovered = await asyncio.wait_for(continuing, 60)
+            recovered = await finish(continuing, 60, cluster)
             assert [value.text for value in recovered] == ["loaded recovered", "LOADED RECOVERED"]
             await certified_records(tmp_path, claims, runtime)
             assert await echo(Greeting(text="after election")) == Greeting(text="after election")

@@ -30,7 +30,7 @@ const MAX_RECORD_QUERIES: usize = 16;
 /// outcome under.
 #[derive(Default)]
 pub(super) struct RecordQueries {
-    queued: VecDeque<(u64, kad::Record, Vec<PeerId>, usize)>,
+    queued: VecDeque<(u64, usize, kad::Record, PeerId)>,
     /// The `kad` queries of record writes in flight to other workers, each
     /// to the write it is part of.
     writes: HashMap<kad::QueryId, (u64, usize)>,
@@ -67,17 +67,17 @@ impl RecordQueries {
 
     pub(super) fn advance_writes(&mut self, swarm: &mut Swarm<Behaviour>, inbound: &Inbound) {
         while self.writes.len() < MAX_RECORD_QUERIES {
-            let Some((number, record, remote, needed)) = self.queued.pop_front() else { break; };
+            let Some((number, placement, record, peer)) = self.queued.pop_front() else { break; };
             if !self.unfinished.contains_key(&number) { continue; }
             let Some(records) = swarm.behaviour_mut().records.as_mut() else {
-                self.write_answered(number, false, inbound);
+                self.write_answered(number, placement, false, inbound);
                 continue;
             };
-            // Keep this budget until every targeted RPC settles. Kad's
-            // quorum shortcut leaves requests to slower holders in flight;
-            // releasing a slot then lets a burst exhaust their streams.
-            let query = records.put_record_to(record, remote.into_iter(), kad::Quorum::All);
-            self.writes.insert(query, (number, needed));
+            // One query per holder keeps the RPC budget after a placement
+            // reaches quorum, without delaying its acknowledgement for slow
+            // holders. Each slot lives until its own request settles.
+            let query = records.put_record_to(record, std::iter::once(peer), kad::Quorum::One);
+            self.writes.insert(query, (number, placement));
         }
     }
 
@@ -122,16 +122,15 @@ impl RecordQueries {
             number,
             UnfinishedWrite {
                 write,
-                outstanding: queries.len(),
+                placements: queries.iter().map(|(remote, needed)| (*needed, remote.len())).collect(),
             },
         );
-        for (remote, needed) in queries {
-            self.queued.push_back((
-                number,
-                kad::Record::new(key.clone(), value.clone()),
-                remote,
-                needed,
-            ));
+        for (placement, (remote, _)) in queries.into_iter().enumerate() {
+            for peer in remote {
+                self.queued.push_back((
+                    number, placement, kad::Record::new(key.clone(), value.clone()), peer,
+                ));
+            }
         }
     }
 
@@ -225,13 +224,8 @@ impl RecordQueries {
     }
 
     fn on_put(&mut self, id: kad::QueryId, result: &kad::PutRecordResult, inbound: &Inbound) {
-        if let Some((number, needed)) = self.writes.remove(&id) {
-            let stored = match result {
-                Ok(_) => true,
-                Err(kad::PutRecordError::QuorumFailed { success, .. }
-                    | kad::PutRecordError::Timeout { success, .. }) => success.len() >= needed,
-            };
-            self.write_answered(number, stored, inbound);
+        if let Some((number, placement)) = self.writes.remove(&id) {
+            self.write_answered(number, placement, result.is_ok(), inbound);
         } else if let Some(respond_to) = self.hand_offs.remove(&id) {
             if let Err(error) = result {
                 tracing::debug!(%error, "a record hand-off did not reach its quorum");
@@ -247,31 +241,17 @@ impl RecordQueries {
 
     /// One query of write `number` answered. A write already refused has no
     /// entry left: its other queries end unheard.
-    fn write_answered(&mut self, number: u64, stored: bool, inbound: &Inbound) {
-        let Some(mut unfinished) = self.unfinished.remove(&number) else {
+    fn write_answered(&mut self, number: u64, placement: usize, stored: bool, inbound: &Inbound) {
+        let Some(unfinished) = self.unfinished.get_mut(&number) else {
             return;
         };
-        unfinished.outstanding -= 1;
-        match stored {
-            false => {
-                tracing::debug!(
-                    key = ?unfinished.write.key,
-                    "a record write did not reach its quorum"
-                );
-                inbound.queue_write(WriteOutcome {
-                    write: unfinished.write,
-                    stored: false,
-                });
-            }
-            true if unfinished.outstanding == 0 => {
-                inbound.queue_write(WriteOutcome {
-                    write: unfinished.write,
-                    stored: true,
-                });
-            }
-            true => {
-                self.unfinished.insert(number, unfinished);
-            }
+        let (needed, waiting) = &mut unfinished.placements[placement];
+        *waiting -= 1;
+        *needed = needed.saturating_sub(usize::from(stored));
+        let impossible = *needed > *waiting;
+        let stored = unfinished.placements.iter().all(|(needed, _)| *needed == 0);
+        if (impossible || stored) && let Some(unfinished) = self.unfinished.remove(&number) {
+            inbound.queue_write(WriteOutcome { write: unfinished.write, stored });
         }
     }
 
@@ -354,8 +334,9 @@ fn split_holders(holders: &[WorkerId], local: PeerId, stored_here: bool) -> (Vec
 /// placement it must reach, each to a quorum of that placement.
 struct UnfinishedWrite {
     write: Write,
-    /// The queries not answered yet.
-    outstanding: usize,
+    /// For each placement, acknowledgements still needed and requests still
+    /// unanswered (queued requests included).
+    placements: Vec<(usize, usize)>,
 }
 
 /// A record lookup collecting the answers of its `kad` query.
